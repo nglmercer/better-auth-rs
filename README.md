@@ -42,6 +42,9 @@ The workspace now covers all roadmap phases at a framework-neutral baseline:
   hashing, and JWT issuance.
 - framework-neutral HTTP endpoints, an optional Axum adapter, and a client
   request SDK with reqwest transport, cookie-jar support, and safe retries.
+- a TypeScript client package at `packages/better-auth-client` with typed
+  fetch-based sign-up/sign-in, sessions, sign-out, generic requests, cookie
+  credentials, structured errors, and safe retries.
 - SQLite relational and secondary-storage adapters, optional SQLx
   Postgres/MySQL adapters with dialect-aware placeholders, and migration
   execution.
@@ -51,6 +54,10 @@ SAML and browser-level WebAuthn fixtures, scheduled OIDC JWKS refresh, browser
 client examples, and independent security review. The traits remain small so
 these integrations do not make the core depend on one database or web
 framework.
+
+For TypeScript consumers, use the fetch-native client package first. WASM is
+best reserved for optional Rust-owned pure computation or cryptography in the
+browser; NAPI should be introduced later only for Node.js backend bindings.
 
 ## Verify
 

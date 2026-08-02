@@ -4,6 +4,15 @@
 **Current commit:** 996ea94
 **Current status:** All roadmap phases have an end-to-end framework-neutral implementation. Remaining items are deployment validation, browser fixtures, scheduled operations, and independent security review.
 
+## Client SDK status
+
+The first TypeScript client-only package is now scaffolded at
+`packages/better-auth-client`. It provides typed email sign-up/sign-in,
+session lookup, sign-out, generic JSON requests, cookie credentials, structured
+HTTP errors, injected `fetch` support, and retry handling that only retries safe
+methods unless an idempotency key is supplied. The Rust client was split into
+request, retry, and transport modules to keep the HTTP boundary reusable.
+
 ## Summary
 
 The Rust rewrite now covers the core runtime, configuration, schema and migration contracts, SQLite plus optional SQLx Postgres/MySQL adapters, email/password sessions, JWT/JWE cookie caching, CSRF and rate limiting, OAuth/PKCE with OIDC JWKS refresh, encrypted provider-token envelopes, advanced plugin services, concrete SAML parsing and validation behind an optional feature, durable WebAuthn ceremony state and passkey storage, SCIM users/groups/filter/PATCH/bulk/token services, an HTTP router, Axum integration, and a retry-capable client SDK.
@@ -34,6 +43,8 @@ cargo test --workspace --all-features --quiet
 
 Test result: **42 passed, 0 failed** — 39 tests in better-auth and 3 in better-auth-core. This includes all-feature compilation/tests for Axum, SQLx, SAML, OIDC JWKS handling, and persisted WebAuthn state. The env-gated PostgreSQL CRUD/KV conformance test also passed against a temporary local PostgreSQL instance.
 
+The TypeScript SDK also passes strict typechecking with TypeScript 5.7.2.
+
 ## Remaining deployment work
 
 1. Run the env-gated MySQL conformance test against a clean MySQL/MariaDB instance. PostgreSQL conformance has passed locally.
@@ -41,6 +52,13 @@ Test result: **42 passed, 0 failed** — 39 tests in better-auth and 3 in better
 3. Exercise WebAuthn with browser fixtures and a production durable passkey table. Server-side ceremony persistence and DB passkey serialization are implemented.
 4. Schedule OIDC JWKS refreshes using the provider’s discovery/rotation policy; the HTTPS refresh method and key replacement are implemented.
 5. Add browser-specific client bindings/examples and complete an independent dependency/threat-model/security review.
+
+The TypeScript SDK is intentionally fetch-native for this phase. WASM is not
+needed for HTTP, cookie, or browser integration and would add bundler and
+startup complexity. If Rust-owned browser cryptography later becomes valuable,
+it can be added as a small optional WASM module behind this SDK. NAPI remains a
+backend-only follow-up for Node.js server adapters and should not be part of
+the browser client package.
 
 ## Recommended next sequence
 
