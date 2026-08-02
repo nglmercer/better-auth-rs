@@ -1,1 +1,3 @@
 /target
+/packages/better-auth-client/node_modules
+/packages/better-auth-client/dist
