@@ -11,4 +11,3 @@ pub(super) fn now_seconds() -> u64 {
 pub(super) fn json_error(error: serde_json::Error) -> AuthError {
     AuthError::Adapter(format!("SQLite JSON error: {error}"))
 }
-

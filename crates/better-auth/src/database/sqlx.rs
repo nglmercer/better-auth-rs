@@ -8,10 +8,6 @@ use serde_json::Value;
 use sqlx::{Executor, Row};
 use std::time::Duration;
 
-fn sqlx_error(error: impl std::fmt::Display) -> AuthError {
-    AuthError::Adapter(format!("SQLx adapter error: {error}"))
-}
-
 #[cfg(feature = "sqlx")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SqlxBackend {
@@ -443,4 +439,3 @@ fn validate_sqlx_url(url: &str, backend: SqlxBackend) -> Result<()> {
 fn sqlx_error(error: impl std::fmt::Display) -> AuthError {
     AuthError::Adapter(format!("SQLx adapter error: {error}"))
 }
-

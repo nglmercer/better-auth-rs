@@ -5,9 +5,7 @@ use better_auth_core::{
 };
 use http::Method;
 use sha2::{Digest, Sha256};
-use std::{
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 pub(super) fn endpoint(method: Method, path: &str, description: &str) -> Endpoint {
@@ -63,7 +61,7 @@ pub(super) fn random_challenge() -> String {
     Uuid::new_v4().simple().to_string()
 }
 
-pub(super) fn now_seconds() -> u64 {
+pub(crate) fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock is before Unix epoch")
@@ -77,4 +75,3 @@ pub(super) fn serialize_error(error: impl std::fmt::Display) -> AuthError {
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-

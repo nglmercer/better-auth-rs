@@ -6,11 +6,7 @@ use better_auth_core::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
-use std::{
-    path::Path,
-    sync::Mutex,
-    time::Duration,
-};
+use std::{path::Path, sync::Mutex, time::Duration};
 
 fn sqlite_error(error: rusqlite::Error) -> AuthError {
     AuthError::Adapter(format!("SQLite adapter error: {error}"))
@@ -318,4 +314,3 @@ fn read_kv(connection: &Connection, key: &str) -> Result<Option<StorageValue>> {
         expires_in: expires_at.map(|expires_at| Duration::from_secs((expires_at - now) as u64)),
     }))
 }
-

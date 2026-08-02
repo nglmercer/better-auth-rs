@@ -9,6 +9,7 @@ use http::Method;
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 
+#[derive(Clone, Copy, Debug, Default)]
 pub struct PasskeyPlugin;
 
 impl Plugin for PasskeyPlugin {
@@ -104,6 +105,3 @@ impl PasskeyService {
         Ok(state)
     }
 }
-
-#[derive(Clone, Copy, Debug, Default)]
-

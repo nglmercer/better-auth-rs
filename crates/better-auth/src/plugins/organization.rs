@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Organization {
     pub id: String,
     pub name: String,
@@ -163,6 +164,3 @@ impl OrganizationService {
         ))
     }
 }
-
-#[derive(Clone, Copy, Debug, Default)]
-

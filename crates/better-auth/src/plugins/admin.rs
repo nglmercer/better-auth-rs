@@ -7,6 +7,7 @@ use better_auth_core::{
 use http::Method;
 use std::{collections::BTreeSet, sync::Arc};
 
+#[derive(Clone, Copy, Debug, Default)]
 pub struct AdminPlugin;
 
 impl Plugin for AdminPlugin {
@@ -76,6 +77,3 @@ impl AdminService {
         self.adapter.update("user", user_id, user).await
     }
 }
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-

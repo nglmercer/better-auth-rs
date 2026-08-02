@@ -20,15 +20,17 @@ pub use two_factor::{
     generate_totp_secret, totp_code, verify_totp, BackupCodeSet, TotpSecret, TwoFactorPlugin,
 };
 
-pub(crate) use shared::now_seconds;
-
 #[cfg(test)]
 mod tests {
+    use super::shared::now_seconds;
     use super::*;
+    use better_auth_core::adapter::{
+        memory::{MemoryDb, MemorySecondaryStorage},
+        DbAdapter,
+    };
     use data_encoding::BASE32_NOPAD;
     use serde_json::json;
     use std::{sync::Arc, time::Duration};
-    use better_auth_core::adapter::memory::{MemoryDb, MemorySecondaryStorage};
 
     #[test]
     fn totp_matches_rfc_vector() {
@@ -169,5 +171,3 @@ mod tests {
         assert!(scim.get_group(group_id).await.is_err());
     }
 }
-
-

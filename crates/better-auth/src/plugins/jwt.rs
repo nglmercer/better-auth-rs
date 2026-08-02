@@ -2,6 +2,7 @@ use super::shared::endpoint;
 use better_auth_core::plugin::{Endpoint, Plugin};
 use http::Method;
 
+#[derive(Clone, Copy, Debug, Default)]
 pub struct JwtPlugin;
 
 impl Plugin for JwtPlugin {
@@ -21,4 +22,3 @@ impl Plugin for JwtPlugin {
             .collect()
     }
 }
-

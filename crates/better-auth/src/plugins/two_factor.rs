@@ -1,6 +1,4 @@
-use super::shared::{
-    endpoint, hash_secret, required, urlencoding,
-};
+use super::shared::{endpoint, hash_secret, required, urlencoding};
 use better_auth_core::{
     error::{AuthError, Result},
     plugin::{Endpoint, Plugin},
@@ -9,12 +7,13 @@ use better_auth_core::{
 use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, Mac};
 use http::Method;
-use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use std::collections::BTreeSet;
 use uuid::Uuid;
 
 type HmacSha1 = Hmac<Sha1>;
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct TwoFactorPlugin;
 
 impl Plugin for TwoFactorPlugin {
@@ -167,5 +166,3 @@ impl BackupCodeSet {
         self.hashes.remove(&hash_secret(code))
     }
 }
-
-

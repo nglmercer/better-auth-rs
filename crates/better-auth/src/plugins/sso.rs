@@ -10,6 +10,7 @@ use http::Method;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SsoConnectionConfig {
     pub id: String,
     #[serde(default)]
@@ -100,6 +101,3 @@ impl SsoConnectionService {
         ))
     }
 }
-
-#[derive(Clone, Copy, Debug, Default)]
-
