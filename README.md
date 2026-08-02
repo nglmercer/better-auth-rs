@@ -33,27 +33,28 @@ The workspace now covers all roadmap phases at a framework-neutral baseline:
 - purpose-bound email verification and password-reset tokens.
 - rate-limit enforcement backed by atomic secondary-storage increments.
 - OAuth authorization state, PKCE, generic HTTPS provider exchange, and
-  Google/GitHub provider presets.
+  Google/GitHub provider presets, configurable OIDC ID-token validation, and
+  encrypted provider-token envelopes.
 - TOTP and one-time backup codes, organization membership, passkey challenge
-  replay protection, admin role guards, SSO connection persistence, SCIM user
-  persistence/token hashing, and JWT issuance.
+  replay protection, real WebAuthn registration/assertion verification through
+  webauthn-rs, admin role guards, OIDC/SAML SSO contracts, SCIM filtering,
+  pagination, bulk operations, user resources/token hashing, and JWT issuance.
 - framework-neutral HTTP endpoints, an optional Axum adapter, and a client
-  request SDK with reqwest transport and cookie-jar support.
-- SQLite relational and secondary-storage adapters plus dialect-neutral
-  migration plan generation.
+  request SDK with reqwest transport, cookie-jar support, and safe retries.
+- SQLite relational and secondary-storage adapters, optional SQLx
+  Postgres/MySQL adapters, and dialect-aware migration execution.
 
-The remaining work is production-hardening rather than missing architecture:
-full WebAuthn attestation/assertion cryptography, SAML-specific SSO, full SCIM
-protocol pagination/filtering, concrete production database adapters, and a
-retry policy. Postgres/MySQL adapters, OAuth ID-token validation, and provider
-token encryption are also production-hardening items. The traits are
-intentionally small so those features can be added without making the core
-depend on a database or web framework.
+The remaining work is protocol and deployment hardening: concrete SAML XML
+canonicalization/signature adapters, full SCIM RFC 7644 surfaces, live
+Postgres/MySQL conformance tests, browser-level WebAuthn tests, OIDC JWKS
+discovery/rotation, and browser-specific client bindings. The traits remain
+small so these integrations do not make the core depend on one database or web
+framework.
 
 ## Verify
 
 ```sh
 cargo fmt --all -- --check
-cargo check --workspace
-cargo test --workspace
+cargo check --workspace --all-features
+cargo test --workspace --all-features
 ```

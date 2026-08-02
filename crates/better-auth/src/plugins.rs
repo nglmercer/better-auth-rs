@@ -611,6 +611,11 @@ impl Plugin for ScimPlugin {
             endpoint(Method::GET, "/scim/v2/Users/:id", "Get a SCIM user"),
             endpoint(Method::PATCH, "/scim/v2/Users/:id", "Update a SCIM user"),
             endpoint(Method::DELETE, "/scim/v2/Users/:id", "Delete a SCIM user"),
+            endpoint(Method::GET, "/scim/v2/Groups", "List SCIM groups"),
+            endpoint(Method::POST, "/scim/v2/Groups", "Create a SCIM group"),
+            endpoint(Method::GET, "/scim/v2/Groups/:id", "Get a SCIM group"),
+            endpoint(Method::PATCH, "/scim/v2/Groups/:id", "Update a SCIM group"),
+            endpoint(Method::DELETE, "/scim/v2/Groups/:id", "Delete a SCIM group"),
             endpoint(Method::POST, "/scim/v2/Bulk", "Apply SCIM bulk operations"),
         ]
     }
@@ -622,6 +627,20 @@ impl Plugin for ScimPlugin {
                 .field("organization_id", required(FieldType::String))
                 .field("token_hash", required(FieldType::String).unique())
                 .field("expires_at", optional(FieldType::DateTime)),
+        )
+        .table(
+            "scim_group",
+            TableSchema::default()
+                .field("id", required(FieldType::String).unique())
+                .field("display_name", required(FieldType::String))
+                .field("organization_id", required(FieldType::String)),
+        )
+        .table(
+            "scim_group_member",
+            TableSchema::default()
+                .field("id", required(FieldType::String).unique())
+                .field("group_id", required(FieldType::String))
+                .field("user_id", required(FieldType::String)),
         )
     }
 }
@@ -657,9 +676,94 @@ pub struct ScimBulkResponse {
     pub response: Option<serde_json::Value>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ScimPatchOperation {
+    pub op: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ScimGroup {
+    pub id: String,
+    pub display_name: String,
+    pub organization_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ScimGroupMember {
+    pub group_id: String,
+    pub user_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ScimTokenRecord {
+    pub id: String,
+    pub organization_id: String,
+    pub token_hash: String,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+}
+
 impl ScimService {
     pub fn new(adapter: Arc<dyn DbAdapter>) -> Self {
         Self { adapter }
+    }
+
+    pub async fn issue_token(
+        &self,
+        organization_id: &str,
+        expires_at: Option<u64>,
+    ) -> Result<String> {
+        if organization_id.trim().is_empty() {
+            return Err(AuthError::InvalidRequest(
+                "SCIM organization_id cannot be empty".into(),
+            ));
+        }
+        let (token, token_hash) = generate_scim_token();
+        let record = ScimTokenRecord {
+            id: Uuid::new_v4().to_string(),
+            organization_id: organization_id.into(),
+            token_hash,
+            expires_at,
+        };
+        self.adapter
+            .insert(
+                "scim_token",
+                &record.id,
+                serde_json::to_value(record).map_err(serialize_error)?,
+            )
+            .await?;
+        Ok(token)
+    }
+
+    pub async fn authorize_token(
+        &self,
+        token: &str,
+        organization_id: Option<&str>,
+        now_seconds: u64,
+    ) -> Result<ScimTokenRecord> {
+        let hash = hash_secret(token);
+        let Some((_, value)) = self
+            .adapter
+            .get_by_field(
+                "scim_token",
+                "token_hash",
+                &serde_json::Value::String(hash),
+            )
+            .await?
+        else {
+            return Err(AuthError::Unauthorized);
+        };
+        let record: ScimTokenRecord = serde_json::from_value(value).map_err(serialize_error)?;
+        if organization_id.is_some_and(|id| id != record.organization_id)
+            || record.expires_at.is_some_and(|expires| expires <= now_seconds)
+        {
+            return Err(AuthError::Unauthorized);
+        }
+        Ok(record)
     }
 
     pub async fn create_user(&self, email: &str, name: &str) -> Result<serde_json::Value> {
@@ -687,7 +791,7 @@ impl ScimService {
             .get("user", user_id)
             .await?
             .ok_or(AuthError::NotFound)?;
-        user = merge_scim_patch(user, &patch)?;
+        user = apply_scim_user_patch(user, &patch)?;
         self.adapter.update("user", user_id, user.clone()).await?;
         Ok(user)
     }
@@ -710,6 +814,161 @@ impl ScimService {
             return Err(AuthError::NotFound);
         }
         self.adapter.delete("user", user_id).await
+    }
+
+    pub async fn create_group(
+        &self,
+        organization_id: &str,
+        display_name: &str,
+    ) -> Result<serde_json::Value> {
+        let display_name = display_name.trim();
+        if organization_id.trim().is_empty() || display_name.is_empty() {
+            return Err(AuthError::InvalidRequest(
+                "SCIM group organization and displayName are required".into(),
+            ));
+        }
+        let group = ScimGroup {
+            id: Uuid::new_v4().to_string(),
+            display_name: display_name.into(),
+            organization_id: organization_id.into(),
+        };
+        self.adapter
+            .insert(
+                "scim_group",
+                &group.id,
+                serde_json::to_value(&group).map_err(serialize_error)?,
+            )
+            .await?;
+        self.group_resource(&group).await
+    }
+
+    pub async fn get_group(&self, group_id: &str) -> Result<serde_json::Value> {
+        let group = self.load_group(group_id).await?;
+        self.group_resource(&group).await
+    }
+
+    pub async fn list_groups(
+        &self,
+        organization_id: &str,
+        start_index: usize,
+        count: usize,
+    ) -> Result<serde_json::Value> {
+        if start_index == 0 {
+            return Err(AuthError::InvalidRequest(
+                "SCIM startIndex is one-based".into(),
+            ));
+        }
+        let groups = self
+            .adapter
+            .list("scim_group")
+            .await?
+            .into_iter()
+            .filter_map(|(_, value)| serde_json::from_value::<ScimGroup>(value).ok())
+            .filter(|group| group.organization_id == organization_id)
+            .collect::<Vec<_>>();
+        let total = groups.len();
+        let start = start_index.saturating_sub(1).min(total);
+        let end = start.saturating_add(count).min(total);
+        let mut resources = Vec::new();
+        for group in &groups[start..end] {
+            resources.push(self.group_resource(group).await?);
+        }
+        Ok(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
+            "totalResults": total,
+            "startIndex": start + 1,
+            "itemsPerPage": resources.len(),
+            "Resources": resources,
+        }))
+    }
+
+    pub async fn update_group(
+        &self,
+        group_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let mut group = self.load_group(group_id).await?;
+        let Some(object) = patch.as_object() else {
+            return Err(AuthError::InvalidRequest(
+                "SCIM group patch must be an object".into(),
+            ));
+        };
+        if let Some(value) = object
+            .get("displayName")
+            .or_else(|| object.get("display_name"))
+            .and_then(serde_json::Value::as_str)
+        {
+            if value.trim().is_empty() {
+                return Err(AuthError::InvalidRequest(
+                    "SCIM group displayName cannot be empty".into(),
+                ));
+            }
+            group.display_name = value.trim().into();
+        }
+        self.adapter
+            .update(
+                "scim_group",
+                group_id,
+                serde_json::to_value(&group).map_err(serialize_error)?,
+            )
+            .await?;
+        if let Some(members) = object.get("members") {
+            self.replace_group_members(group_id, members).await?;
+        }
+        self.group_resource(&group).await
+    }
+
+    pub async fn delete_group(&self, group_id: &str) -> Result<()> {
+        self.load_group(group_id).await?;
+        let operations = self
+            .adapter
+            .list("scim_group_member")
+            .await?
+            .into_iter()
+            .filter(|(_, value)| {
+                value
+                    .get("group_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(group_id)
+            })
+            .map(|(id, _)| DbOperation::Delete {
+                table: "scim_group_member".into(),
+                id,
+            })
+            .chain(std::iter::once(DbOperation::Delete {
+                table: "scim_group".into(),
+                id: group_id.into(),
+            }))
+            .collect();
+        self.adapter.transaction(operations).await
+    }
+
+    pub async fn add_group_member(&self, group_id: &str, user_id: &str) -> Result<()> {
+        self.load_group(group_id).await?;
+        if self.adapter.get("user", user_id).await?.is_none() {
+            return Err(AuthError::NotFound);
+        }
+        let member = ScimGroupMember {
+            group_id: group_id.into(),
+            user_id: user_id.into(),
+        };
+        self.adapter
+            .insert(
+                "scim_group_member",
+                &scim_group_member_id(group_id, user_id),
+                serde_json::to_value(member).map_err(serialize_error)?,
+            )
+            .await
+    }
+
+    pub async fn remove_group_member(&self, group_id: &str, user_id: &str) -> Result<()> {
+        self.load_group(group_id).await?;
+        self.adapter
+            .delete(
+                "scim_group_member",
+                &scim_group_member_id(group_id, user_id),
+            )
+            .await
     }
 
     pub async fn list_users_filtered(
@@ -853,6 +1112,84 @@ impl ScimService {
             }
         }
         Ok(responses)
+    }
+
+    async fn load_group(&self, group_id: &str) -> Result<ScimGroup> {
+        let value = self
+            .adapter
+            .get("scim_group", group_id)
+            .await?
+            .ok_or(AuthError::NotFound)?;
+        serde_json::from_value(value).map_err(serialize_error)
+    }
+
+    async fn group_resource(&self, group: &ScimGroup) -> Result<serde_json::Value> {
+        let members = self
+            .adapter
+            .list("scim_group_member")
+            .await?
+            .into_iter()
+            .filter_map(|(_, value)| serde_json::from_value::<ScimGroupMember>(value).ok())
+            .filter(|member| member.group_id == group.id)
+            .map(|member| json!({"value": member.user_id}))
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+            "id": group.id,
+            "displayName": group.display_name,
+            "members": members,
+            "meta": {"resourceType": "Group"},
+        }))
+    }
+
+    async fn replace_group_members(
+        &self,
+        group_id: &str,
+        members: &serde_json::Value,
+    ) -> Result<()> {
+        let Some(members) = members.as_array() else {
+            return Err(AuthError::InvalidRequest(
+                "SCIM group members must be an array".into(),
+            ));
+        };
+        let mut operations = self
+            .adapter
+            .list("scim_group_member")
+            .await?
+            .into_iter()
+            .filter(|(_, value)| {
+                value
+                    .get("group_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(group_id)
+            })
+            .map(|(id, _)| DbOperation::Delete {
+                table: "scim_group_member".into(),
+                id,
+            })
+            .collect::<Vec<_>>();
+        for member in members {
+            let user_id = member
+                .get("value")
+                .or_else(|| member.get("user_id"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    AuthError::InvalidRequest("SCIM group member requires value".into())
+                })?;
+            if self.adapter.get("user", user_id).await?.is_none() {
+                return Err(AuthError::NotFound);
+            }
+            let member = ScimGroupMember {
+                group_id: group_id.into(),
+                user_id: user_id.into(),
+            };
+            operations.push(DbOperation::Insert {
+                table: "scim_group_member".into(),
+                id: scim_group_member_id(group_id, user_id),
+                record: serde_json::to_value(member).map_err(serialize_error)?,
+            });
+        }
+        self.adapter.transaction(operations).await
     }
 }
 
