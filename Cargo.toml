@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/better-auth-core",
+    "crates/better-auth",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.78"
+
+[workspace.dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+hmac = "0.12"
+http = "1"
+password-hash = "0.5"
+scrypt = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+

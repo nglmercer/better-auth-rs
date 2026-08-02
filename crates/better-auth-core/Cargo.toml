@@ -1,0 +1,17 @@
+[package]
+name = "better-auth-core"
+version = "0.1.0"
+description = "Shared types and adapter contracts for a Rust Better Auth implementation"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+uuid.workspace = true
+
