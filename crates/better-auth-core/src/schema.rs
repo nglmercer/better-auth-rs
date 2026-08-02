@@ -102,6 +102,7 @@ pub fn core_schema() -> SchemaExtension {
                 .field("email", FieldSchema::required(String).unique())
                 .field("name", FieldSchema::required(String))
                 .field("email_verified", FieldSchema::required(Boolean))
+                .field("role", FieldSchema::optional(String))
                 .field("image", FieldSchema::optional(String)),
         )
         .table(

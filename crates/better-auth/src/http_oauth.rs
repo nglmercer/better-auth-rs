@@ -1,4 +1,7 @@
-use crate::oauth::{OAuthProvider, OAuthProviderConfig, OAuthTokens, OAuthUserProfile};
+use crate::{
+    oauth::{OAuthProvider, OAuthProviderConfig, OAuthTokens, OAuthUserProfile},
+    oidc::OidcIdTokenValidator,
+};
 use async_trait::async_trait;
 use better_auth_core::error::{AuthError, Result};
 use reqwest::Client;
@@ -13,6 +16,7 @@ pub struct HttpOAuthProvider {
     token_endpoint: Url,
     userinfo_endpoint: Url,
     client: Client,
+    id_token_validator: Option<OidcIdTokenValidator>,
 }
 
 impl HttpOAuthProvider {
@@ -35,7 +39,13 @@ impl HttpOAuthProvider {
             token_endpoint,
             userinfo_endpoint,
             client: Client::new(),
+            id_token_validator: None,
         })
+    }
+
+    pub fn with_oidc_validator(mut self, validator: OidcIdTokenValidator) -> Self {
+        self.id_token_validator = Some(validator);
+        self
     }
 
     pub fn google(client_id: impl Into<String>, client_secret: impl Into<String>) -> Result<Self> {
@@ -128,6 +138,10 @@ impl OAuthProvider for HttpOAuthProvider {
                 .and_then(Value::as_str)
                 .unwrap_or("Bearer")
                 .to_owned(),
+            id_token: body
+                .get("id_token")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         })
     }
 
@@ -176,6 +190,14 @@ impl OAuthProvider for HttpOAuthProvider {
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
         })
+    }
+
+    fn validate_tokens(&self, tokens: &OAuthTokens, expected_nonce: &str) -> Result<()> {
+        if let Some(validator) = &self.id_token_validator {
+            let id_token = tokens.id_token.as_deref().ok_or(AuthError::Unauthorized)?;
+            validator.validate(id_token, Some(expected_nonce))?;
+        }
+        Ok(())
     }
 }
 

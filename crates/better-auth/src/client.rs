@@ -71,6 +71,47 @@ impl AuthClient {
         Ok(Some((user, session)))
     }
 
+    pub fn http_client() -> Result<reqwest::Client> {
+        reqwest::Client::builder()
+            .cookie_store(true)
+            .build()
+            .map_err(|error| AuthError::Adapter(format!("auth HTTP client setup failed: {error}")))
+    }
+
+    pub async fn execute(
+        &self,
+        client: &reqwest::Client,
+        request: HttpRequest,
+    ) -> Result<HttpResponse> {
+        let mut builder = client.request(request.method, request.uri.to_string());
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
+        let response =
+            builder.body(request.body).send().await.map_err(|error| {
+                AuthError::Adapter(format!("auth HTTP request failed: {error}"))
+            })?;
+        let status = http::StatusCode::from_u16(response.status().as_u16()).map_err(|error| {
+            AuthError::Adapter(format!("invalid auth response status: {error}"))
+        })?;
+        let mut headers = HeaderMap::new();
+        for (name, value) in response.headers() {
+            headers.append(name, value.clone());
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| {
+                AuthError::Adapter(format!("auth response body read failed: {error}"))
+            })?
+            .to_vec();
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+
     fn json_request<T: Serialize>(
         &self,
         method: Method,

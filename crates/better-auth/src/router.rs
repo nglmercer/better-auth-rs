@@ -3,6 +3,7 @@ use crate::{
     context::{AuthContext, RequestMetadata},
     email_password::{AuthResult, EmailPasswordService, SignInInput, SignUpInput},
     rate_limit::{RateLimitPolicy, RateLimiter},
+    verification::{EmailVerificationService, PasswordResetService},
 };
 use better_auth_core::error::{AuthError, Result};
 use http::{header, HeaderMap, Method, StatusCode, Uri};
@@ -69,6 +70,8 @@ pub struct AuthRouter {
     email_password: EmailPasswordService,
     rate_limiter: Option<RateLimiter>,
     sign_in_policy: Option<RateLimitPolicy>,
+    email_verification: Option<EmailVerificationService>,
+    password_reset: Option<PasswordResetService>,
 }
 
 impl AuthRouter {
@@ -79,7 +82,20 @@ impl AuthRouter {
             email_password,
             rate_limiter: None,
             sign_in_policy: None,
+            email_verification: None,
+            password_reset: None,
         })
+    }
+
+    pub fn with_verification_services(mut self) -> Self {
+        if let Some(storage) = self.context.secondary_storage.clone() {
+            self.email_verification = Some(EmailVerificationService::new(
+                self.context.clone(),
+                storage.clone(),
+            ));
+            self.password_reset = Some(PasswordResetService::new(self.context.clone(), storage));
+        }
+        self
     }
 
     pub fn with_sign_in_rate_limit(
@@ -162,6 +178,38 @@ impl AuthRouter {
                 Ok(HttpResponse::json(StatusCode::OK, json!({}))
                     .with_cookie(cookie.to_set_cookie_header()))
             }
+            (Method::POST, "/verify-email") => {
+                check_csrf(&request_context, &request.metadata())?;
+                let input: TokenInput = parse_json(&request.body)?;
+                let service = self.email_verification.as_ref().ok_or_else(|| {
+                    AuthError::InvalidConfiguration("verification storage is not configured".into())
+                })?;
+                let verified = service.verify(&input.token).await?;
+                Ok(HttpResponse::json(
+                    StatusCode::OK,
+                    json!({"verified": verified}),
+                ))
+            }
+            (Method::POST, "/request-password-reset") => {
+                check_csrf(&request_context, &request.metadata())?;
+                let input: EmailInput = parse_json(&request.body)?;
+                let service = self.password_reset.as_ref().ok_or_else(|| {
+                    AuthError::InvalidConfiguration("verification storage is not configured".into())
+                })?;
+                let _ = service
+                    .issue(&input.email, std::time::Duration::from_secs(15 * 60))
+                    .await?;
+                Ok(HttpResponse::json(StatusCode::OK, json!({"sent": true})))
+            }
+            (Method::POST, "/reset-password") => {
+                check_csrf(&request_context, &request.metadata())?;
+                let input: PasswordResetInput = parse_json(&request.body)?;
+                let service = self.password_reset.as_ref().ok_or_else(|| {
+                    AuthError::InvalidConfiguration("verification storage is not configured".into())
+                })?;
+                let reset = service.reset(&input.token, &input.new_password).await?;
+                Ok(HttpResponse::json(StatusCode::OK, json!({"reset": reset})))
+            }
             _ if endpoint.starts_with('/') => Err(AuthError::NotFound),
             _ => Err(AuthError::NotFound),
         }
@@ -181,6 +229,22 @@ impl AuthRouter {
             .unwrap_or_else(|| identity.trim().to_ascii_lowercase());
         limiter.enforce(policy, &identity).await
     }
+}
+
+#[derive(serde::Deserialize)]
+struct TokenInput {
+    token: String,
+}
+
+#[derive(serde::Deserialize)]
+struct EmailInput {
+    email: String,
+}
+
+#[derive(serde::Deserialize)]
+struct PasswordResetInput {
+    token: String,
+    new_password: String,
 }
 
 fn parse_json<T: DeserializeOwned>(body: &[u8]) -> Result<T> {

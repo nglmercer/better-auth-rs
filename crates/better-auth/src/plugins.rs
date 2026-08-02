@@ -8,6 +8,7 @@ use data_encoding::BASE32_NOPAD;
 use hmac::{Hmac, Mac};
 use http::Method;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
@@ -468,7 +469,42 @@ impl AdminGuard {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
+pub struct AdminService {
+    adapter: Arc<dyn DbAdapter>,
+    guard: AdminGuard,
+}
+
+impl AdminService {
+    pub fn new(adapter: Arc<dyn DbAdapter>, guard: AdminGuard) -> Self {
+        Self { adapter, guard }
+    }
+
+    pub async fn set_role(&self, actor_id: &str, user_id: &str, role: &str) -> Result<()> {
+        let actor = self
+            .adapter
+            .get("user", actor_id)
+            .await?
+            .ok_or(AuthError::Unauthorized)?;
+        if !self.guard.allows(
+            actor
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(""),
+        ) {
+            return Err(AuthError::Forbidden("administrator role required".into()));
+        }
+        let mut user = self
+            .adapter
+            .get("user", user_id)
+            .await?
+            .ok_or(AuthError::NotFound)?;
+        user["role"] = role.into();
+        self.adapter.update("user", user_id, user).await
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SsoConnectionConfig {
     pub id: String,
     pub issuer: String,
@@ -516,6 +552,37 @@ impl SsoConnectionConfig {
     }
 }
 
+#[derive(Clone)]
+pub struct SsoConnectionService {
+    adapter: Arc<dyn DbAdapter>,
+}
+
+impl SsoConnectionService {
+    pub fn new(adapter: Arc<dyn DbAdapter>) -> Self {
+        Self { adapter }
+    }
+
+    pub async fn create(&self, connection: SsoConnectionConfig) -> Result<()> {
+        connection.validate()?;
+        self.adapter
+            .insert(
+                "sso_connection",
+                &connection.id,
+                serde_json::to_value(&connection).map_err(serialize_error)?,
+            )
+            .await
+    }
+
+    pub async fn get(&self, id: &str) -> Result<Option<SsoConnectionConfig>> {
+        let Some(value) = self.adapter.get("sso_connection", id).await? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            serde_json::from_value(value).map_err(serialize_error)?,
+        ))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScimPlugin;
 
@@ -527,7 +594,10 @@ impl Plugin for ScimPlugin {
         vec![
             endpoint(Method::GET, "/scim/v2/Users", "List SCIM users"),
             endpoint(Method::POST, "/scim/v2/Users", "Create a SCIM user"),
+            endpoint(Method::GET, "/scim/v2/Users/:id", "Get a SCIM user"),
             endpoint(Method::PATCH, "/scim/v2/Users/:id", "Update a SCIM user"),
+            endpoint(Method::DELETE, "/scim/v2/Users/:id", "Delete a SCIM user"),
+            endpoint(Method::POST, "/scim/v2/Bulk", "Apply SCIM bulk operations"),
         ]
     }
     fn schema(&self) -> SchemaExtension {
@@ -549,6 +619,416 @@ pub fn generate_scim_token() -> (String, String) {
 
 pub fn verify_scim_token(token: &str, expected_hash: &str) -> bool {
     hash_secret(token) == expected_hash
+}
+
+#[derive(Clone)]
+pub struct ScimService {
+    adapter: Arc<dyn DbAdapter>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ScimBulkOperation {
+    pub method: String,
+    pub path: String,
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ScimBulkResponse {
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response: Option<serde_json::Value>,
+}
+
+impl ScimService {
+    pub fn new(adapter: Arc<dyn DbAdapter>) -> Self {
+        Self { adapter }
+    }
+
+    pub async fn create_user(&self, email: &str, name: &str) -> Result<serde_json::Value> {
+        let user = json!({
+            "id": Uuid::new_v4().to_string(),
+            "email": email.trim().to_ascii_lowercase(),
+            "name": name.trim(),
+            "email_verified": true,
+            "role": "user",
+        });
+        let id = user["id"]
+            .as_str()
+            .ok_or_else(|| AuthError::Adapter("SCIM user has no id".into()))?;
+        self.adapter.insert("user", id, user.clone()).await?;
+        Ok(user)
+    }
+
+    pub async fn update_user(
+        &self,
+        user_id: &str,
+        patch: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let mut user = self
+            .adapter
+            .get("user", user_id)
+            .await?
+            .ok_or(AuthError::NotFound)?;
+        user = merge_scim_patch(user, &patch)?;
+        self.adapter.update("user", user_id, user.clone()).await?;
+        Ok(user)
+    }
+
+    pub async fn list_users(&self, start_index: usize, count: usize) -> Result<serde_json::Value> {
+        self.list_users_filtered(start_index, count, None).await
+    }
+
+    pub async fn get_user(&self, user_id: &str) -> Result<serde_json::Value> {
+        let user = self
+            .adapter
+            .get("user", user_id)
+            .await?
+            .ok_or(AuthError::NotFound)?;
+        Ok(scim_user_resource(user_id, &user))
+    }
+
+    pub async fn delete_user(&self, user_id: &str) -> Result<()> {
+        if self.adapter.get("user", user_id).await?.is_none() {
+            return Err(AuthError::NotFound);
+        }
+        self.adapter.delete("user", user_id).await
+    }
+
+    pub async fn list_users_filtered(
+        &self,
+        start_index: usize,
+        count: usize,
+        filter: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        if start_index == 0 {
+            return Err(AuthError::InvalidRequest(
+                "SCIM startIndex is one-based".into(),
+            ));
+        }
+        let predicate = ScimFilter::parse(filter)?;
+        let records = self
+            .adapter
+            .list("user")
+            .await?
+            .into_iter()
+            .filter(|(_, user)| predicate.matches(user))
+            .collect::<Vec<_>>();
+        let total = records.len();
+        let start = start_index.saturating_sub(1).min(total);
+        let end = start.saturating_add(count).min(total);
+        let resources = records[start..end]
+            .iter()
+            .map(|(id, user)| scim_user_resource(id, user))
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
+            "totalResults": total,
+            "startIndex": start + 1,
+            "itemsPerPage": resources.len(),
+            "Resources": resources,
+        }))
+    }
+
+    pub async fn apply_bulk(
+        &self,
+        operations: &[ScimBulkOperation],
+        fail_on_errors: usize,
+    ) -> Result<Vec<ScimBulkResponse>> {
+        if operations.len() > 1_000 {
+            return Err(AuthError::InvalidRequest(
+                "SCIM bulk request exceeds the 1000 operation limit".into(),
+            ));
+        }
+        let mut planned = Vec::new();
+        let mut responses = Vec::with_capacity(operations.len());
+        let mut errors = 0;
+        for operation in operations {
+            let method = operation.method.to_ascii_uppercase();
+            let path = normalize_scim_path(&operation.path)?;
+            let id = path.strip_prefix("/Users/").unwrap_or_default();
+            let result = match (method.as_str(), id.is_empty()) {
+                ("POST", true) => {
+                    let data = operation.data.clone().ok_or_else(|| {
+                        AuthError::InvalidRequest("SCIM POST operation requires data".into())
+                    })?;
+                    let user = scim_user_from_resource(&data)?;
+                    let id = Uuid::new_v4().to_string();
+                    planned.push(DbOperation::Insert {
+                        table: "user".into(),
+                        id: id.clone(),
+                        record: user.clone(),
+                    });
+                    Ok((201, Some(scim_user_resource(&id, &user))))
+                }
+                ("PUT", false) | ("PATCH", false) => {
+                    let existing = self
+                        .adapter
+                        .get("user", id)
+                        .await?
+                        .ok_or(AuthError::NotFound)?;
+                    let data = operation.data.clone().ok_or_else(|| {
+                        AuthError::InvalidRequest("SCIM update operation requires data".into())
+                    })?;
+                    let updated = if method == "PUT" {
+                        scim_user_from_resource(&data)?
+                    } else {
+                        merge_scim_patch(existing, &data)?
+                    };
+                    planned.push(DbOperation::Update {
+                        table: "user".into(),
+                        id: id.into(),
+                        record: updated.clone(),
+                    });
+                    Ok((200, Some(scim_user_resource(id, &updated))))
+                }
+                ("DELETE", false) => {
+                    if self.adapter.get("user", id).await?.is_none() {
+                        Err(AuthError::NotFound)
+                    } else {
+                        planned.push(DbOperation::Delete {
+                            table: "user".into(),
+                            id: id.into(),
+                        });
+                        Ok((204, None))
+                    }
+                }
+                ("POST", false) | ("PUT", true) | ("PATCH", true) | ("DELETE", true) => {
+                    Err(AuthError::InvalidRequest("invalid SCIM bulk path".into()))
+                }
+                _ => Err(AuthError::InvalidRequest(format!(
+                    "unsupported SCIM bulk method: {}",
+                    operation.method
+                ))),
+            };
+            match result {
+                Ok((status, response)) => responses.push(ScimBulkResponse {
+                    method,
+                    path: operation.path.clone(),
+                    status,
+                    response,
+                }),
+                Err(error) => {
+                    errors += 1;
+                    responses.push(ScimBulkResponse {
+                        method,
+                        path: operation.path.clone(),
+                        status: error.status_code(),
+                        response: Some(json!({"detail": error.to_string()})),
+                    });
+                    if fail_on_errors != 0 && errors >= fail_on_errors {
+                        break;
+                    }
+                }
+            }
+        }
+        if fail_on_errors != 0 && errors >= fail_on_errors {
+            return Err(AuthError::InvalidRequest(
+                "SCIM bulk request exceeded failOnErrors".into(),
+            ));
+        } else {
+            if !planned.is_empty() {
+                self.adapter.transaction(planned).await?;
+            }
+        }
+        Ok(responses)
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ScimFilter {
+    All,
+    Eq(String, String),
+    Contains(String, String),
+    StartsWith(String, String),
+    Present(String),
+}
+
+impl ScimFilter {
+    fn parse(filter: Option<&str>) -> Result<Self> {
+        let Some(filter) = filter.map(str::trim).filter(|filter| !filter.is_empty()) else {
+            return Ok(Self::All);
+        };
+        let tokens = filter.split_whitespace().collect::<Vec<_>>();
+        if tokens.len() == 2 && tokens[1].eq_ignore_ascii_case("pr") {
+            return Ok(Self::Present(normalize_scim_attribute(tokens[0])?));
+        }
+        if tokens.len() < 3 {
+            return Err(AuthError::InvalidRequest("invalid SCIM filter".into()));
+        }
+        let attribute = normalize_scim_attribute(tokens[0])?;
+        let operator = tokens[1].to_ascii_lowercase();
+        let raw = tokens[2..].join(" ");
+        let value = raw
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .or_else(|| {
+                raw.strip_prefix('\'')
+                    .and_then(|value| value.strip_suffix('\''))
+            })
+            .unwrap_or(&raw)
+            .to_owned();
+        match operator.as_str() {
+            "eq" => Ok(Self::Eq(attribute, value)),
+            "co" => Ok(Self::Contains(attribute, value)),
+            "sw" => Ok(Self::StartsWith(attribute, value)),
+            "pr" if tokens.len() == 2 => Ok(Self::Present(attribute)),
+            _ => Err(AuthError::InvalidRequest(
+                "SCIM supports eq, co, sw, and pr filters".into(),
+            )),
+        }
+    }
+
+    fn matches(&self, user: &serde_json::Value) -> bool {
+        if matches!(self, Self::All) {
+            return true;
+        }
+        let Some(value) = scim_attribute(user, self.attribute()) else {
+            return false;
+        };
+        match self {
+            Self::All => true,
+            Self::Eq(_, expected) => value.eq_ignore_ascii_case(expected),
+            Self::Contains(_, expected) => value
+                .to_ascii_lowercase()
+                .contains(&expected.to_ascii_lowercase()),
+            Self::StartsWith(_, expected) => value
+                .to_ascii_lowercase()
+                .starts_with(&expected.to_ascii_lowercase()),
+            Self::Present(_) => true,
+        }
+    }
+
+    fn attribute(&self) -> &str {
+        match self {
+            Self::All => "",
+            Self::Eq(attribute, _)
+            | Self::Contains(attribute, _)
+            | Self::StartsWith(attribute, _)
+            | Self::Present(attribute) => attribute,
+        }
+    }
+}
+
+fn normalize_scim_attribute(attribute: &str) -> Result<String> {
+    match attribute.to_ascii_lowercase().as_str() {
+        "id" => Ok("id".into()),
+        "username" | "emails.value" | "email" => Ok("email".into()),
+        "displayname" | "name" => Ok("name".into()),
+        "active" => Ok("active".into()),
+        _ => Err(AuthError::InvalidRequest(format!(
+            "unsupported SCIM attribute: {attribute}"
+        ))),
+    }
+}
+
+fn scim_attribute(user: &serde_json::Value, attribute: &str) -> Option<String> {
+    if attribute == "active" {
+        return Some(
+            user.get("active")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true)
+                .to_string(),
+        );
+    }
+    user.get(attribute)
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn scim_user_resource(id: &str, user: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+        "id": id,
+        "userName": user.get("email"),
+        "displayName": user.get("name"),
+        "active": user.get("active").and_then(serde_json::Value::as_bool).unwrap_or(true),
+        "meta": {"resourceType": "User"},
+    })
+}
+
+fn scim_user_from_resource(resource: &serde_json::Value) -> Result<serde_json::Value> {
+    let email = resource
+        .get("userName")
+        .or_else(|| resource.get("email"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|email| email.contains('@'))
+        .ok_or_else(|| AuthError::InvalidRequest("SCIM userName must be an email".into()))?;
+    let name = resource
+        .get("displayName")
+        .or_else(|| resource.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(email);
+    Ok(json!({
+        "email": email.to_ascii_lowercase(),
+        "name": name.trim(),
+        "email_verified": true,
+        "role": "user",
+        "active": resource.get("active").and_then(serde_json::Value::as_bool).unwrap_or(true),
+    }))
+}
+
+fn merge_scim_patch(
+    mut user: serde_json::Value,
+    patch: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let Some(patch) = patch.as_object() else {
+        return Err(AuthError::InvalidRequest(
+            "SCIM patch must be an object".into(),
+        ));
+    };
+    for (key, value) in patch {
+        match key.as_str() {
+            "userName" | "email" => user["email"] = value.clone(),
+            "displayName" | "name" => user["name"] = value.clone(),
+            "active" => user["active"] = value.clone(),
+            "role" => user["role"] = value.clone(),
+            "id" | "schemas" | "meta" => {}
+            _ => {
+                return Err(AuthError::InvalidRequest(format!(
+                    "unsupported SCIM patch attribute: {key}"
+                )))
+            }
+        }
+    }
+    Ok(user)
+}
+
+fn normalize_scim_path(path: &str) -> Result<String> {
+    let path = path
+        .strip_prefix("/scim/v2")
+        .or_else(|| path.strip_prefix("/"))
+        .unwrap_or(path)
+        .trim_end_matches('/');
+    if path == "/Users" || path.starts_with("/Users/") {
+        Ok(path.into())
+    } else {
+        Err(AuthError::InvalidRequest("invalid SCIM bulk path".into()))
+    }
+}
+
+trait ScimErrorStatus {
+    fn status_code(&self) -> u16;
+}
+
+impl ScimErrorStatus for AuthError {
+    fn status_code(&self) -> u16 {
+        match self {
+            AuthError::InvalidRequest(_) => 400,
+            AuthError::Unauthorized => 401,
+            AuthError::Forbidden(_) => 403,
+            AuthError::NotFound => 404,
+            AuthError::RateLimited { .. } => 429,
+            AuthError::InvalidConfiguration(_)
+            | AuthError::Adapter(_)
+            | AuthError::Plugin(_)
+            | AuthError::Crypto(_) => 500,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -675,5 +1155,53 @@ mod tests {
         let (token, hash) = generate_scim_token();
         assert!(verify_scim_token(&token, &hash));
         assert!(!verify_scim_token("wrong", &hash));
+    }
+
+    #[tokio::test]
+    async fn admin_and_scim_services_enforce_and_persist_roles() {
+        let adapter = Arc::new(MemoryDb::default());
+        adapter
+            .insert(
+                "user",
+                "admin",
+                json!({"id":"admin","email":"admin@example.com","name":"Admin","email_verified":true,"role":"admin"}),
+            )
+            .await
+            .unwrap();
+        adapter
+            .insert(
+                "user",
+                "user",
+                json!({"id":"user","email":"user@example.com","name":"User","email_verified":true,"role":"user"}),
+            )
+            .await
+            .unwrap();
+        let admin = AdminService::new(adapter.clone(), AdminGuard::new(["admin"]));
+        admin.set_role("admin", "user", "manager").await.unwrap();
+        let scim = ScimService::new(adapter);
+        let updated = scim
+            .update_user("user", json!({"name":"Updated"}))
+            .await
+            .unwrap();
+        assert_eq!(updated["name"], "Updated");
+        let page = scim.list_users(1, 1).await.unwrap();
+        assert_eq!(page["totalResults"], 2);
+        assert_eq!(page["itemsPerPage"], 1);
+        let filtered = scim
+            .list_users_filtered(1, 10, Some(r#"userName eq "user@example.com""#))
+            .await
+            .unwrap();
+        assert_eq!(filtered["totalResults"], 1);
+        let operations = vec![ScimBulkOperation {
+            method: "PATCH".into(),
+            path: "/Users/user".into(),
+            data: Some(json!({"displayName":"Bulk Updated"})),
+        }];
+        let result = scim.apply_bulk(&operations, 1).await.unwrap();
+        assert_eq!(result[0].status, 200);
+        assert_eq!(
+            scim.get_user("user").await.unwrap()["displayName"],
+            "Bulk Updated"
+        );
     }
 }

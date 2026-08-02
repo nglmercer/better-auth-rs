@@ -1,6 +1,6 @@
 use crate::{
     context::AuthContext,
-    cookies::{AuthCookie, SecretKeySet},
+    cookies::{AuthCookie, CookieCacheCodec, SecretKeySet},
     email_password::{AuthResult, EmailPasswordService, User},
 };
 use async_trait::async_trait;
@@ -83,6 +83,7 @@ struct OAuthState {
     state: String,
     redirect_uri: String,
     code_verifier: String,
+    nonce: String,
     expires_at: u64,
 }
 
@@ -91,6 +92,7 @@ pub struct OAuthAuthorization {
     pub provider_id: String,
     pub state: String,
     pub code_verifier: String,
+    pub nonce: String,
     pub authorization_url: Url,
     pub state_cookie: Option<AuthCookie>,
 }
@@ -131,12 +133,14 @@ impl OAuthStateManager {
     ) -> Result<OAuthAuthorization> {
         let pkce = PkcePair::generate();
         let state = Uuid::new_v4().simple().to_string();
+        let nonce = Uuid::new_v4().simple().to_string();
         let expires_at = now_seconds() + provider.state_ttl.as_secs();
         let record = OAuthState {
             provider_id: provider.id.clone(),
             state: state.clone(),
             redirect_uri: redirect_uri.to_owned(),
             code_verifier: pkce.verifier.clone(),
+            nonce: nonce.clone(),
             expires_at,
         };
         let mut authorization_url = provider.authorization_endpoint.clone();
@@ -148,7 +152,8 @@ impl OAuthStateManager {
                 .append_pair("response_type", "code")
                 .append_pair("state", &state)
                 .append_pair("code_challenge", &pkce.challenge)
-                .append_pair("code_challenge_method", "S256");
+                .append_pair("code_challenge_method", "S256")
+                .append_pair("nonce", &nonce);
             if !provider.scopes.is_empty() {
                 query.append_pair("scope", &provider.scopes.join(" "));
             }
@@ -189,6 +194,7 @@ impl OAuthStateManager {
             provider_id: provider.id.clone(),
             state,
             code_verifier: pkce.verifier,
+            nonce,
             authorization_url,
             state_cookie,
         })
@@ -199,7 +205,7 @@ impl OAuthStateManager {
         provider_id: &str,
         state: &str,
         signed_cookie: Option<&str>,
-    ) -> Result<(String, String)> {
+    ) -> Result<(String, String, String)> {
         let record: OAuthState = match self.mode {
             OAuthStateStorage::Verification => {
                 let storage = self.storage.as_ref().ok_or_else(|| {
@@ -223,7 +229,7 @@ impl OAuthStateManager {
         {
             return Err(AuthError::Unauthorized);
         }
-        Ok((record.redirect_uri, record.code_verifier))
+        Ok((record.redirect_uri, record.code_verifier, record.nonce))
     }
 }
 
@@ -233,6 +239,8 @@ pub struct OAuthTokens {
     pub refresh_token: Option<String>,
     pub expires_at: Option<u64>,
     pub token_type: String,
+    #[serde(default)]
+    pub id_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -254,12 +262,17 @@ pub trait OAuthProvider: Send + Sync {
         code_verifier: &str,
     ) -> Result<OAuthTokens>;
     async fn profile(&self, tokens: &OAuthTokens) -> Result<OAuthUserProfile>;
+
+    fn validate_tokens(&self, _tokens: &OAuthTokens, _expected_nonce: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
 pub struct OAuthService {
     context: AuthContext,
     state: OAuthStateManager,
+    token_vault: ProviderTokenVault,
 }
 
 impl OAuthService {
@@ -267,11 +280,15 @@ impl OAuthService {
         let keys = SecretKeySet::from_options(&context.options)?;
         let state = OAuthStateManager::new(
             context.secondary_storage.clone(),
-            keys,
+            keys.clone(),
             mode,
             context.options.base_path.clone(),
         )?;
-        Ok(Self { context, state })
+        Ok(Self {
+            context,
+            state,
+            token_vault: ProviderTokenVault::new(keys),
+        })
     }
 
     pub async fn begin(
@@ -298,15 +315,18 @@ impl OAuthService {
                 "OAuth authentication requires a primary database".into(),
             ));
         }
-        let (redirect_uri, verifier) = self
+        let (redirect_uri, verifier, nonce) = self
             .state
             .consume(provider.id(), state, signed_state_cookie)
             .await?;
         let tokens = provider
             .exchange_code(code, &redirect_uri, &verifier)
             .await?;
+        provider.validate_tokens(&tokens, &nonce)?;
         let profile = provider.profile(&tokens).await?;
-        let user = self.find_or_create_user(provider.id(), &profile).await?;
+        let user = self
+            .find_or_create_user(provider.id(), &profile, &tokens)
+            .await?;
         EmailPasswordService::new(self.context.clone())?
             .create_session_for_user(user, secure_cookie)
             .await
@@ -316,6 +336,7 @@ impl OAuthService {
         &self,
         provider_id: &str,
         profile: &OAuthUserProfile,
+        tokens: &OAuthTokens,
     ) -> Result<User> {
         let account_id = format!("oauth:{provider_id}:{}", profile.provider_account_id);
         if let Some(account) = self.context.adapter.get(ACCOUNT_TABLE, &account_id).await? {
@@ -375,11 +396,44 @@ impl OAuthService {
                 "user_id": user.id,
                 "provider_id": provider_id,
                 "account_id": profile.provider_account_id,
-                "access_token": "",
+                "token_envelope": self.token_vault.seal(provider_id, tokens)?,
             }),
         });
         self.context.adapter.transaction(operations).await?;
         Ok(user)
+    }
+}
+
+#[derive(Clone)]
+pub struct ProviderTokenVault {
+    codec: CookieCacheCodec,
+}
+
+impl ProviderTokenVault {
+    pub fn new(keys: SecretKeySet) -> Self {
+        Self {
+            codec: CookieCacheCodec::new(keys),
+        }
+    }
+
+    pub fn seal(&self, provider_id: &str, tokens: &OAuthTokens) -> Result<String> {
+        let now = now_seconds();
+        self.codec.encode(
+            better_auth_core::options::CookieCacheStrategy::Jwe,
+            provider_id,
+            serde_json::to_value(tokens).map_err(serialize_error)?,
+            now,
+            tokens.expires_at.unwrap_or(now + 24 * 60 * 60).max(now + 1),
+        )
+    }
+
+    pub fn open(&self, envelope: &str) -> Result<OAuthTokens> {
+        let claims = self.codec.decode(
+            better_auth_core::options::CookieCacheStrategy::Jwe,
+            envelope,
+            now_seconds(),
+        )?;
+        serde_json::from_value(claims.data).map_err(serialize_error)
     }
 }
 
@@ -431,8 +485,9 @@ mod tests {
             .await
             .unwrap();
         assert!(auth.authorization_url.as_str().contains("code_challenge="));
-        let (_, verifier) = manager.consume("example", &auth.state, None).await.unwrap();
+        let (_, verifier, nonce) = manager.consume("example", &auth.state, None).await.unwrap();
         assert_eq!(verifier, auth.code_verifier);
+        assert_eq!(nonce, auth.nonce);
         assert!(manager.consume("example", &auth.state, None).await.is_err());
     }
 
@@ -457,11 +512,12 @@ mod tests {
             .await
             .unwrap();
         let cookie = auth.state_cookie.unwrap();
-        let (_, verifier) = manager
+        let (_, verifier, nonce) = manager
             .consume("example", &auth.state, Some(&cookie.value))
             .await
             .unwrap();
         assert_eq!(verifier, auth.code_verifier);
+        assert_eq!(nonce, auth.nonce);
     }
 
     struct MockProvider;
@@ -483,6 +539,7 @@ mod tests {
                 refresh_token: None,
                 expires_at: None,
                 token_type: "Bearer".into(),
+                id_token: None,
             })
         }
 

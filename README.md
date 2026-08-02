@@ -15,7 +15,7 @@ use the same auth context and security behavior.
 
 ## Current implementation
 
-The foundation covers roadmap phases 0–5 at the contract/runtime level:
+The workspace now covers all roadmap phases at a framework-neutral baseline:
 
 - configuration validation and the no-durable-store cookie-cache defaults;
 - static, request-derived, and allowed-host dynamic base URLs;
@@ -29,11 +29,26 @@ The foundation covers roadmap phases 0–5 at the contract/runtime level:
 - Origin, Fetch Metadata, trusted-proxy, and trusted-IP-header helpers.
 - email/password sign-up and sign-in, persisted sessions, cookie lookup, and
   sign-out on top of the adapter contract.
+- JWT/JWE cookie-cache codecs with key-version lookup and session refresh.
+- purpose-bound email verification and password-reset tokens.
+- rate-limit enforcement backed by atomic secondary-storage increments.
+- OAuth authorization state, PKCE, generic HTTPS provider exchange, and
+  Google/GitHub provider presets.
+- TOTP and one-time backup codes, organization membership, passkey challenge
+  replay protection, admin role guards, SSO connection persistence, SCIM user
+  persistence/token hashing, and JWT issuance.
+- framework-neutral HTTP endpoints, an optional Axum adapter, and a client
+  request SDK with reqwest transport and cookie-jar support.
+- SQLite relational and secondary-storage adapters plus dialect-neutral
+  migration plan generation.
 
-OAuth/PKCE, framework adapters, rate-limit enforcement, cookie-cache JWE/JWT
-encoding, and advanced plugins remain the next implementation layers. The
-traits are intentionally small so those features can be added without making
-the core depend on a database or web framework.
+The remaining work is production-hardening rather than missing architecture:
+full WebAuthn attestation/assertion cryptography, SAML-specific SSO, full SCIM
+protocol pagination/filtering, concrete production database adapters, and a
+retry policy. Postgres/MySQL adapters, OAuth ID-token validation, and provider
+token encryption are also production-hardening items. The traits are
+intentionally small so those features can be added without making the core
+depend on a database or web framework.
 
 ## Verify
 

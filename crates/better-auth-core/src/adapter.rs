@@ -59,6 +59,8 @@ pub trait DbAdapter: Send + Sync {
         value: &Value,
     ) -> Result<Option<(String, Value)>>;
 
+    async fn list(&self, table: &str) -> Result<Vec<(String, Value)>>;
+
     async fn transaction(&self, operations: Vec<DbOperation>) -> Result<()>;
 }
 
@@ -148,6 +150,20 @@ pub mod memory {
                     None
                 }
             }))
+        }
+
+        async fn list(&self, table: &str) -> Result<Vec<(String, Value)>> {
+            let records = self
+                .records
+                .lock()
+                .map_err(|_| AuthError::Adapter("memory DB lock poisoned".into()))?;
+            let mut result = records
+                .iter()
+                .filter(|((record_table, _), _)| record_table == table)
+                .map(|((_, id), record)| (id.clone(), record.clone()))
+                .collect::<Vec<_>>();
+            result.sort_by(|left, right| left.0.cmp(&right.0));
+            Ok(result)
         }
 
         async fn transaction(&self, operations: Vec<DbOperation>) -> Result<()> {

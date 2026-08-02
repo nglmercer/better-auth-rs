@@ -1,70 +1,52 @@
 # Better Auth Rust Rewrite — Progress Report
 
 **Report date:** 2026-08-01  
-**Current commit:** `24dc526` — Add email/password sign-up, sign-in, and session management  
-**Overall status:** Foundation implemented; HTTP/framework integration and advanced auth features remain.
+**Baseline commit:** `24dc526`  
+**Current status:** All roadmap phases have a working framework-neutral baseline; production protocol hardening remains.
 
-## Executive summary
+## Summary
 
-The rewrite has a working, framework-neutral Rust foundation. Core configuration, request context resolution, adapter contracts, schema/plugin aggregation, security helpers, password hashing, secure cookies, and a database-backed email/password session flow are implemented.
-
-The project is not yet feature-complete Better Auth. OAuth/PKCE, concrete framework routers, rate-limit enforcement, JWE/JWT cookie-cache encoding, database-specific adapters, and advanced plugins are still outstanding.
+The Rust rewrite has progressed from a core foundation to an end-to-end baseline. It now includes runtime context resolution, transactional adapter contracts, migrations, email/password sessions, JWT/JWE cookie caching, request security, rate limiting, OAuth/PKCE, advanced-plugin services, HTTP routing, an optional Axum adapter, and a client request SDK.
 
 ## Roadmap status
 
-| Phase | Status | Evidence / scope |
+| Phase | Status | Current implementation |
 |---|---|---|
-| 0. Core types and traits | Complete | `AuthOptions`, adapter traits, schema types, plugin trait, shared errors |
-| 1. AuthContext and config | Complete | Defaults, secret validation, static/dynamic base URLs, allowed-host checks |
-| 2. Adapters and schema | Complete at contract level | `DbAdapter`, `SecondaryStorage`, TTL/increment semantics, core schema, in-memory test adapters |
-| 3. Email/password and sessions | Partial | Sign-up, sign-in, scrypt passwords, persisted sessions, signed session cookies, lookup, sign-out |
-| 4. CSRF and security middleware | Partial | Origin validation, Fetch Metadata checks, SameSite=Lax cookies, trusted proxy/IP helpers |
-| 5. Plugin system | Complete at foundation level | Endpoint, hook, schema, and error-code registry with conflict detection |
-| 6. OAuth/social/PKCE | Not started | State, provider flows, and PKCE storage remain |
-| 7. Advanced plugins | Not started | 2FA, organizations, passkeys, admin, SSO, SCIM, JWT |
-| 8. Client SDK/framework integrations | Not started | Axum/Actix adapters, HTTP endpoints, and client SDK remain |
-
-## Implemented components
-
-- Workspace crates: `better-auth-core` and `better-auth`.
-- Immutable `AuthContext` with per-request `RequestContext` cloning.
-- Static, request-derived, and wildcard allowed-host base URL resolution.
-- Secret validation and versioned HMAC envelopes for direct key-version lookup during rotation.
-- Relational CRUD and secondary KV storage contracts.
-- Core user/session/account/verification schema model.
-- Plugin endpoint, hook, schema, and error-code aggregation.
-- scrypt password hashing and verification.
-- Cookie construction with secure prefixes, HttpOnly, SameSite=Lax, path, and max-age attributes.
-- Email/password service with normalized email handling, account creation, session persistence, cookie session lookup, expiry checks, and sign-out.
-- CSRF origin checks, Fetch Metadata blocking, trusted proxy header handling, and client-IP extraction.
+| 0. Core types and traits | Complete | Options, errors, adapter contracts, schema, plugins |
+| 1. AuthContext and config | Complete | Defaults, secrets, static/dynamic base URLs, allowed hosts |
+| 2. Adapters and schema | Complete baseline | CRUD/KV adapters, atomic transactions, TTL, migration plan/SQL rendering, SQLite adapters |
+| 3. Email/password and sessions | Complete baseline | Sign-up/sign-in, scrypt, session persistence, refresh, sign-out, JWE/JWT/opaque cookies, email verification and password reset |
+| 4. CSRF and security middleware | Complete baseline | Origin, Fetch Metadata, SameSite=Lax, trusted proxy/IP handling, rate limiting |
+| 5. Plugin system | Complete | Endpoint/hook/schema/error registry and conflict detection |
+| 6. OAuth/social/PKCE | Complete baseline | Verification/signed-cookie state, PKCE S256, OAuth completion/account linking, HTTPS generic provider, Google/GitHub presets |
+| 7. Advanced plugins | Implemented baseline | TOTP/backup codes, organizations, passkey challenges, admin roles, SSO connections, SCIM users/list pagination/tokens, JWT |
+| 8. Client/framework integrations | Implemented baseline | JSON HTTP router, optional Axum adapter, request-building client SDK, reqwest transport/cookie jar |
 
 ## Verification
 
-The current workspace passes:
+The latest checks are:
 
 ```text
 cargo fmt --all -- --check
-cargo check --workspace
-cargo test --workspace
+cargo check --workspace --all-features
+cargo test --workspace --all-features
 ```
 
-Test result: **12 tests passed, 0 failed** across the two crates.
+The latest full test run passed **30 tests**: 27 in `better-auth` and 3 in `better-auth-core`, with 0 failures. The optional Axum feature is included in the all-features check.
 
-## Remaining gaps and risks
+## Remaining production gaps
 
-1. The `CookieCacheStrategy` enum exists, but the current session cookie is a signed opaque token; JWE/JWT encoding and refresh behavior are not implemented.
-2. Email/password operations are service methods, not exposed as framework HTTP endpoints yet.
-3. Rate limiting is represented by the secondary-storage contract but is not enforced by request middleware.
-4. The generic adapter contract has no transaction primitive. Sign-up performs best-effort user cleanup if account insertion fails.
-5. Only in-memory adapters are included for tests; production database adapters are not present.
-6. OAuth/social providers, state/PKCE, email verification, password reset, and advanced plugins are not implemented.
+1. Passkey support currently protects challenge issuance/consumption and stores credential metadata; full WebAuthn CBOR attestation/assertion and signature-counter verification still require a WebAuthn implementation.
+2. SSO currently provides validated OIDC-style connection persistence and can use the generic OAuth provider; SAML protocol handling is not included.
+3. SCIM currently provides token hashing, user CRUD, and basic list pagination; full RFC 7644 filtering and bulk operations remain.
+4. SQLite is implemented; Postgres/MySQL adapters and production migration runners are still needed.
+5. The client SDK now owns a reqwest transport and cookie jar, but retry policy and browser-specific integration remain.
+6. OAuth ID-token signature/nonce validation and provider-specific token persistence/encryption should be added before production deployment.
 
-## Recommended next implementation order
+## Recommended release sequence
 
-1. Add an HTTP router/handler contract and an Axum adapter for the existing context and email/password service.
-2. Implement session cookie-cache JWE/JWT strategies, refresh behavior, and durable-session fallback rules.
-3. Add rate-limit middleware backed by atomic secondary-storage increments.
-4. Add OAuth provider abstractions plus verification-table and signed-cookie state/PKCE storage.
-5. Add a transaction-capable adapter API and the first production database adapter.
-6. Port advanced plugins and add an integration-test matrix across framework adapters.
-
+1. Add Postgres/MySQL adapters and production migration runners using the existing contracts.
+2. Integrate a vetted WebAuthn implementation and add browser ceremony integration tests.
+3. Complete SCIM/SAML protocol surfaces and OAuth ID-token validation.
+4. Add client transport/cookie-jar support and integration tests against the Axum adapter.
+5. Run security review, dependency audit, and multi-database conformance tests.

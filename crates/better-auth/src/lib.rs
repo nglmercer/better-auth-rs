@@ -7,34 +7,48 @@
 pub mod client;
 pub mod context;
 pub mod cookies;
+pub mod database;
 pub mod email_password;
 pub mod http_oauth;
 pub mod jwt;
 pub mod oauth;
+pub mod oidc;
 pub mod password;
 pub mod plugins;
 pub mod rate_limit;
 pub mod router;
 pub mod security;
+pub mod verification;
+pub mod webauthn;
 
 pub use better_auth_core as core;
 pub use client::AuthClient;
 pub use context::{AuthContext, RequestContext, RequestMetadata};
 pub use cookies::{AuthCookie, CookieCacheClaims, CookieCacheCodec, CookieSameSite, SecretKeySet};
+#[cfg(feature = "sqlx")]
+pub use database::{
+    MySqlDbAdapter, MySqlSecondaryStorage, PostgresDbAdapter, PostgresSecondaryStorage,
+    SqlxBackend, SqlxDbAdapter, SqlxSecondaryStorage,
+};
+pub use database::{SqliteDbAdapter, SqliteSecondaryStorage};
 pub use email_password::{AuthResult, EmailPasswordService, SignInInput, SignUpInput, User};
 pub use http_oauth::HttpOAuthProvider;
 pub use jwt::JwtService;
 pub use oauth::{
     OAuthAuthorization, OAuthProvider, OAuthProviderConfig, OAuthService, OAuthStateManager,
-    OAuthStateStorage, OAuthTokens, OAuthUserProfile, PkcePair,
+    OAuthStateStorage, OAuthTokens, OAuthUserProfile, PkcePair, ProviderTokenVault,
 };
+pub use oidc::{OidcClaims, OidcIdTokenValidator};
 pub use password::{hash_password, verify_password};
 pub use plugins::{
     generate_scim_token, generate_totp_secret, totp_code, verify_scim_token, verify_totp,
-    AdminGuard, AdminPlugin, BackupCodeSet, Organization, OrganizationMember, OrganizationPlugin,
-    OrganizationService, PasskeyChallenge, PasskeyPlugin, PasskeyService, ScimPlugin,
-    SsoConnectionConfig, SsoPlugin, TotpSecret, TwoFactorPlugin,
+    AdminGuard, AdminPlugin, AdminService, BackupCodeSet, Organization, OrganizationMember,
+    OrganizationPlugin, OrganizationService, PasskeyChallenge, PasskeyPlugin, PasskeyService,
+    ScimPlugin, ScimService, SsoConnectionConfig, SsoConnectionService, SsoPlugin, TotpSecret,
+    TwoFactorPlugin,
 };
 pub use rate_limit::{RateLimitDecision, RateLimitPolicy, RateLimiter};
 pub use router::{AuthRouter, HttpRequest, HttpResponse};
 pub use security::{check_csrf, extract_client_ip};
+pub use verification::{EmailVerificationService, PasswordResetService, VerificationService};
+pub use webauthn::{WebAuthnAuthenticationResult, WebAuthnService};
