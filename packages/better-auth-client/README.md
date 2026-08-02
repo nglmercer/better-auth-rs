@@ -46,13 +46,12 @@ Install dependencies and run the client tests with:
 npm install
 npm run test:types
 npm test
+npm run test:e2e
 ```
 
 Vitest tests should mock `fetch` for request and retry behavior. For HTTP
-integration tests, prefer a real test server only in a separate suite. The
-Rust crate is framework-neutral and does not currently ship a runnable server,
-so the recommended setup is a small test-only Axum host around `AuthRouter`:
-bind to `127.0.0.1:0`, print or expose the selected port, wait for an explicit
-readiness response, then terminate the child in `afterAll`. If the host and
-test runner share a runtime, an in-process server is simpler; use `spawn` only
-when you need to exercise real sockets, cookies, CORS, or process boundaries.
+integration tests now use the test-only Axum host in
+`crates/better-auth/examples/client-test-server.rs`. It binds to
+`127.0.0.1:0`, emits a readiness line, and is spawned and terminated by the
+E2E suite. Keep unit tests mocked for speed, and use E2E for the real HTTP
+contract, cookies, routing, and status/error behavior.

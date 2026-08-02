@@ -21,9 +21,11 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:types": "tsc -p tsconfig.test.json --noEmit"
+    "test:types": "tsc -p tsconfig.test.json --noEmit",
+    "test:e2e": "cargo build --quiet --manifest-path ../../Cargo.toml -p better-auth --features axum --example client-test-server && vitest run --config vitest.e2e.config.ts"
   },
   "devDependencies": {
+    "@types/node": "^22.10.0",
     "typescript": "^5.7.2",
     "vitest": "^2.1.9"
   }
