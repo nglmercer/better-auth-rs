@@ -192,4 +192,3 @@ impl AuthOptions {
         Ok(())
     }
 }
-

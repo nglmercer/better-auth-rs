@@ -79,7 +79,9 @@ impl SchemaExtension {
                             )));
                         }
                     } else {
-                        existing.fields.insert(field_name.clone(), incoming_field.clone());
+                        existing
+                            .fields
+                            .insert(field_name.clone(), incoming_field.clone());
                     }
                 }
             } else {
@@ -127,4 +129,3 @@ pub fn core_schema() -> SchemaExtension {
                 .field("expires_at", FieldSchema::required(DateTime)),
         )
 }
-

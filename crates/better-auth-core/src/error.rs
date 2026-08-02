@@ -29,4 +29,3 @@ pub enum AuthError {
 }
 
 pub type Result<T> = std::result::Result<T, AuthError>;
-

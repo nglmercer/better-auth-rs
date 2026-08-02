@@ -15,4 +15,3 @@ pub use error::{AuthError, Result};
 pub use options::{AuthOptions, BaseUrl, CookieCacheStrategy, SessionOptions};
 pub use plugin::{Endpoint, Hook, Plugin, PluginRegistry};
 pub use schema::{SchemaExtension, TableSchema};
-

@@ -113,4 +113,3 @@ impl PluginRegistry {
         &self.error_codes
     }
 }
-
