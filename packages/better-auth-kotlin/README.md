@@ -43,6 +43,8 @@ lifecycle and should close it when the application shuts down.
 
 ## Tests
 
+Use JDK 21 for the current Kotlin/Gradle toolchain.
+
 Run the unit tests with:
 
 ```sh

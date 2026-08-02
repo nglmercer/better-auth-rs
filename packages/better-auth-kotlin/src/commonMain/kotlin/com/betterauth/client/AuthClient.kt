@@ -17,6 +17,7 @@ import io.ktor.http.content.TextContent
 import io.ktor.client.request.setBody
 import kotlinx.coroutines.delay
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -42,15 +43,15 @@ public data class AuthUser(
     val id: String,
     val email: String,
     val name: String,
-    val email_verified: Boolean,
+    @SerialName("email_verified") val emailVerified: Boolean,
     val image: String? = null,
 )
 
 @Serializable
 public data class AuthSession(
     val id: String,
-    val user_id: String,
-    val expires_at: Long,
+    @SerialName("user_id") val userId: String,
+    @SerialName("expires_at") val expiresAt: Long,
 )
 
 @Serializable
@@ -74,7 +75,7 @@ public data class RequestPasswordResetResponse(val sent: Boolean)
 @Serializable
 public data class ResetPasswordInput(
     val token: String,
-    val new_password: String,
+    @SerialName("new_password") val newPassword: String,
 )
 
 @Serializable

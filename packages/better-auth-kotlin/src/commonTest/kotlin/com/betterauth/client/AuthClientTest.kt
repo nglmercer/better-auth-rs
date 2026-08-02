@@ -109,6 +109,41 @@ class AuthClientTest {
     }
 
     @Test
+    fun sessionCookieIsReusedForLaterRequests() = runTest {
+        var calls = 0
+        var receivedCookie: String? = null
+        val httpClient = HttpClient(MockEngine) {
+            installBetterAuth()
+            engine {
+                addHandler {
+                    calls += 1
+                    receivedCookie = it.headers[HttpHeaders.Cookie]
+                    if (calls == 1) {
+                        respond(
+                            content = SESSION_JSON,
+                            status = HttpStatusCode.OK,
+                            headers = headersOf(
+                                HttpHeaders.ContentType to listOf(ContentType.Application.Json.toString()),
+                                HttpHeaders.SetCookie to listOf(
+                                    "better-auth.session_token=session-token; Path=/",
+                                ),
+                            ),
+                        )
+                    } else {
+                        respond("null", HttpStatusCode.OK, JSON_HEADERS)
+                    }
+                }
+            }
+        }
+        val client = AuthClient("http://localhost/api/auth", httpClient)
+
+        client.signUpEmail(SignUpEmailInput("user@example.com", "User", "password"))
+        client.getSession()
+
+        assertEquals("better-auth.session_token=session-token", receivedCookie)
+    }
+
+    @Test
     fun genericRequestsAcceptJsonBodies() = runTest {
         val httpClient = HttpClient(MockEngine) {
             engine {
