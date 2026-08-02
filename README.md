@@ -36,19 +36,20 @@ The workspace now covers all roadmap phases at a framework-neutral baseline:
   Google/GitHub provider presets, configurable OIDC ID-token validation, and
   encrypted provider-token envelopes.
 - TOTP and one-time backup codes, organization membership, passkey challenge
-  replay protection, real WebAuthn registration/assertion verification through
-  webauthn-rs, admin role guards, OIDC/SAML SSO contracts, SCIM filtering,
-  pagination, bulk operations, user resources/token hashing, and JWT issuance.
+  replay protection, durable WebAuthn registration/assertion verification
+  through webauthn-rs, admin role guards, OIDC/SAML SSO, concrete optional
+  `saml-rs` validation, SCIM filtering/PATCH/groups/bulk operations and token
+  hashing, and JWT issuance.
 - framework-neutral HTTP endpoints, an optional Axum adapter, and a client
   request SDK with reqwest transport, cookie-jar support, and safe retries.
 - SQLite relational and secondary-storage adapters, optional SQLx
-  Postgres/MySQL adapters, and dialect-aware migration execution.
+  Postgres/MySQL adapters with dialect-aware placeholders, and migration
+  execution.
 
-The remaining work is protocol and deployment hardening: concrete SAML XML
-canonicalization/signature adapters, full SCIM RFC 7644 surfaces, live
-Postgres/MySQL conformance tests, browser-level WebAuthn tests, OIDC JWKS
-discovery/rotation, and browser-specific client bindings. The traits remain
-small so these integrations do not make the core depend on one database or web
+The remaining work is deployment hardening: live MySQL conformance, signed
+SAML and browser-level WebAuthn fixtures, scheduled OIDC JWKS refresh, browser
+client examples, and independent security review. The traits remain small so
+these integrations do not make the core depend on one database or web
 framework.
 
 ## Verify

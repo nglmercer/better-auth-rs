@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 type HmacSha1 = Hmac<Sha1>;
