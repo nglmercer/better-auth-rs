@@ -21,6 +21,7 @@ data-encoding.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 sqlx = { workspace = true, optional = true }
+tokio.workspace = true
 hmac.workspace = true
 http.workspace = true
 jsonwebtoken.workspace = true
@@ -36,4 +37,4 @@ webauthn-rs.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

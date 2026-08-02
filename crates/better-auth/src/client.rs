@@ -6,7 +6,48 @@ use better_auth_core::error::{AuthError, Result};
 use http::{header, HeaderMap, Method, Uri};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 use url::Url;
+
+#[derive(Clone, Debug)]
+pub struct RetryPolicy {
+    pub max_retries: usize,
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 2,
+            base_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(2),
+        }
+    }
+}
+
+impl RetryPolicy {
+    pub fn new(max_retries: usize, base_delay: Duration, max_delay: Duration) -> Result<Self> {
+        if base_delay.is_zero() || max_delay < base_delay {
+            return Err(AuthError::InvalidConfiguration(
+                "retry delays must be non-zero and max_delay must be >= base_delay".into(),
+            ));
+        }
+        Ok(Self {
+            max_retries,
+            base_delay,
+            max_delay,
+        })
+    }
+
+    fn delay_for(&self, retry_index: usize) -> Duration {
+        let exponent = retry_index.min(u32::BITS as usize - 1) as u32;
+        self.base_delay
+            .checked_mul(1_u32 << exponent)
+            .unwrap_or(self.max_delay)
+            .min(self.max_delay)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AuthClient {
@@ -112,6 +153,33 @@ impl AuthClient {
         })
     }
 
+    pub async fn execute_with_retry(
+        &self,
+        client: &reqwest::Client,
+        request: HttpRequest,
+        policy: &RetryPolicy,
+    ) -> Result<HttpResponse> {
+        let retry_safe = matches!(request.method, Method::GET | Method::HEAD | Method::OPTIONS)
+            || request.headers.contains_key("idempotency-key");
+        let mut retry_index = 0;
+        loop {
+            let result = self.execute(client, request.clone()).await;
+            let should_retry = match &result {
+                Ok(response) => retry_safe && retryable_status(response.status),
+                Err(_) => retry_safe,
+            };
+            if !should_retry || retry_index >= policy.max_retries {
+                return result;
+            }
+            let retry_after = result.as_ref().ok().and_then(retry_after);
+            let delay = retry_after
+                .map(|delay| delay.min(policy.max_delay))
+                .unwrap_or_else(|| policy.delay_for(retry_index));
+            tokio::time::sleep(delay).await;
+            retry_index += 1;
+        }
+    }
+
     fn json_request<T: Serialize>(
         &self,
         method: Method,
@@ -153,6 +221,30 @@ impl AuthClient {
     }
 }
 
+fn retryable_status(status: http::StatusCode) -> bool {
+    matches!(
+        status,
+        http::StatusCode::REQUEST_TIMEOUT
+            | http::StatusCode::TOO_EARLY
+            | http::StatusCode::TOO_MANY_REQUESTS
+            | http::StatusCode::INTERNAL_SERVER_ERROR
+            | http::StatusCode::BAD_GATEWAY
+            | http::StatusCode::SERVICE_UNAVAILABLE
+            | http::StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+fn retry_after(response: &HttpResponse) -> Option<Duration> {
+    response
+        .headers
+        .get(header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +265,14 @@ mod tests {
             request.headers.get(header::ORIGIN).unwrap(),
             "https://example.com"
         );
+    }
+
+    #[test]
+    fn retry_policy_caps_exponential_backoff() {
+        let policy =
+            RetryPolicy::new(3, Duration::from_millis(10), Duration::from_millis(15)).unwrap();
+        assert_eq!(policy.delay_for(0), Duration::from_millis(10));
+        assert_eq!(policy.delay_for(1), Duration::from_millis(15));
+        assert_eq!(policy.delay_for(2), Duration::from_millis(15));
     }
 }

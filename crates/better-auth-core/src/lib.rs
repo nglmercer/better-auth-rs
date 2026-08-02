@@ -13,7 +13,7 @@ pub mod schema;
 
 pub use adapter::{DbAdapter, DbOperation, SecondaryStorage, StorageValue};
 pub use error::{AuthError, Result};
-pub use migration::{MigrationPlan, MigrationStep, SqlDialect};
+pub use migration::{MigrationExecutor, MigrationPlan, MigrationStep, SqlDialect};
 pub use options::{AuthOptions, BaseUrl, CookieCacheStrategy, SessionOptions};
 pub use plugin::{Endpoint, Hook, Plugin, PluginRegistry};
 pub use schema::{SchemaExtension, TableSchema};

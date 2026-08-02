@@ -1,4 +1,6 @@
 use crate::schema::{FieldSchema, SchemaExtension, TableSchema};
+use crate::{AuthError, Result};
+use async_trait::async_trait;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MigrationStep {
@@ -72,13 +74,34 @@ impl MigrationPlan {
                     sql_type(&schema.field_type, dialect)
                 ),
                 MigrationStep::CreateUniqueIndex { table, field } => format!(
-                    "CREATE UNIQUE INDEX ON {} ({});",
+                    "CREATE UNIQUE INDEX {} ON {} ({});",
+                    quote(&format!("{table}_{field}_unique"), dialect),
                     quote(table, dialect),
                     quote(field, dialect)
                 ),
             })
             .collect()
     }
+
+    pub async fn apply<E: MigrationExecutor>(
+        &self,
+        executor: &E,
+        dialect: SqlDialect,
+    ) -> Result<()> {
+        for statement in self.sql(dialect) {
+            executor.execute(&statement).await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+pub trait MigrationExecutor: Send + Sync {
+    async fn execute(&self, statement: &str) -> Result<()>;
+}
+
+pub fn migration_error(message: impl Into<String>) -> AuthError {
+    AuthError::Adapter(message.into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

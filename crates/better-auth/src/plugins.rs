@@ -1,3 +1,4 @@
+use crate::sso::SsoProtocol;
 use better_auth_core::{
     adapter::{DbAdapter, DbOperation, SecondaryStorage, StorageValue},
     error::{AuthError, Result},
@@ -507,6 +508,8 @@ impl AdminService {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SsoConnectionConfig {
     pub id: String,
+    #[serde(default)]
+    pub protocol: SsoProtocol,
     pub issuer: String,
     pub client_id: String,
     pub discovery_url: String,
@@ -527,6 +530,16 @@ impl Plugin for SsoPlugin {
                 "Start an enterprise SSO flow",
             ),
             endpoint(Method::POST, "/sso/connections", "Create an SSO connection"),
+            endpoint(
+                Method::GET,
+                "/sso/saml/authorize",
+                "Start a SAML enterprise SSO flow",
+            ),
+            endpoint(
+                Method::POST,
+                "/sso/saml/callback",
+                "Validate a SAML enterprise SSO response",
+            ),
         ]
     }
     fn schema(&self) -> SchemaExtension {
@@ -534,6 +547,7 @@ impl Plugin for SsoPlugin {
             "sso_connection",
             TableSchema::default()
                 .field("id", required(FieldType::String).unique())
+                .field("protocol", required(FieldType::String))
                 .field("issuer", required(FieldType::String))
                 .field("client_id", required(FieldType::String))
                 .field("discovery_url", required(FieldType::String)),
@@ -757,6 +771,8 @@ impl ScimService {
                     })?;
                     let user = scim_user_from_resource(&data)?;
                     let id = Uuid::new_v4().to_string();
+                    let mut user = user;
+                    user["id"] = id.clone().into();
                     planned.push(DbOperation::Insert {
                         table: "user".into(),
                         id: id.clone(),
@@ -778,6 +794,8 @@ impl ScimService {
                     } else {
                         merge_scim_patch(existing, &data)?
                     };
+                    let mut updated = updated;
+                    updated["id"] = id.into();
                     planned.push(DbOperation::Update {
                         table: "user".into(),
                         id: id.into(),
@@ -999,11 +1017,14 @@ fn merge_scim_patch(
 }
 
 fn normalize_scim_path(path: &str) -> Result<String> {
-    let path = path
-        .strip_prefix("/scim/v2")
-        .or_else(|| path.strip_prefix("/"))
-        .unwrap_or(path)
-        .trim_end_matches('/');
+    let path = if let Some(path) = path.strip_prefix("/scim/v2") {
+        format!("/{}", path.trim_start_matches('/'))
+    } else if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    };
+    let path = path.trim_end_matches('/');
     if path == "/Users" || path.starts_with("/Users/") {
         Ok(path.into())
     } else {

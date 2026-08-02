@@ -19,6 +19,7 @@ data-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "any", "postgres", "mysql"] }
+tokio = { version = "1", features = ["time"] }
 hmac = "0.12"
 http = "1"
 jsonwebtoken = "9"

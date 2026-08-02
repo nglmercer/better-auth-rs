@@ -1,6 +1,7 @@
 use better_auth_core::{
     adapter::{DbAdapter, DbOperation, SecondaryStorage, StorageValue},
     error::{AuthError, Result},
+    migration::{MigrationExecutor, MigrationPlan, SqlDialect},
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
@@ -40,6 +41,21 @@ impl SqliteDbAdapter {
         Ok(Self {
             connection: Mutex::new(connection),
         })
+    }
+
+    pub async fn apply_migrations(&self, plan: &MigrationPlan) -> Result<()> {
+        plan.apply(self, SqlDialect::Sqlite).await
+    }
+}
+
+#[async_trait::async_trait]
+impl MigrationExecutor for SqliteDbAdapter {
+    async fn execute(&self, statement: &str) -> Result<()> {
+        self.connection
+            .lock()
+            .map_err(|_| lock_error())?
+            .execute_batch(statement)
+            .map_err(sqlite_error)
     }
 }
 
@@ -324,7 +340,6 @@ pub enum SqlxBackend {
 #[derive(Clone)]
 pub struct SqlxDbAdapter {
     pool: sqlx::AnyPool,
-    backend: SqlxBackend,
 }
 
 #[cfg(feature = "sqlx")]
@@ -333,7 +348,7 @@ impl SqlxDbAdapter {
         validate_sqlx_url(url, backend)?;
         sqlx::any::install_default_drivers();
         let pool = sqlx::AnyPool::connect(url).await.map_err(sqlx_error)?;
-        let adapter = Self { pool, backend };
+        let adapter = Self { pool };
         adapter
             .pool
             .execute(sqlx_records_ddl(backend))
@@ -349,6 +364,10 @@ impl SqlxDbAdapter {
     pub async fn mysql(url: &str) -> Result<Self> {
         Self::connect(url, SqlxBackend::MySql).await
     }
+
+    pub async fn apply_migrations(&self, plan: &MigrationPlan, dialect: SqlDialect) -> Result<()> {
+        plan.apply(self, dialect).await
+    }
 }
 
 #[cfg(feature = "sqlx")]
@@ -356,6 +375,15 @@ pub type PostgresDbAdapter = SqlxDbAdapter;
 
 #[cfg(feature = "sqlx")]
 pub type MySqlDbAdapter = SqlxDbAdapter;
+
+#[cfg(feature = "sqlx")]
+#[async_trait::async_trait]
+impl MigrationExecutor for SqlxDbAdapter {
+    async fn execute(&self, statement: &str) -> Result<()> {
+        self.pool.execute(statement).await.map_err(sqlx_error)?;
+        Ok(())
+    }
+}
 
 #[cfg(feature = "sqlx")]
 #[async_trait::async_trait]
@@ -502,7 +530,6 @@ impl DbAdapter for SqlxDbAdapter {
 #[derive(Clone)]
 pub struct SqlxSecondaryStorage {
     pool: sqlx::AnyPool,
-    backend: SqlxBackend,
 }
 
 #[cfg(feature = "sqlx")]
@@ -514,7 +541,7 @@ impl SqlxSecondaryStorage {
         pool.execute(sqlx_kv_ddl(backend))
             .await
             .map_err(sqlx_error)?;
-        Ok(Self { pool, backend })
+        Ok(Self { pool })
     }
 
     pub async fn postgres(url: &str) -> Result<Self> {
@@ -691,6 +718,7 @@ fn sqlx_error(error: impl std::fmt::Display) -> AuthError {
 mod tests {
     use super::*;
     use better_auth_core::adapter::{DbAdapter, DbOperation, SecondaryStorage};
+    use better_auth_core::migration::MigrationPlan;
 
     #[tokio::test]
     async fn sqlite_db_transactions_are_atomic() {
@@ -740,5 +768,16 @@ mod tests {
             Value::from(3)
         );
         assert!(storage.get("counter").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn sqlite_migration_runner_applies_schema_sql() {
+        let adapter = SqliteDbAdapter::in_memory().unwrap();
+        adapter
+            .apply_migrations(&MigrationPlan::from_schema(
+                &better_auth_core::schema::core_schema(),
+            ))
+            .await
+            .unwrap();
     }
 }

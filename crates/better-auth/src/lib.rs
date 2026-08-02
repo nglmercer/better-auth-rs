@@ -18,11 +18,12 @@ pub mod plugins;
 pub mod rate_limit;
 pub mod router;
 pub mod security;
+pub mod sso;
 pub mod verification;
 pub mod webauthn;
 
 pub use better_auth_core as core;
-pub use client::AuthClient;
+pub use client::{AuthClient, RetryPolicy};
 pub use context::{AuthContext, RequestContext, RequestMetadata};
 pub use cookies::{AuthCookie, CookieCacheClaims, CookieCacheCodec, CookieSameSite, SecretKeySet};
 #[cfg(feature = "sqlx")]
@@ -50,5 +51,9 @@ pub use plugins::{
 pub use rate_limit::{RateLimitDecision, RateLimitPolicy, RateLimiter};
 pub use router::{AuthRouter, HttpRequest, HttpResponse};
 pub use security::{check_csrf, extract_client_ip};
+pub use sso::{
+    SamlAssertion, SamlAssertionValidator, SamlAuthorizationRequest, SamlIdentity, SamlProvider,
+    SamlResponse, SamlSignatureVerifier, SamlValidationConfig, SsoProtocol, ValidatedSamlProvider,
+};
 pub use verification::{EmailVerificationService, PasswordResetService, VerificationService};
 pub use webauthn::{WebAuthnAuthenticationResult, WebAuthnService};
