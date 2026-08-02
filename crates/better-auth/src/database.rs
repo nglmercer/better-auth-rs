@@ -340,6 +340,7 @@ pub enum SqlxBackend {
 #[derive(Clone)]
 pub struct SqlxDbAdapter {
     pool: sqlx::AnyPool,
+    backend: SqlxBackend,
 }
 
 #[cfg(feature = "sqlx")]
@@ -348,7 +349,7 @@ impl SqlxDbAdapter {
         validate_sqlx_url(url, backend)?;
         sqlx::any::install_default_drivers();
         let pool = sqlx::AnyPool::connect(url).await.map_err(sqlx_error)?;
-        let adapter = Self { pool };
+        let adapter = Self { pool, backend };
         adapter
             .pool
             .execute(sqlx_records_ddl(backend))
@@ -389,9 +390,10 @@ impl MigrationExecutor for SqlxDbAdapter {
 #[async_trait::async_trait]
 impl DbAdapter for SqlxDbAdapter {
     async fn get(&self, table: &str, id: &str) -> Result<Option<Value>> {
-        let row = sqlx::query(
+        let row = sqlx::query(&sqlx_bind_sql(
+            self.backend,
             "SELECT record_json FROM _better_auth_records WHERE table_name = ? AND record_id = ?",
-        )
+        ))
         .bind(table)
         .bind(id)
         .fetch_optional(&self.pool)
@@ -409,9 +411,10 @@ impl DbAdapter for SqlxDbAdapter {
     }
 
     async fn insert(&self, table: &str, id: &str, record: Value) -> Result<()> {
-        sqlx::query(
+        sqlx::query(&sqlx_bind_sql(
+            self.backend,
             "INSERT INTO _better_auth_records(table_name, record_id, record_json) VALUES (?, ?, ?)",
-        )
+        ))
         .bind(table)
         .bind(id)
         .bind(record.to_string())
@@ -422,9 +425,10 @@ impl DbAdapter for SqlxDbAdapter {
     }
 
     async fn update(&self, table: &str, id: &str, record: Value) -> Result<()> {
-        let result = sqlx::query(
+        let result = sqlx::query(&sqlx_bind_sql(
+            self.backend,
             "UPDATE _better_auth_records SET record_json = ? WHERE table_name = ? AND record_id = ?",
-        )
+        ))
         .bind(record.to_string())
         .bind(table)
         .bind(id)
@@ -438,12 +442,15 @@ impl DbAdapter for SqlxDbAdapter {
     }
 
     async fn delete(&self, table: &str, id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM _better_auth_records WHERE table_name = ? AND record_id = ?")
-            .bind(table)
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .map_err(sqlx_error)?;
+        sqlx::query(&sqlx_bind_sql(
+            self.backend,
+            "DELETE FROM _better_auth_records WHERE table_name = ? AND record_id = ?",
+        ))
+        .bind(table)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(sqlx_error)?;
         Ok(())
     }
 
@@ -460,9 +467,10 @@ impl DbAdapter for SqlxDbAdapter {
     }
 
     async fn list(&self, table: &str) -> Result<Vec<(String, Value)>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&sqlx_bind_sql(
+            self.backend,
             "SELECT record_id, record_json FROM _better_auth_records WHERE table_name = ? ORDER BY record_id",
-        )
+        ))
         .bind(table)
         .fetch_all(&self.pool)
         .await
@@ -486,9 +494,10 @@ impl DbAdapter for SqlxDbAdapter {
         for operation in operations {
             match operation {
                 DbOperation::Insert { table, id, record } => {
-                    sqlx::query(
+                    sqlx::query(&sqlx_bind_sql(
+                        self.backend,
                         "INSERT INTO _better_auth_records(table_name, record_id, record_json) VALUES (?, ?, ?)",
-                    )
+                    ))
                     .bind(table)
                     .bind(id)
                     .bind(record.to_string())
@@ -497,9 +506,10 @@ impl DbAdapter for SqlxDbAdapter {
                     .map_err(sqlx_error)?;
                 }
                 DbOperation::Update { table, id, record } => {
-                    let result = sqlx::query(
+                    let result = sqlx::query(&sqlx_bind_sql(
+                        self.backend,
                         "UPDATE _better_auth_records SET record_json = ? WHERE table_name = ? AND record_id = ?",
-                    )
+                    ))
                     .bind(record.to_string())
                     .bind(table)
                     .bind(id)
@@ -511,9 +521,10 @@ impl DbAdapter for SqlxDbAdapter {
                     }
                 }
                 DbOperation::Delete { table, id } => {
-                    sqlx::query(
+                    sqlx::query(&sqlx_bind_sql(
+                        self.backend,
                         "DELETE FROM _better_auth_records WHERE table_name = ? AND record_id = ?",
-                    )
+                    ))
                     .bind(table)
                     .bind(id)
                     .execute(&mut *transaction)
@@ -530,6 +541,7 @@ impl DbAdapter for SqlxDbAdapter {
 #[derive(Clone)]
 pub struct SqlxSecondaryStorage {
     pool: sqlx::AnyPool,
+    backend: SqlxBackend,
 }
 
 #[cfg(feature = "sqlx")]
@@ -541,7 +553,7 @@ impl SqlxSecondaryStorage {
         pool.execute(sqlx_kv_ddl(backend))
             .await
             .map_err(sqlx_error)?;
-        Ok(Self { pool })
+        Ok(Self { pool, backend })
     }
 
     pub async fn postgres(url: &str) -> Result<Self> {
@@ -564,7 +576,7 @@ pub type MySqlSecondaryStorage = SqlxSecondaryStorage;
 impl SecondaryStorage for SqlxSecondaryStorage {
     async fn get(&self, key: &str) -> Result<Option<StorageValue>> {
         let mut transaction = self.pool.begin().await.map_err(sqlx_error)?;
-        let result = read_sqlx_kv(&mut transaction, key, false).await?;
+        let result = read_sqlx_kv(&mut transaction, self.backend, key, false).await?;
         transaction.commit().await.map_err(sqlx_error)?;
         Ok(result)
     }
@@ -573,35 +585,43 @@ impl SecondaryStorage for SqlxSecondaryStorage {
         let expires_at = value
             .expires_in
             .map(|ttl| now_seconds() as i64 + ttl.as_secs() as i64);
-        sqlx::query("DELETE FROM _better_auth_kv WHERE storage_key = ?")
-            .bind(key)
-            .execute(&self.pool)
-            .await
-            .map_err(sqlx_error)?;
-        sqlx::query(
+        let mut transaction = self.pool.begin().await.map_err(sqlx_error)?;
+        sqlx::query(&sqlx_bind_sql(
+            self.backend,
+            "DELETE FROM _better_auth_kv WHERE storage_key = ?",
+        ))
+        .bind(key)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sqlx_error)?;
+        sqlx::query(&sqlx_bind_sql(
+            self.backend,
             "INSERT INTO _better_auth_kv(storage_key, value_json, expires_at) VALUES (?, ?, ?)",
-        )
+        ))
         .bind(key)
         .bind(value.value.to_string())
         .bind(expires_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sqlx_error)?;
+        transaction.commit().await.map_err(sqlx_error)
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        sqlx::query(&sqlx_bind_sql(
+            self.backend,
+            "DELETE FROM _better_auth_kv WHERE storage_key = ?",
+        ))
+        .bind(key)
         .execute(&self.pool)
         .await
         .map_err(sqlx_error)?;
         Ok(())
     }
 
-    async fn delete(&self, key: &str) -> Result<()> {
-        sqlx::query("DELETE FROM _better_auth_kv WHERE storage_key = ?")
-            .bind(key)
-            .execute(&self.pool)
-            .await
-            .map_err(sqlx_error)?;
-        Ok(())
-    }
-
     async fn increment(&self, key: &str, amount: i64, expires_in: Duration) -> Result<i64> {
         let mut transaction = self.pool.begin().await.map_err(sqlx_error)?;
-        let existing = read_sqlx_kv(&mut transaction, key, true).await?;
+        let existing = read_sqlx_kv(&mut transaction, self.backend, key, true).await?;
         let current = existing
             .as_ref()
             .and_then(|value| value.value.as_i64())
@@ -613,14 +633,18 @@ impl SecondaryStorage for SqlxSecondaryStorage {
             .and_then(|value| value.expires_in)
             .map(|ttl| now_seconds() as i64 + ttl.as_secs() as i64)
             .unwrap_or(now_seconds() as i64 + expires_in.as_secs() as i64);
-        sqlx::query("DELETE FROM _better_auth_kv WHERE storage_key = ?")
-            .bind(key)
-            .execute(&mut *transaction)
-            .await
-            .map_err(sqlx_error)?;
-        sqlx::query(
+        sqlx::query(&sqlx_bind_sql(
+            self.backend,
+            "DELETE FROM _better_auth_kv WHERE storage_key = ?",
+        ))
+        .bind(key)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sqlx_error)?;
+        sqlx::query(&sqlx_bind_sql(
+            self.backend,
             "INSERT INTO _better_auth_kv(storage_key, value_json, expires_at) VALUES (?, ?, ?)",
-        )
+        ))
         .bind(key)
         .bind(Value::from(next).to_string())
         .bind(expires_at)
@@ -633,12 +657,15 @@ impl SecondaryStorage for SqlxSecondaryStorage {
 
     async fn get_and_delete(&self, key: &str) -> Result<Option<StorageValue>> {
         let mut transaction = self.pool.begin().await.map_err(sqlx_error)?;
-        let result = read_sqlx_kv(&mut transaction, key, true).await?;
-        sqlx::query("DELETE FROM _better_auth_kv WHERE storage_key = ?")
-            .bind(key)
-            .execute(&mut *transaction)
-            .await
-            .map_err(sqlx_error)?;
+        let result = read_sqlx_kv(&mut transaction, self.backend, key, true).await?;
+        sqlx::query(&sqlx_bind_sql(
+            self.backend,
+            "DELETE FROM _better_auth_kv WHERE storage_key = ?",
+        ))
+        .bind(key)
+        .execute(&mut *transaction)
+        .await
+        .map_err(sqlx_error)?;
         transaction.commit().await.map_err(sqlx_error)?;
         Ok(result)
     }
@@ -647,6 +674,7 @@ impl SecondaryStorage for SqlxSecondaryStorage {
 #[cfg(feature = "sqlx")]
 async fn read_sqlx_kv(
     transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+    backend: SqlxBackend,
     key: &str,
     for_update: bool,
 ) -> Result<Option<StorageValue>> {
@@ -655,7 +683,7 @@ async fn read_sqlx_kv(
     } else {
         "SELECT value_json, expires_at FROM _better_auth_kv WHERE storage_key = ?"
     };
-    let row = sqlx::query(query)
+    let row = sqlx::query(&sqlx_bind_sql(backend, query))
         .bind(key)
         .fetch_optional(&mut **transaction)
         .await
@@ -675,6 +703,25 @@ async fn read_sqlx_kv(
         value: serde_json::from_str(&raw).map_err(json_error)?,
         expires_in: expires_at.map(|expires_at| Duration::from_secs((expires_at - now) as u64)),
     }))
+}
+
+#[cfg(feature = "sqlx")]
+fn sqlx_bind_sql(backend: SqlxBackend, sql: &str) -> String {
+    if backend == SqlxBackend::MySql {
+        return sql.to_owned();
+    }
+    let mut output = String::with_capacity(sql.len() + 8);
+    let mut parameter = 0;
+    for character in sql.chars() {
+        if character == '?' {
+            parameter += 1;
+            output.push('$');
+            output.push_str(&parameter.to_string());
+        } else {
+            output.push(character);
+        }
+    }
+    output
 }
 
 #[cfg(feature = "sqlx")]
@@ -779,5 +826,69 @@ mod tests {
             ))
             .await
             .unwrap();
+    }
+
+    #[cfg(feature = "sqlx")]
+    #[tokio::test]
+    async fn sqlx_postgres_conformance_when_configured() {
+        let Ok(url) = std::env::var("BETTER_AUTH_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let adapter = SqlxDbAdapter::postgres(&url).await.unwrap();
+        let id = format!("conformance-{}", uuid::Uuid::new_v4());
+        adapter
+            .insert(
+                "user",
+                &id,
+                serde_json::json!({"id": id.clone(), "email": "pg@example.com"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            adapter
+                .get_by_field("user", "email", &serde_json::json!("pg@example.com"))
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            id
+        );
+        adapter
+            .update(
+                "user",
+                &id,
+                serde_json::json!({"id": id.clone(), "email": "updated@example.com"}),
+            )
+            .await
+            .unwrap();
+        adapter.delete("user", &id).await.unwrap();
+        let storage = SqlxSecondaryStorage::postgres(&url).await.unwrap();
+        assert_eq!(
+            storage
+                .increment("conformance-counter", 1, Duration::from_secs(60))
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[cfg(feature = "sqlx")]
+    #[tokio::test]
+    async fn sqlx_mysql_conformance_when_configured() {
+        let Ok(url) = std::env::var("BETTER_AUTH_TEST_MYSQL_URL") else {
+            return;
+        };
+        let adapter = SqlxDbAdapter::mysql(&url).await.unwrap();
+        let id = format!("conformance-{}", uuid::Uuid::new_v4());
+        adapter
+            .insert(
+                "user",
+                &id,
+                serde_json::json!({"id": id.clone(), "email": "mysql@example.com"}),
+            )
+            .await
+            .unwrap();
+        assert!(adapter.get("user", &id).await.unwrap().is_some());
+        adapter.delete("user", &id).await.unwrap();
     }
 }

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use uuid::Uuid;
 
@@ -653,7 +654,10 @@ pub fn generate_scim_token() -> (String, String) {
 }
 
 pub fn verify_scim_token(token: &str, expected_hash: &str) -> bool {
-    hash_secret(token) == expected_hash
+    hash_secret(token)
+        .as_bytes()
+        .ct_eq(expected_hash.as_bytes())
+        .into()
 }
 
 #[derive(Clone)]
@@ -974,19 +978,45 @@ impl ScimService {
         count: usize,
         filter: Option<&str>,
     ) -> Result<serde_json::Value> {
+        self.list_users_query(start_index, count, filter, None, None)
+            .await
+    }
+
+    pub async fn list_users_query(
+        &self,
+        start_index: usize,
+        count: usize,
+        filter: Option<&str>,
+        sort_by: Option<&str>,
+        sort_order: Option<&str>,
+    ) -> Result<serde_json::Value> {
         if start_index == 0 {
             return Err(AuthError::InvalidRequest(
                 "SCIM startIndex is one-based".into(),
             ));
         }
         let predicate = ScimFilter::parse(filter)?;
-        let records = self
+        let mut records = self
             .adapter
             .list("user")
             .await?
             .into_iter()
             .filter(|(_, user)| predicate.matches(user))
             .collect::<Vec<_>>();
+        if let Some(sort_by) = sort_by {
+            let sort_by = normalize_scim_attribute(sort_by)?;
+            records.sort_by(|left, right| {
+                scim_sort_value(&left.0, &left.1, &sort_by)
+                    .cmp(&scim_sort_value(&right.0, &right.1, &sort_by))
+            });
+            if sort_order.is_some_and(|order| order.eq_ignore_ascii_case("descending")) {
+                records.reverse();
+            } else if sort_order.is_some_and(|order| !order.eq_ignore_ascii_case("ascending")) {
+                return Err(AuthError::InvalidRequest(
+                    "SCIM sortOrder must be ascending or descending".into(),
+                ));
+            }
+        }
         let total = records.len();
         let start = start_index.saturating_sub(1).min(total);
         let end = start.saturating_add(count).min(total);
@@ -1196,6 +1226,13 @@ enum ScimFilter {
         operator: ScimCompare,
         expected: String,
     },
+    ValuePath {
+        base: String,
+        subfilter: Box<Self>,
+        attribute: String,
+        operator: ScimCompare,
+        expected: String,
+    },
     And(Box<Self>, Box<Self>),
     Or(Box<Self>, Box<Self>),
 }
@@ -1219,6 +1256,9 @@ enum ScimFilterToken {
     Value(String),
     Open,
     Close,
+    OpenBracket,
+    CloseBracket,
+    Dot,
 }
 
 impl ScimFilter {
@@ -1247,31 +1287,61 @@ impl ScimFilter {
                 attribute,
                 operator,
                 expected,
+            } => scim_compare_matches(user, attribute, *operator, expected),
+            Self::ValuePath {
+                base,
+                subfilter,
+                attribute,
+                operator,
+                expected,
             } => {
-                let Some(actual) = scim_attribute(user, attribute) else {
+                if base != "emails" || attribute != "email" {
+                    return false;
+                }
+                let Some(email) = user.get("email").and_then(serde_json::Value::as_str) else {
                     return false;
                 };
-                match operator {
-                    ScimCompare::Eq => actual.eq_ignore_ascii_case(expected),
-                    ScimCompare::Ne => !actual.eq_ignore_ascii_case(expected),
-                    ScimCompare::Contains => actual
-                        .to_ascii_lowercase()
-                        .contains(&expected.to_ascii_lowercase()),
-                    ScimCompare::StartsWith => actual
-                        .to_ascii_lowercase()
-                        .starts_with(&expected.to_ascii_lowercase()),
-                    ScimCompare::EndsWith => actual
-                        .to_ascii_lowercase()
-                        .ends_with(&expected.to_ascii_lowercase()),
-                    ScimCompare::GreaterThan => compare_scim_values(&actual, expected).is_gt(),
-                    ScimCompare::GreaterOrEqual => compare_scim_values(&actual, expected).is_ge(),
-                    ScimCompare::LessThan => compare_scim_values(&actual, expected).is_lt(),
-                    ScimCompare::LessOrEqual => compare_scim_values(&actual, expected).is_le(),
-                }
+                let synthetic = serde_json::json!({
+                    "type": "work",
+                    "email": email,
+                });
+                subfilter.matches(&synthetic) && scim_compare_value(email, *operator, expected)
             }
             Self::And(left, right) => left.matches(user) && right.matches(user),
             Self::Or(left, right) => left.matches(user) || right.matches(user),
         }
+    }
+}
+
+fn scim_compare_matches(
+    user: &serde_json::Value,
+    attribute: &str,
+    operator: ScimCompare,
+    expected: &str,
+) -> bool {
+    let Some(actual) = scim_attribute(user, attribute) else {
+        return false;
+    };
+    scim_compare_value(&actual, operator, expected)
+}
+
+fn scim_compare_value(actual: &str, operator: ScimCompare, expected: &str) -> bool {
+    match operator {
+        ScimCompare::Eq => actual.eq_ignore_ascii_case(expected),
+        ScimCompare::Ne => !actual.eq_ignore_ascii_case(expected),
+        ScimCompare::Contains => actual
+            .to_ascii_lowercase()
+            .contains(&expected.to_ascii_lowercase()),
+        ScimCompare::StartsWith => actual
+            .to_ascii_lowercase()
+            .starts_with(&expected.to_ascii_lowercase()),
+        ScimCompare::EndsWith => actual
+            .to_ascii_lowercase()
+            .ends_with(&expected.to_ascii_lowercase()),
+        ScimCompare::GreaterThan => compare_scim_values(actual, expected).is_gt(),
+        ScimCompare::GreaterOrEqual => compare_scim_values(actual, expected).is_ge(),
+        ScimCompare::LessThan => compare_scim_values(actual, expected).is_lt(),
+        ScimCompare::LessOrEqual => compare_scim_values(actual, expected).is_le(),
     }
 }
 
@@ -1307,14 +1377,56 @@ impl ScimFilterParser {
             }
             return Ok(result);
         }
-        let attribute = match self.next() {
-            Some(ScimFilterToken::Word(attribute)) => normalize_scim_attribute(&attribute)?,
+        let raw_attribute = match self.next() {
+            Some(ScimFilterToken::Word(attribute)) => attribute,
             _ => {
                 return Err(AuthError::InvalidRequest(
                     "SCIM filter must start with an attribute".into(),
                 ))
             }
         };
+        let attribute = normalize_scim_attribute(&raw_attribute)?;
+        if self.take_token(ScimFilterToken::OpenBracket) {
+            let subfilter = self.parse_or()?;
+            if !self.take_token(ScimFilterToken::CloseBracket)
+                || !self.take_token(ScimFilterToken::Dot)
+            {
+                return Err(AuthError::InvalidRequest(
+                    "invalid SCIM valuePath filter".into(),
+                ));
+            }
+            let value_attribute = match self.next() {
+                Some(ScimFilterToken::Word(value)) => normalize_scim_attribute(&value)?,
+                _ => {
+                    return Err(AuthError::InvalidRequest(
+                        "SCIM valuePath is missing an attribute".into(),
+                    ))
+                }
+            };
+            let operator = match self.next() {
+                Some(ScimFilterToken::Word(operator)) => scim_compare_operator(&operator)?,
+                _ => {
+                    return Err(AuthError::InvalidRequest(
+                        "SCIM valuePath is missing an operator".into(),
+                    ))
+                }
+            };
+            let expected = match self.next() {
+                Some(ScimFilterToken::Word(value) | ScimFilterToken::Value(value)) => value,
+                _ => {
+                    return Err(AuthError::InvalidRequest(
+                        "SCIM valuePath is missing a value".into(),
+                    ))
+                }
+            };
+            return Ok(ScimFilter::ValuePath {
+                base: attribute,
+                subfilter: Box::new(subfilter),
+                attribute: value_attribute,
+                operator,
+                expected,
+            });
+        }
         let operator = match self.next() {
             Some(ScimFilterToken::Word(operator)) => operator.to_ascii_lowercase(),
             _ => {
@@ -1326,22 +1438,7 @@ impl ScimFilterParser {
         if operator == "pr" {
             return Ok(ScimFilter::Present(attribute));
         }
-        let operator = match operator.as_str() {
-            "eq" => ScimCompare::Eq,
-            "ne" => ScimCompare::Ne,
-            "co" => ScimCompare::Contains,
-            "sw" => ScimCompare::StartsWith,
-            "ew" => ScimCompare::EndsWith,
-            "gt" => ScimCompare::GreaterThan,
-            "ge" => ScimCompare::GreaterOrEqual,
-            "lt" => ScimCompare::LessThan,
-            "le" => ScimCompare::LessOrEqual,
-            _ => {
-                return Err(AuthError::InvalidRequest(
-                    "unsupported SCIM filter operator".into(),
-                ))
-            }
-        };
+        let operator = scim_compare_operator(&operator)?;
         let expected = match self.next() {
             Some(ScimFilterToken::Word(value) | ScimFilterToken::Value(value)) => value,
             _ => {
@@ -1387,6 +1484,23 @@ impl ScimFilterParser {
     }
 }
 
+fn scim_compare_operator(operator: &str) -> Result<ScimCompare> {
+    match operator.to_ascii_lowercase().as_str() {
+        "eq" => Ok(ScimCompare::Eq),
+        "ne" => Ok(ScimCompare::Ne),
+        "co" => Ok(ScimCompare::Contains),
+        "sw" => Ok(ScimCompare::StartsWith),
+        "ew" => Ok(ScimCompare::EndsWith),
+        "gt" => Ok(ScimCompare::GreaterThan),
+        "ge" => Ok(ScimCompare::GreaterOrEqual),
+        "lt" => Ok(ScimCompare::LessThan),
+        "le" => Ok(ScimCompare::LessOrEqual),
+        _ => Err(AuthError::InvalidRequest(
+            "unsupported SCIM filter operator".into(),
+        )),
+    }
+}
+
 fn tokenize_scim_filter(filter: &str) -> Result<Vec<ScimFilterToken>> {
     let characters = filter.chars().collect::<Vec<_>>();
     let mut tokens = Vec::new();
@@ -1399,6 +1513,15 @@ fn tokenize_scim_filter(filter: &str) -> Result<Vec<ScimFilterToken>> {
             position += 1;
         } else if characters[position] == ')' {
             tokens.push(ScimFilterToken::Close);
+            position += 1;
+        } else if characters[position] == '[' {
+            tokens.push(ScimFilterToken::OpenBracket);
+            position += 1;
+        } else if characters[position] == ']' {
+            tokens.push(ScimFilterToken::CloseBracket);
+            position += 1;
+        } else if characters[position] == '.' {
+            tokens.push(ScimFilterToken::Dot);
             position += 1;
         } else if matches!(characters[position], '"' | '\'') {
             let quote = characters[position];
@@ -1429,7 +1552,7 @@ fn tokenize_scim_filter(filter: &str) -> Result<Vec<ScimFilterToken>> {
             let start = position;
             while position < characters.len()
                 && !characters[position].is_whitespace()
-                && !matches!(characters[position], '(' | ')')
+                && !matches!(characters[position], '(' | ')' | '[' | ']' | '.')
             {
                 position += 1;
             }
@@ -1456,6 +1579,9 @@ fn normalize_scim_attribute(attribute: &str) -> Result<String> {
     match attribute.to_ascii_lowercase().as_str() {
         "id" => Ok("id".into()),
         "username" | "emails.value" | "email" => Ok("email".into()),
+        "emails" => Ok("emails".into()),
+        "value" => Ok("email".into()),
+        "type" => Ok("type".into()),
         "displayname" | "name" => Ok("name".into()),
         "active" => Ok("active".into()),
         _ => Err(AuthError::InvalidRequest(format!(
@@ -1465,6 +1591,18 @@ fn normalize_scim_attribute(attribute: &str) -> Result<String> {
 }
 
 fn scim_attribute(user: &serde_json::Value, attribute: &str) -> Option<String> {
+    if attribute == "emails" {
+        return user
+            .get("email")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+    }
+    if attribute == "type" {
+        return user
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+    }
     if attribute == "active" {
         return Some(
             user.get("active")
@@ -1476,6 +1614,15 @@ fn scim_attribute(user: &serde_json::Value, attribute: &str) -> Option<String> {
     user.get(attribute)
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
+}
+
+fn scim_sort_value(id: &str, user: &serde_json::Value, attribute: &str) -> String {
+    if attribute == "id" {
+        return id.to_ascii_lowercase();
+    }
+    scim_attribute(user, attribute)
+        .unwrap_or_default()
+        .to_ascii_lowercase()
 }
 
 fn scim_user_resource(id: &str, user: &serde_json::Value) -> serde_json::Value {
@@ -1850,6 +1997,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(filtered["totalResults"], 1);
+        let value_path = scim
+            .list_users_filtered(
+                1,
+                10,
+                Some(r#"emails[type eq "work"].value eq "user@example.com""#),
+            )
+            .await
+            .unwrap();
+        assert_eq!(value_path["totalResults"], 1);
         let operations = vec![ScimBulkOperation {
             method: "PATCH".into(),
             path: "/Users/user".into(),

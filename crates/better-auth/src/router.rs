@@ -356,4 +356,27 @@ mod tests {
         assert_eq!(response.status, StatusCode::OK);
         assert!(response.headers.contains_key(header::SET_COOKIE));
     }
+
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn axum_adapter_bridges_native_requests_and_responses() {
+        use axum::{body::Body, extract::State, response::IntoResponse};
+        use http::Request;
+
+        let router = Arc::new(router());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/auth/sign-up/email")
+            .header(header::ORIGIN, "https://example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"email":"axum@example.com","name":"Axum","password":"correct horse battery staple"}"#,
+            ))
+            .unwrap();
+        let response = axum_adapter::handler(State(router), request)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(header::SET_COOKIE).is_some());
+    }
 }
