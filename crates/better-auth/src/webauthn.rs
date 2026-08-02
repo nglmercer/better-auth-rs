@@ -227,7 +227,7 @@ impl WebAuthnService {
             .map_err(webauthn_error)?;
         let updated = credential
             .update_credential(&result)
-            .ok_or_else(|| AuthError::Unauthorized)?;
+            .ok_or(AuthError::Unauthorized)?;
         Ok(WebAuthnAuthenticationResult {
             credential_id: format!("{:?}", result.cred_id()),
             counter: result.counter(),

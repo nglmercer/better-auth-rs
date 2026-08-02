@@ -125,7 +125,7 @@ pub fn verify_totp(
     step_seconds: u64,
     window: i8,
 ) -> Result<bool> {
-    if window < 0 || window > 5 {
+    if !(0..=5).contains(&window) {
         return Err(AuthError::InvalidConfiguration(
             "invalid TOTP window".into(),
         ));
