@@ -10,6 +10,7 @@ rust-version.workspace = true
 default = []
 axum = ["dep:axum"]
 sqlx = ["dep:sqlx"]
+saml = ["dep:saml-rs"]
 
 [dependencies]
 aes-gcm.workspace = true
@@ -21,6 +22,7 @@ data-encoding.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 sqlx = { workspace = true, optional = true }
+saml-rs = { workspace = true, optional = true }
 tokio.workspace = true
 hmac.workspace = true
 http.workspace = true

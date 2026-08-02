@@ -620,28 +620,29 @@ impl Plugin for ScimPlugin {
         ]
     }
     fn schema(&self) -> SchemaExtension {
-        SchemaExtension::default().table(
-            "scim_token",
-            TableSchema::default()
-                .field("id", required(FieldType::String).unique())
-                .field("organization_id", required(FieldType::String))
-                .field("token_hash", required(FieldType::String).unique())
-                .field("expires_at", optional(FieldType::DateTime)),
-        )
-        .table(
-            "scim_group",
-            TableSchema::default()
-                .field("id", required(FieldType::String).unique())
-                .field("display_name", required(FieldType::String))
-                .field("organization_id", required(FieldType::String)),
-        )
-        .table(
-            "scim_group_member",
-            TableSchema::default()
-                .field("id", required(FieldType::String).unique())
-                .field("group_id", required(FieldType::String))
-                .field("user_id", required(FieldType::String)),
-        )
+        SchemaExtension::default()
+            .table(
+                "scim_token",
+                TableSchema::default()
+                    .field("id", required(FieldType::String).unique())
+                    .field("organization_id", required(FieldType::String))
+                    .field("token_hash", required(FieldType::String).unique())
+                    .field("expires_at", optional(FieldType::DateTime)),
+            )
+            .table(
+                "scim_group",
+                TableSchema::default()
+                    .field("id", required(FieldType::String).unique())
+                    .field("display_name", required(FieldType::String))
+                    .field("organization_id", required(FieldType::String)),
+            )
+            .table(
+                "scim_group_member",
+                TableSchema::default()
+                    .field("id", required(FieldType::String).unique())
+                    .field("group_id", required(FieldType::String))
+                    .field("user_id", required(FieldType::String)),
+            )
     }
 }
 
@@ -733,7 +734,7 @@ impl ScimService {
             .insert(
                 "scim_token",
                 &record.id,
-                serde_json::to_value(record).map_err(serialize_error)?,
+                serde_json::to_value(&record).map_err(serialize_error)?,
             )
             .await?;
         Ok(token)
@@ -748,18 +749,16 @@ impl ScimService {
         let hash = hash_secret(token);
         let Some((_, value)) = self
             .adapter
-            .get_by_field(
-                "scim_token",
-                "token_hash",
-                &serde_json::Value::String(hash),
-            )
+            .get_by_field("scim_token", "token_hash", &serde_json::Value::String(hash))
             .await?
         else {
             return Err(AuthError::Unauthorized);
         };
         let record: ScimTokenRecord = serde_json::from_value(value).map_err(serialize_error)?;
         if organization_id.is_some_and(|id| id != record.organization_id)
-            || record.expires_at.is_some_and(|expires| expires <= now_seconds)
+            || record
+                .expires_at
+                .is_some_and(|expires| expires <= now_seconds)
         {
             return Err(AuthError::Unauthorized);
         }
@@ -926,10 +925,7 @@ impl ScimService {
             .await?
             .into_iter()
             .filter(|(_, value)| {
-                value
-                    .get("group_id")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(group_id)
+                value.get("group_id").and_then(serde_json::Value::as_str) == Some(group_id)
             })
             .map(|(id, _)| DbOperation::Delete {
                 table: "scim_group_member".into(),
@@ -1158,10 +1154,7 @@ impl ScimService {
             .await?
             .into_iter()
             .filter(|(_, value)| {
-                value
-                    .get("group_id")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(group_id)
+                value.get("group_id").and_then(serde_json::Value::as_str) == Some(group_id)
             })
             .map(|(id, _)| DbOperation::Delete {
                 table: "scim_group_member".into(),
@@ -1196,10 +1189,35 @@ impl ScimService {
 #[derive(Clone, Debug)]
 enum ScimFilter {
     All,
-    Eq(String, String),
-    Contains(String, String),
-    StartsWith(String, String),
     Present(String),
+    Compare {
+        attribute: String,
+        operator: ScimCompare,
+        expected: String,
+    },
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ScimCompare {
+    Eq,
+    Ne,
+    Contains,
+    StartsWith,
+    EndsWith,
+    GreaterThan,
+    GreaterOrEqual,
+    LessThan,
+    LessOrEqual,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ScimFilterToken {
+    Word(String),
+    Value(String),
+    Open,
+    Close,
 }
 
 impl ScimFilter {
@@ -1207,64 +1225,229 @@ impl ScimFilter {
         let Some(filter) = filter.map(str::trim).filter(|filter| !filter.is_empty()) else {
             return Ok(Self::All);
         };
-        let tokens = filter.split_whitespace().collect::<Vec<_>>();
-        if tokens.len() == 2 && tokens[1].eq_ignore_ascii_case("pr") {
-            return Ok(Self::Present(normalize_scim_attribute(tokens[0])?));
+        let mut parser = ScimFilterParser {
+            tokens: tokenize_scim_filter(filter)?,
+            position: 0,
+        };
+        let result = parser.parse_or()?;
+        if parser.position != parser.tokens.len() {
+            return Err(AuthError::InvalidRequest(
+                "unexpected tokens at end of SCIM filter".into(),
+            ));
         }
-        if tokens.len() < 3 {
-            return Err(AuthError::InvalidRequest("invalid SCIM filter".into()));
-        }
-        let attribute = normalize_scim_attribute(tokens[0])?;
-        let operator = tokens[1].to_ascii_lowercase();
-        let raw = tokens[2..].join(" ");
-        let value = raw
-            .strip_prefix('"')
-            .and_then(|value| value.strip_suffix('"'))
-            .or_else(|| {
-                raw.strip_prefix('\'')
-                    .and_then(|value| value.strip_suffix('\''))
-            })
-            .unwrap_or(&raw)
-            .to_owned();
-        match operator.as_str() {
-            "eq" => Ok(Self::Eq(attribute, value)),
-            "co" => Ok(Self::Contains(attribute, value)),
-            "sw" => Ok(Self::StartsWith(attribute, value)),
-            "pr" if tokens.len() == 2 => Ok(Self::Present(attribute)),
-            _ => Err(AuthError::InvalidRequest(
-                "SCIM supports eq, co, sw, and pr filters".into(),
-            )),
-        }
+        Ok(result)
     }
 
     fn matches(&self, user: &serde_json::Value) -> bool {
-        if matches!(self, Self::All) {
-            return true;
-        }
-        let Some(value) = scim_attribute(user, self.attribute()) else {
-            return false;
-        };
         match self {
             Self::All => true,
-            Self::Eq(_, expected) => value.eq_ignore_ascii_case(expected),
-            Self::Contains(_, expected) => value
-                .to_ascii_lowercase()
-                .contains(&expected.to_ascii_lowercase()),
-            Self::StartsWith(_, expected) => value
-                .to_ascii_lowercase()
-                .starts_with(&expected.to_ascii_lowercase()),
-            Self::Present(_) => true,
+            Self::Present(attribute) => scim_attribute(user, attribute).is_some(),
+            Self::Compare {
+                attribute,
+                operator,
+                expected,
+            } => {
+                let Some(actual) = scim_attribute(user, attribute) else {
+                    return false;
+                };
+                match operator {
+                    ScimCompare::Eq => actual.eq_ignore_ascii_case(expected),
+                    ScimCompare::Ne => !actual.eq_ignore_ascii_case(expected),
+                    ScimCompare::Contains => actual
+                        .to_ascii_lowercase()
+                        .contains(&expected.to_ascii_lowercase()),
+                    ScimCompare::StartsWith => actual
+                        .to_ascii_lowercase()
+                        .starts_with(&expected.to_ascii_lowercase()),
+                    ScimCompare::EndsWith => actual
+                        .to_ascii_lowercase()
+                        .ends_with(&expected.to_ascii_lowercase()),
+                    ScimCompare::GreaterThan => compare_scim_values(&actual, expected).is_gt(),
+                    ScimCompare::GreaterOrEqual => compare_scim_values(&actual, expected).is_ge(),
+                    ScimCompare::LessThan => compare_scim_values(&actual, expected).is_lt(),
+                    ScimCompare::LessOrEqual => compare_scim_values(&actual, expected).is_le(),
+                }
+            }
+            Self::And(left, right) => left.matches(user) && right.matches(user),
+            Self::Or(left, right) => left.matches(user) || right.matches(user),
+        }
+    }
+}
+
+struct ScimFilterParser {
+    tokens: Vec<ScimFilterToken>,
+    position: usize,
+}
+
+impl ScimFilterParser {
+    fn parse_or(&mut self) -> Result<ScimFilter> {
+        let mut result = self.parse_and()?;
+        while self.take_word("or") {
+            result = ScimFilter::Or(Box::new(result), Box::new(self.parse_and()?));
+        }
+        Ok(result)
+    }
+
+    fn parse_and(&mut self) -> Result<ScimFilter> {
+        let mut result = self.parse_factor()?;
+        while self.take_word("and") {
+            result = ScimFilter::And(Box::new(result), Box::new(self.parse_factor()?));
+        }
+        Ok(result)
+    }
+
+    fn parse_factor(&mut self) -> Result<ScimFilter> {
+        if self.take_token(ScimFilterToken::Open) {
+            let result = self.parse_or()?;
+            if !self.take_token(ScimFilterToken::Close) {
+                return Err(AuthError::InvalidRequest(
+                    "unclosed parenthesis in SCIM filter".into(),
+                ));
+            }
+            return Ok(result);
+        }
+        let attribute = match self.next() {
+            Some(ScimFilterToken::Word(attribute)) => normalize_scim_attribute(&attribute)?,
+            _ => {
+                return Err(AuthError::InvalidRequest(
+                    "SCIM filter must start with an attribute".into(),
+                ))
+            }
+        };
+        let operator = match self.next() {
+            Some(ScimFilterToken::Word(operator)) => operator.to_ascii_lowercase(),
+            _ => {
+                return Err(AuthError::InvalidRequest(
+                    "SCIM filter is missing an operator".into(),
+                ))
+            }
+        };
+        if operator == "pr" {
+            return Ok(ScimFilter::Present(attribute));
+        }
+        let operator = match operator.as_str() {
+            "eq" => ScimCompare::Eq,
+            "ne" => ScimCompare::Ne,
+            "co" => ScimCompare::Contains,
+            "sw" => ScimCompare::StartsWith,
+            "ew" => ScimCompare::EndsWith,
+            "gt" => ScimCompare::GreaterThan,
+            "ge" => ScimCompare::GreaterOrEqual,
+            "lt" => ScimCompare::LessThan,
+            "le" => ScimCompare::LessOrEqual,
+            _ => {
+                return Err(AuthError::InvalidRequest(
+                    "unsupported SCIM filter operator".into(),
+                ))
+            }
+        };
+        let expected = match self.next() {
+            Some(ScimFilterToken::Word(value) | ScimFilterToken::Value(value)) => value,
+            _ => {
+                return Err(AuthError::InvalidRequest(
+                    "SCIM comparison is missing a value".into(),
+                ))
+            }
+        };
+        Ok(ScimFilter::Compare {
+            attribute,
+            operator,
+            expected,
+        })
+    }
+
+    fn next(&mut self) -> Option<ScimFilterToken> {
+        let token = self.tokens.get(self.position).cloned();
+        if token.is_some() {
+            self.position += 1;
+        }
+        token
+    }
+
+    fn take_token(&mut self, expected: ScimFilterToken) -> bool {
+        if self.tokens.get(self.position) == Some(&expected) {
+            self.position += 1;
+            true
+        } else {
+            false
         }
     }
 
-    fn attribute(&self) -> &str {
-        match self {
-            Self::All => "",
-            Self::Eq(attribute, _)
-            | Self::Contains(attribute, _)
-            | Self::StartsWith(attribute, _)
-            | Self::Present(attribute) => attribute,
+    fn take_word(&mut self, expected: &str) -> bool {
+        if matches!(
+            self.tokens.get(self.position),
+            Some(ScimFilterToken::Word(word)) if word.eq_ignore_ascii_case(expected)
+        ) {
+            self.position += 1;
+            true
+        } else {
+            false
         }
+    }
+}
+
+fn tokenize_scim_filter(filter: &str) -> Result<Vec<ScimFilterToken>> {
+    let characters = filter.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut position = 0;
+    while position < characters.len() {
+        if characters[position].is_whitespace() {
+            position += 1;
+        } else if characters[position] == '(' {
+            tokens.push(ScimFilterToken::Open);
+            position += 1;
+        } else if characters[position] == ')' {
+            tokens.push(ScimFilterToken::Close);
+            position += 1;
+        } else if matches!(characters[position], '"' | '\'') {
+            let quote = characters[position];
+            position += 1;
+            let mut value = String::new();
+            let mut closed = false;
+            while position < characters.len() {
+                let character = characters[position];
+                position += 1;
+                if character == quote {
+                    closed = true;
+                    break;
+                }
+                if character == '\\' && position < characters.len() {
+                    value.push(characters[position]);
+                    position += 1;
+                } else {
+                    value.push(character);
+                }
+            }
+            if !closed {
+                return Err(AuthError::InvalidRequest(
+                    "unterminated quoted value in SCIM filter".into(),
+                ));
+            }
+            tokens.push(ScimFilterToken::Value(value));
+        } else {
+            let start = position;
+            while position < characters.len()
+                && !characters[position].is_whitespace()
+                && !matches!(characters[position], '(' | ')')
+            {
+                position += 1;
+            }
+            tokens.push(ScimFilterToken::Word(
+                characters[start..position].iter().collect(),
+            ));
+        }
+    }
+    Ok(tokens)
+}
+
+fn compare_scim_values(actual: &str, expected: &str) -> std::cmp::Ordering {
+    match (actual.parse::<f64>(), expected.parse::<f64>()) {
+        (Ok(actual), Ok(expected)) => actual
+            .partial_cmp(&expected)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        _ => actual
+            .to_ascii_lowercase()
+            .cmp(&expected.to_ascii_lowercase()),
     }
 }
 
@@ -1327,30 +1510,138 @@ fn scim_user_from_resource(resource: &serde_json::Value) -> Result<serde_json::V
     }))
 }
 
-fn merge_scim_patch(
+fn apply_scim_user_patch(
     mut user: serde_json::Value,
     patch: &serde_json::Value,
 ) -> Result<serde_json::Value> {
+    if patch.is_array() {
+        let operations = serde_json::from_value::<Vec<ScimPatchOperation>>(patch.clone())
+            .map_err(serialize_error)?;
+        for operation in operations {
+            apply_scim_patch_operation(&mut user, &operation)?;
+        }
+        return Ok(user);
+    }
     let Some(patch) = patch.as_object() else {
         return Err(AuthError::InvalidRequest(
-            "SCIM patch must be an object".into(),
+            "SCIM patch must be an object or operation array".into(),
         ));
     };
     for (key, value) in patch {
-        match key.as_str() {
-            "userName" | "email" => user["email"] = value.clone(),
-            "displayName" | "name" => user["name"] = value.clone(),
-            "active" => user["active"] = value.clone(),
-            "role" => user["role"] = value.clone(),
-            "id" | "schemas" | "meta" => {}
-            _ => {
-                return Err(AuthError::InvalidRequest(format!(
-                    "unsupported SCIM patch attribute: {key}"
-                )))
-            }
+        if matches!(key.as_str(), "id" | "schemas" | "meta") {
+            continue;
         }
+        apply_scim_patch_operation(
+            &mut user,
+            &ScimPatchOperation {
+                op: "replace".into(),
+                path: Some(key.clone()),
+                value: Some(value.clone()),
+            },
+        )?;
     }
     Ok(user)
+}
+
+fn apply_scim_patch_operation(
+    user: &mut serde_json::Value,
+    operation: &ScimPatchOperation,
+) -> Result<()> {
+    let op = operation.op.to_ascii_lowercase();
+    if !matches!(op.as_str(), "add" | "replace" | "remove") {
+        return Err(AuthError::InvalidRequest(format!(
+            "unsupported SCIM PATCH operation: {}",
+            operation.op
+        )));
+    }
+    let Some(path) = operation.path.as_deref() else {
+        if op == "remove" {
+            return Err(AuthError::InvalidRequest(
+                "SCIM remove requires a path".into(),
+            ));
+        }
+        let Some(value) = operation.value.as_ref() else {
+            return Err(AuthError::InvalidRequest(
+                "SCIM add/replace requires a value".into(),
+            ));
+        };
+        let Some(object) = value.as_object() else {
+            return Err(AuthError::InvalidRequest(
+                "SCIM add/replace without path requires an object".into(),
+            ));
+        };
+        for (key, value) in object {
+            apply_scim_patch_operation(
+                user,
+                &ScimPatchOperation {
+                    op: op.clone(),
+                    path: Some(key.clone()),
+                    value: Some(value.clone()),
+                },
+            )?;
+        }
+        return Ok(());
+    };
+    let attribute = normalize_scim_patch_attribute(path)?;
+    if op == "remove" {
+        if let Some(object) = user.as_object_mut() {
+            object.remove(&attribute);
+        }
+        return Ok(());
+    }
+    let value = operation
+        .value
+        .clone()
+        .ok_or_else(|| AuthError::InvalidRequest("SCIM add/replace requires a value".into()))?;
+    if attribute == "email" {
+        let email = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| value.contains('@'))
+            .ok_or_else(|| AuthError::InvalidRequest("SCIM userName must be an email".into()))?;
+        user["email"] = email.to_ascii_lowercase().into();
+    } else if attribute == "name" {
+        user["name"] = value;
+    } else if attribute == "active" {
+        if !value.is_boolean() {
+            return Err(AuthError::InvalidRequest(
+                "SCIM active must be boolean".into(),
+            ));
+        }
+        user["active"] = value;
+    } else if attribute == "role" {
+        user["role"] = value;
+    }
+    Ok(())
+}
+
+fn normalize_scim_patch_attribute(path: &str) -> Result<String> {
+    let path = path.trim();
+    let normalized = match path.to_ascii_lowercase().as_str() {
+        "username" | "email" | "emails.value" => "email",
+        "displayname" | "name" => "name",
+        "active" => "active",
+        "role" => "role",
+        _ => {
+            if path.to_ascii_lowercase().starts_with("emails[")
+                && path.to_ascii_lowercase().ends_with("].value")
+            {
+                "email"
+            } else {
+                return Err(AuthError::InvalidRequest(format!(
+                    "unsupported SCIM PATCH path: {path}"
+                )));
+            }
+        }
+    };
+    Ok(normalized.into())
+}
+
+fn merge_scim_patch(
+    user: serde_json::Value,
+    patch: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    apply_scim_user_patch(user, patch)
 }
 
 fn normalize_scim_path(path: &str) -> Result<String> {
@@ -1367,6 +1658,10 @@ fn normalize_scim_path(path: &str) -> Result<String> {
     } else {
         Err(AuthError::InvalidRequest("invalid SCIM bulk path".into()))
     }
+}
+
+fn scim_group_member_id(group_id: &str, user_id: &str) -> String {
+    format!("{group_id}:{user_id}")
 }
 
 trait ScimErrorStatus {
@@ -1546,7 +1841,11 @@ mod tests {
         assert_eq!(page["totalResults"], 2);
         assert_eq!(page["itemsPerPage"], 1);
         let filtered = scim
-            .list_users_filtered(1, 10, Some(r#"userName eq "user@example.com""#))
+            .list_users_filtered(
+                1,
+                10,
+                Some(r#"(userName eq "user@example.com") and active eq true"#),
+            )
             .await
             .unwrap();
         assert_eq!(filtered["totalResults"], 1);
@@ -1561,5 +1860,39 @@ mod tests {
             scim.get_user("user").await.unwrap()["displayName"],
             "Bulk Updated"
         );
+        scim.update_user(
+            "user",
+            json!([{"op":"replace","path":"displayName","value":"Patched Again"}]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scim.get_user("user").await.unwrap()["displayName"],
+            "Patched Again"
+        );
+        let token = scim
+            .issue_token("org-1", Some(now_seconds() + 60))
+            .await
+            .unwrap();
+        assert!(scim
+            .authorize_token(&token, Some("org-1"), now_seconds())
+            .await
+            .is_ok());
+        assert!(scim
+            .authorize_token(&token, Some("org-2"), now_seconds())
+            .await
+            .is_err());
+        let group = scim.create_group("org-1", "Operators").await.unwrap();
+        let group_id = group["id"].as_str().unwrap();
+        scim.add_group_member(group_id, "user").await.unwrap();
+        assert_eq!(
+            scim.get_group(group_id).await.unwrap()["members"][0]["value"],
+            "user"
+        );
+        let groups = scim.list_groups("org-1", 1, 10).await.unwrap();
+        assert_eq!(groups["totalResults"], 1);
+        scim.remove_group_member(group_id, "user").await.unwrap();
+        scim.delete_group(group_id).await.unwrap();
+        assert!(scim.get_group(group_id).await.is_err());
     }
 }

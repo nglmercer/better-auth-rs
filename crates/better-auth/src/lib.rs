@@ -17,6 +17,8 @@ pub mod password;
 pub mod plugins;
 pub mod rate_limit;
 pub mod router;
+#[cfg(feature = "saml")]
+pub mod saml_rs_integration;
 pub mod security;
 pub mod sso;
 pub mod verification;
@@ -45,11 +47,14 @@ pub use plugins::{
     generate_scim_token, generate_totp_secret, totp_code, verify_scim_token, verify_totp,
     AdminGuard, AdminPlugin, AdminService, BackupCodeSet, Organization, OrganizationMember,
     OrganizationPlugin, OrganizationService, PasskeyChallenge, PasskeyPlugin, PasskeyService,
-    ScimPlugin, ScimService, SsoConnectionConfig, SsoConnectionService, SsoPlugin, TotpSecret,
-    TwoFactorPlugin,
+    ScimBulkOperation, ScimBulkResponse, ScimGroup, ScimGroupMember, ScimPatchOperation,
+    ScimPlugin, ScimService, ScimTokenRecord, SsoConnectionConfig, SsoConnectionService, SsoPlugin,
+    TotpSecret, TwoFactorPlugin,
 };
 pub use rate_limit::{RateLimitDecision, RateLimitPolicy, RateLimiter};
 pub use router::{AuthRouter, HttpRequest, HttpResponse};
+#[cfg(feature = "saml")]
+pub use saml_rs_integration::{SamlRsIdentity, SamlRsServiceProvider, SamlRsStarted};
 pub use security::{check_csrf, extract_client_ip};
 pub use sso::{
     SamlAssertion, SamlAssertionValidator, SamlAuthorizationRequest, SamlIdentity, SamlProvider,
