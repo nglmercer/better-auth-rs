@@ -45,6 +45,9 @@ The workspace now covers all roadmap phases at a framework-neutral baseline:
 - a TypeScript client package at `packages/better-auth-client` with typed
   fetch-based sign-up/sign-in, sessions, sign-out, generic requests, cookie
   credentials, structured errors, and safe retries.
+- a Kotlin Multiplatform client package at `packages/better-auth-kotlin` with
+  typed Ktor requests, cookie sessions, structured errors, safe retries, and
+  MockEngine tests.
 - SQLite relational and secondary-storage adapters, optional SQLx
   Postgres/MySQL adapters with dialect-aware placeholders, and migration
   execution.

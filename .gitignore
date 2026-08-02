@@ -1,3 +1,5 @@
 /target
 /packages/better-auth-client/node_modules
 /packages/better-auth-client/dist
+/packages/better-auth-kotlin/.gradle
+/packages/better-auth-kotlin/build
