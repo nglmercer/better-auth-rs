@@ -11,11 +11,16 @@ license = "MIT"
 rust-version = "1.78"
 
 [workspace.dependencies]
+aes-gcm = "0.10"
+axum = "0.8"
 async-trait = "0.1"
 base64 = "0.22"
+data-encoding = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 hmac = "0.12"
 http = "1"
 password-hash = "0.5"
+sha1 = "0.10"
 scrypt = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,4 +31,3 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
-

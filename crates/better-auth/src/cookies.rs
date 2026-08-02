@@ -1,3 +1,7 @@
+use aes_gcm::{
+    aead::{Aead, KeyInit as AesKeyInit},
+    Aes256Gcm, Nonce,
+};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use better_auth_core::{
     error::{AuthError, Result},
@@ -5,7 +9,9 @@ use better_auth_core::{
 };
 use hmac::{Hmac, Mac};
 use http::HeaderMap;
-use sha2::Sha256;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -103,6 +109,14 @@ impl SecretKeySet {
         })
     }
 
+    pub fn current_version(&self) -> &str {
+        &self.current_version
+    }
+
+    pub fn key_for_version(&self, version: &str) -> Option<&[u8]> {
+        self.keys.get(version).map(Vec::as_slice)
+    }
+
     /// Signs with the active key and embeds its version in the envelope. A
     /// verifier can select a rotated key directly instead of trying every key.
     pub fn sign(&self, value: &str) -> Result<String> {
@@ -112,7 +126,7 @@ impl SecretKeySet {
             .ok_or_else(|| AuthError::Crypto("current secret version is missing".into()))?;
         let payload = URL_SAFE_NO_PAD.encode(value.as_bytes());
         let message = format!("{}.{}", self.current_version, payload);
-        let mut mac = HmacSha256::new_from_slice(key)
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
             .map_err(|_| AuthError::Crypto("invalid HMAC key".into()))?;
         mac.update(message.as_bytes());
         Ok(format!(
@@ -130,7 +144,8 @@ impl SecretKeySet {
             return Err(AuthError::Unauthorized);
         }
         let key = self.keys.get(version).ok_or(AuthError::Unauthorized)?;
-        let mut mac = HmacSha256::new_from_slice(key).map_err(|_| AuthError::Unauthorized)?;
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(key).map_err(|_| AuthError::Unauthorized)?;
         mac.update(format!("{version}.{payload}").as_bytes());
         let expected = URL_SAFE_NO_PAD
             .decode(signature)
@@ -141,6 +156,233 @@ impl SecretKeySet {
             .decode(payload)
             .map_err(|_| AuthError::Unauthorized)?;
         String::from_utf8(bytes).map_err(|_| AuthError::Unauthorized)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct CookieCacheClaims {
+    pub sub: String,
+    pub iat: u64,
+    pub exp: u64,
+    #[serde(default)]
+    pub data: Value,
+}
+
+/// Compact JWT and direct-encryption JWE codecs for cookie-cached sessions.
+/// The JWE implementation uses the standard direct AES-256-GCM content
+/// encryption shape (protected header, empty encrypted-key, IV, ciphertext,
+/// tag) and embeds the key version as kid for rotation lookup.
+#[derive(Clone)]
+pub struct CookieCacheCodec {
+    keys: SecretKeySet,
+}
+
+impl CookieCacheCodec {
+    pub fn new(keys: SecretKeySet) -> Self {
+        Self { keys }
+    }
+
+    pub fn encode(
+        &self,
+        strategy: better_auth_core::options::CookieCacheStrategy,
+        subject: impl Into<String>,
+        data: Value,
+        issued_at: u64,
+        expires_at: u64,
+    ) -> Result<String> {
+        if expires_at <= issued_at {
+            return Err(AuthError::InvalidRequest(
+                "cookie-cache expiry must be after issuance".into(),
+            ));
+        }
+        let claims = CookieCacheClaims {
+            sub: subject.into(),
+            iat: issued_at,
+            exp: expires_at,
+            data,
+        };
+        let payload = serde_json::to_vec(&claims).map_err(|error| {
+            AuthError::Crypto(format!("cookie claims serialization failed: {error}"))
+        })?;
+        match strategy {
+            better_auth_core::options::CookieCacheStrategy::Jwt => self.encode_jwt(&payload),
+            better_auth_core::options::CookieCacheStrategy::Jwe => self.encode_jwe(&payload),
+        }
+    }
+
+    pub fn decode(
+        &self,
+        strategy: better_auth_core::options::CookieCacheStrategy,
+        token: &str,
+        now: u64,
+    ) -> Result<CookieCacheClaims> {
+        let claims = match strategy {
+            better_auth_core::options::CookieCacheStrategy::Jwt => self.decode_jwt(token)?,
+            better_auth_core::options::CookieCacheStrategy::Jwe => self.decode_jwe(token)?,
+        };
+        if claims.exp <= now || claims.iat > now.saturating_add(60) {
+            return Err(AuthError::Unauthorized);
+        }
+        Ok(claims)
+    }
+
+    fn encode_jwt(&self, payload: &[u8]) -> Result<String> {
+        let header = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "alg": "HS256",
+                "typ": "JWT",
+                "kid": self.keys.current_version(),
+            }))
+            .map_err(|error| AuthError::Crypto(error.to_string()))?,
+        );
+        let payload = URL_SAFE_NO_PAD.encode(payload);
+        let message = format!("{header}.{payload}");
+        let key = self
+            .keys
+            .key_for_version(self.keys.current_version())
+            .ok_or_else(|| AuthError::Crypto("current secret version is missing".into()))?;
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
+            .map_err(|_| AuthError::Crypto("invalid HMAC key".into()))?;
+        mac.update(message.as_bytes());
+        Ok(format!(
+            "{message}.{}",
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        ))
+    }
+
+    fn decode_jwt(&self, token: &str) -> Result<CookieCacheClaims> {
+        let mut parts = token.split('.');
+        let header_segment = parts.next().ok_or(AuthError::Unauthorized)?;
+        let payload = parts.next().ok_or(AuthError::Unauthorized)?;
+        let signature = parts.next().ok_or(AuthError::Unauthorized)?;
+        if parts.next().is_some() {
+            return Err(AuthError::Unauthorized);
+        }
+        let header: Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(header_segment)
+                .map_err(|_| AuthError::Unauthorized)?,
+        )
+        .map_err(|_| AuthError::Unauthorized)?;
+        if header.get("alg").and_then(Value::as_str) != Some("HS256") {
+            return Err(AuthError::Unauthorized);
+        }
+        let version = header
+            .get("kid")
+            .and_then(Value::as_str)
+            .ok_or(AuthError::Unauthorized)?;
+        let key = self
+            .keys
+            .key_for_version(version)
+            .ok_or(AuthError::Unauthorized)?;
+        let mut mac =
+            <HmacSha256 as Mac>::new_from_slice(key).map_err(|_| AuthError::Unauthorized)?;
+        mac.update(format!("{header_segment}.{payload}").as_bytes());
+        let signature = URL_SAFE_NO_PAD
+            .decode(signature)
+            .map_err(|_| AuthError::Unauthorized)?;
+        mac.verify_slice(&signature)
+            .map_err(|_| AuthError::Unauthorized)?;
+        serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(payload)
+                .map_err(|_| AuthError::Unauthorized)?,
+        )
+        .map_err(|_| AuthError::Unauthorized)
+    }
+
+    fn encode_jwe(&self, payload: &[u8]) -> Result<String> {
+        let protected = URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&json!({
+                "alg": "dir",
+                "enc": "A256GCM",
+                "kid": self.keys.current_version(),
+            }))
+            .map_err(|error| AuthError::Crypto(error.to_string()))?,
+        );
+        let uuid = uuid::Uuid::new_v4();
+        let nonce_bytes = &uuid.as_bytes()[..12];
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let key_material = self
+            .keys
+            .key_for_version(self.keys.current_version())
+            .ok_or_else(|| AuthError::Crypto("current secret version is missing".into()))?;
+        let key = sha2::Sha256::digest(key_material);
+        let cipher = <Aes256Gcm as AesKeyInit>::new_from_slice(&key)
+            .map_err(|_| AuthError::Crypto("invalid encryption key".into()))?;
+        let encrypted = cipher
+            .encrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: payload,
+                    aad: protected.as_bytes(),
+                },
+            )
+            .map_err(|_| AuthError::Crypto("cookie encryption failed".into()))?;
+        let split = encrypted.len().checked_sub(16).ok_or_else(|| {
+            AuthError::Crypto("encrypted cookie is missing an authentication tag".into())
+        })?;
+        let (ciphertext, tag) = encrypted.split_at(split);
+        Ok(format!(
+            "{protected}..{}.{}.{}",
+            URL_SAFE_NO_PAD.encode(nonce_bytes),
+            URL_SAFE_NO_PAD.encode(ciphertext),
+            URL_SAFE_NO_PAD.encode(tag)
+        ))
+    }
+
+    fn decode_jwe(&self, token: &str) -> Result<CookieCacheClaims> {
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 5 || !parts[1].is_empty() || parts[4].is_empty() {
+            return Err(AuthError::Unauthorized);
+        }
+        let protected = parts[0];
+        let header: Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(protected)
+                .map_err(|_| AuthError::Unauthorized)?,
+        )
+        .map_err(|_| AuthError::Unauthorized)?;
+        if header.get("alg").and_then(Value::as_str) != Some("dir")
+            || header.get("enc").and_then(Value::as_str) != Some("A256GCM")
+        {
+            return Err(AuthError::Unauthorized);
+        }
+        let version = header
+            .get("kid")
+            .and_then(Value::as_str)
+            .ok_or(AuthError::Unauthorized)?;
+        let key_material = self
+            .keys
+            .key_for_version(version)
+            .ok_or(AuthError::Unauthorized)?;
+        let key = sha2::Sha256::digest(key_material);
+        let cipher =
+            <Aes256Gcm as AesKeyInit>::new_from_slice(&key).map_err(|_| AuthError::Unauthorized)?;
+        let nonce = URL_SAFE_NO_PAD
+            .decode(parts[2])
+            .map_err(|_| AuthError::Unauthorized)?;
+        if nonce.len() != 12 {
+            return Err(AuthError::Unauthorized);
+        }
+        let mut encrypted = URL_SAFE_NO_PAD
+            .decode(parts[3])
+            .map_err(|_| AuthError::Unauthorized)?;
+        encrypted.extend_from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(parts[4])
+                .map_err(|_| AuthError::Unauthorized)?,
+        );
+        let plaintext = cipher
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                aes_gcm::aead::Payload {
+                    msg: &encrypted,
+                    aad: protected.as_bytes(),
+                },
+            )
+            .map_err(|_| AuthError::Unauthorized)?;
+        serde_json::from_slice(&plaintext).map_err(|_| AuthError::Unauthorized)
     }
 }
 
@@ -193,5 +435,23 @@ mod tests {
         let signed = keys.sign("session-123").unwrap();
         assert_eq!(keys.verify(&signed).unwrap(), "session-123");
         assert!(keys.verify("old.invalid.signature").is_err());
+    }
+
+    #[test]
+    fn jwt_and_jwe_cookie_cache_round_trip() {
+        let keys = keyset();
+        let codec = CookieCacheCodec::new(keys);
+        for strategy in [
+            better_auth_core::options::CookieCacheStrategy::Jwt,
+            better_auth_core::options::CookieCacheStrategy::Jwe,
+        ] {
+            let token = codec
+                .encode(strategy, "user-1", json!({"role": "user"}), 100, 200)
+                .unwrap();
+            let claims = codec.decode(strategy, &token, 150).unwrap();
+            assert_eq!(claims.sub, "user-1");
+            assert_eq!(claims.data["role"], "user");
+            assert!(codec.decode(strategy, &token, 200).is_err());
+        }
     }
 }

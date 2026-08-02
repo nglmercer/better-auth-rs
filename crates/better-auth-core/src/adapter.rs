@@ -25,6 +25,24 @@ impl StorageValue {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum DbOperation {
+    Insert {
+        table: String,
+        id: String,
+        record: Value,
+    },
+    Update {
+        table: String,
+        id: String,
+        record: Value,
+    },
+    Delete {
+        table: String,
+        id: String,
+    },
+}
+
 /// Minimal relational CRUD contract. Concrete adapters own query building,
 /// transactions, and database-specific typing.
 #[async_trait]
@@ -40,6 +58,8 @@ pub trait DbAdapter: Send + Sync {
         field: &str,
         value: &Value,
     ) -> Result<Option<(String, Value)>>;
+
+    async fn transaction(&self, operations: Vec<DbOperation>) -> Result<()>;
 }
 
 /// KV storage for sessions, verification records, OAuth state, and rate-limit
@@ -129,6 +149,37 @@ pub mod memory {
                 }
             }))
         }
+
+        async fn transaction(&self, operations: Vec<DbOperation>) -> Result<()> {
+            let mut records = self
+                .records
+                .lock()
+                .map_err(|_| AuthError::Adapter("memory DB lock poisoned".into()))?;
+            let mut working = records.clone();
+            for operation in operations {
+                match operation {
+                    DbOperation::Insert { table, id, record } => {
+                        let key = (table, id);
+                        if working.contains_key(&key) {
+                            return Err(AuthError::Adapter("record already exists".into()));
+                        }
+                        working.insert(key, record);
+                    }
+                    DbOperation::Update { table, id, record } => {
+                        let key = (table, id);
+                        if !working.contains_key(&key) {
+                            return Err(AuthError::NotFound);
+                        }
+                        working.insert(key, record);
+                    }
+                    DbOperation::Delete { table, id } => {
+                        working.remove(&(table, id));
+                    }
+                }
+            }
+            *records = working;
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -202,10 +253,13 @@ pub mod memory {
             let next = current
                 .checked_add(amount)
                 .ok_or_else(|| AuthError::Adapter("counter overflow".into()))?;
-            values.insert(
-                key.to_owned(),
-                (Value::from(next), Some(Instant::now() + expires_in)),
-            );
+            let now = Instant::now();
+            let expiry = values
+                .get(key)
+                .and_then(|(_, expires_at)| *expires_at)
+                .filter(|expires_at| *expires_at > now)
+                .unwrap_or(now + expires_in);
+            values.insert(key.to_owned(), (Value::from(next), Some(expiry)));
             Ok(next)
         }
 

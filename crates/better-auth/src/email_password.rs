@@ -1,9 +1,12 @@
 use crate::{
     context::AuthContext,
-    cookies::{request_cookies, session_cookie_from_options, AuthCookie, SecretKeySet},
+    cookies::{request_cookies, AuthCookie, CookieCacheClaims, CookieCacheCodec, SecretKeySet},
     hash_password, verify_password,
 };
-use better_auth_core::error::{AuthError, Result};
+use better_auth_core::{
+    adapter::DbOperation,
+    error::{AuthError, Result},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -57,12 +60,18 @@ pub struct AuthResult {
 pub struct EmailPasswordService {
     context: AuthContext,
     keys: SecretKeySet,
+    cache: CookieCacheCodec,
 }
 
 impl EmailPasswordService {
     pub fn new(context: AuthContext) -> Result<Self> {
         let keys = SecretKeySet::from_options(&context.options)?;
-        Ok(Self { context, keys })
+        let cache = CookieCacheCodec::new(keys.clone());
+        Ok(Self {
+            context,
+            keys,
+            cache,
+        })
     }
 
     pub fn context(&self) -> &AuthContext {
@@ -70,6 +79,7 @@ impl EmailPasswordService {
     }
 
     pub async fn sign_up(&self, input: SignUpInput, secure_cookie: bool) -> Result<AuthResult> {
+        self.require_database()?;
         let email = normalize_email(&input.email)?;
         validate_name(&input.name)?;
         if input.password.is_empty() {
@@ -95,15 +105,6 @@ impl EmailPasswordService {
             image: None,
         };
         let password_hash = hash_password(&input.password)?;
-        self.context
-            .adapter
-            .insert(
-                USER_TABLE,
-                &user.id,
-                serde_json::to_value(&user).map_err(serialize_error)?,
-            )
-            .await?;
-
         let account_id = format!("{}:{EMAIL_PROVIDER}", user.id);
         let account = json!({
             "id": account_id,
@@ -112,22 +113,27 @@ impl EmailPasswordService {
             "account_id": user.email,
             "password_hash": password_hash,
         });
-        if let Err(error) = self
-            .context
+        self.context
             .adapter
-            .insert(ACCOUNT_TABLE, &account_id, account)
-            .await
-        {
-            // The generic adapter contract has no transaction primitive yet;
-            // clean up the just-created user on the failure path.
-            let _ = self.context.adapter.delete(USER_TABLE, &user.id).await;
-            return Err(error);
-        }
+            .transaction(vec![
+                DbOperation::Insert {
+                    table: USER_TABLE.into(),
+                    id: user.id.clone(),
+                    record: serde_json::to_value(&user).map_err(serialize_error)?,
+                },
+                DbOperation::Insert {
+                    table: ACCOUNT_TABLE.into(),
+                    id: account_id,
+                    record: account,
+                },
+            ])
+            .await?;
 
         self.create_authenticated_session(user, secure_cookie).await
     }
 
     pub async fn sign_in(&self, input: SignInInput, secure_cookie: bool) -> Result<AuthResult> {
+        self.require_database()?;
         let email = normalize_email(&input.email)?;
         let (_, user_value) = self
             .context
@@ -168,36 +174,96 @@ impl EmailPasswordService {
         let Some(value) = cookies.get(name) else {
             return Ok(None);
         };
-        let Ok(token) = self.keys.verify(value) else {
+        let Ok(verified) = self.read_cookie(value) else {
             return Ok(None);
         };
-        let token_hash = hash_session_token(&token);
-        let Some((_, session_value)) = self
-            .context
-            .adapter
-            .get_by_field(SESSION_TABLE, "token_hash", &Value::String(token_hash))
-            .await?
+        match verified {
+            VerifiedCookie::Opaque(token) => self.session_from_database(&token).await,
+            VerifiedCookie::Cache(claims) => {
+                if self.context.options.has_database {
+                    let Some(token) = claims.data.get("token").and_then(Value::as_str) else {
+                        return Ok(None);
+                    };
+                    self.session_from_database(token).await
+                } else {
+                    let user: User = serde_json::from_value(
+                        claims
+                            .data
+                            .get("user")
+                            .cloned()
+                            .ok_or(AuthError::Unauthorized)?,
+                    )
+                    .map_err(serialize_error)?;
+                    let session: Session = serde_json::from_value(
+                        claims
+                            .data
+                            .get("session")
+                            .cloned()
+                            .ok_or(AuthError::Unauthorized)?,
+                    )
+                    .map_err(serialize_error)?;
+                    if session.user_id != user.id || session.expires_at <= now_seconds() {
+                        return Ok(None);
+                    }
+                    Ok(Some((user, session)))
+                }
+            }
+        }
+    }
+
+    pub async fn refresh_session_cookie(
+        &self,
+        headers: &http::HeaderMap,
+        secure_cookie: bool,
+    ) -> Result<Option<AuthCookie>> {
+        let Some((user, mut session)) = self.session_from_cookie(headers, secure_cookie).await?
         else {
             return Ok(None);
         };
-        let session: Session =
-            serde_json::from_value(session_value.clone()).map_err(serialize_error)?;
-        if session.expires_at <= now_seconds() {
-            let _ = self
-                .context
-                .adapter
-                .delete(SESSION_TABLE, &session.id)
-                .await;
+        let now = now_seconds();
+        if session.expires_at.saturating_sub(now) > self.context.options.session.update_age_seconds
+        {
             return Ok(None);
         }
-        let user_value = self
-            .context
-            .adapter
-            .get(USER_TABLE, &session.user_id)
-            .await?
-            .ok_or(AuthError::Unauthorized)?;
-        let user = serde_json::from_value(user_value).map_err(serialize_error)?;
-        Ok(Some((user, session)))
+        let cookies = request_cookies(headers);
+        let name = session_cookie_name(secure_cookie);
+        let Some(value) = cookies.get(name) else {
+            return Ok(None);
+        };
+        let verified = self
+            .read_cookie(value)
+            .map_err(|_| AuthError::Unauthorized)?;
+        let token = match verified {
+            VerifiedCookie::Opaque(token) => token,
+            VerifiedCookie::Cache(claims) => claims
+                .data
+                .get("token")
+                .and_then(Value::as_str)
+                .ok_or(AuthError::Unauthorized)?
+                .to_owned(),
+        };
+        session.expires_at = now + self.context.options.session.expires_in_seconds;
+        if self.context.options.has_database {
+            self.context
+                .adapter
+                .update(
+                    SESSION_TABLE,
+                    &session.id,
+                    json!({
+                        "id": session.id,
+                        "user_id": session.user_id,
+                        "expires_at": session.expires_at,
+                        "token_hash": hash_session_token(&token),
+                    }),
+                )
+                .await?;
+        }
+        Ok(Some(self.build_cookie(
+            &user,
+            &session,
+            &token,
+            secure_cookie,
+        )?))
     }
 
     pub async fn sign_out(
@@ -212,18 +278,28 @@ impl EmailPasswordService {
             "better-auth.session_token"
         };
         if let Some(value) = cookies.get(name) {
-            if let Ok(token) = self.keys.verify(value) {
-                let token_hash = hash_session_token(&token);
-                if let Some((session_id, _)) = self
-                    .context
-                    .adapter
-                    .get_by_field(SESSION_TABLE, "token_hash", &Value::String(token_hash))
-                    .await?
-                {
-                    self.context
+            if let Ok(verified) = self.read_cookie(value) {
+                let token = match verified {
+                    VerifiedCookie::Opaque(token) => Some(token),
+                    VerifiedCookie::Cache(claims) => claims
+                        .data
+                        .get("token")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                };
+                if let Some(token) = token {
+                    let token_hash = hash_session_token(&token);
+                    if let Some((session_id, _)) = self
+                        .context
                         .adapter
-                        .delete(SESSION_TABLE, &session_id)
-                        .await?;
+                        .get_by_field(SESSION_TABLE, "token_hash", &Value::String(token_hash))
+                        .await?
+                    {
+                        self.context
+                            .adapter
+                            .delete(SESSION_TABLE, &session_id)
+                            .await?;
+                    }
                 }
             }
         }
@@ -251,18 +327,129 @@ impl EmailPasswordService {
             "expires_at": session.expires_at,
             "token_hash": hash_session_token(&token),
         });
-        self.context
-            .adapter
-            .insert(SESSION_TABLE, &session.id, record)
-            .await?;
-        let signed_token = self.keys.sign(&token)?;
-        let cookie =
-            session_cookie_from_options(&self.context.options, signed_token, secure_cookie);
+        if self.context.options.has_database {
+            self.context
+                .adapter
+                .insert(SESSION_TABLE, &session.id, record)
+                .await?;
+        }
+        let cookie = self.build_cookie(&user, &session, &token, secure_cookie)?;
         Ok(AuthResult {
             user,
             session,
             cookie,
         })
+    }
+
+    pub(crate) async fn create_session_for_user(
+        &self,
+        user: User,
+        secure_cookie: bool,
+    ) -> Result<AuthResult> {
+        self.create_authenticated_session(user, secure_cookie).await
+    }
+
+    fn require_database(&self) -> Result<()> {
+        if self.context.options.has_database {
+            Ok(())
+        } else {
+            Err(AuthError::InvalidConfiguration(
+                "email/password authentication requires a primary database".into(),
+            ))
+        }
+    }
+
+    async fn session_from_database(&self, token: &str) -> Result<Option<(User, Session)>> {
+        let token_hash = hash_session_token(token);
+        let Some((_, session_value)) = self
+            .context
+            .adapter
+            .get_by_field(SESSION_TABLE, "token_hash", &Value::String(token_hash))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let session: Session = serde_json::from_value(session_value).map_err(serialize_error)?;
+        if session.expires_at <= now_seconds() {
+            let _ = self
+                .context
+                .adapter
+                .delete(SESSION_TABLE, &session.id)
+                .await;
+            return Ok(None);
+        }
+        let user_value = self
+            .context
+            .adapter
+            .get(USER_TABLE, &session.user_id)
+            .await?
+            .ok_or(AuthError::Unauthorized)?;
+        let user = serde_json::from_value(user_value).map_err(serialize_error)?;
+        Ok(Some((user, session)))
+    }
+
+    fn read_cookie(&self, value: &str) -> Result<VerifiedCookie> {
+        if self.context.options.session.cookie_cache.enabled {
+            Ok(VerifiedCookie::Cache(self.cache.decode(
+                self.context.options.session.cookie_cache.strategy,
+                value,
+                now_seconds(),
+            )?))
+        } else {
+            Ok(VerifiedCookie::Opaque(self.keys.verify(value)?))
+        }
+    }
+
+    fn build_cookie(
+        &self,
+        user: &User,
+        session: &Session,
+        token: &str,
+        secure_cookie: bool,
+    ) -> Result<AuthCookie> {
+        let value = if self.context.options.session.cookie_cache.enabled {
+            let now = now_seconds();
+            let cache_age = self.context.options.session.cookie_cache.max_age_seconds;
+            self.cache.encode(
+                self.context.options.session.cookie_cache.strategy,
+                user.id.clone(),
+                json!({"user": user, "session": session, "token": token}),
+                now,
+                now + if cache_age == 0 {
+                    self.context.options.session.expires_in_seconds
+                } else {
+                    cache_age
+                },
+            )?
+        } else {
+            self.keys.sign(token)?
+        };
+        let max_age = if self.context.options.session.cookie_cache.enabled
+            && self.context.options.session.cookie_cache.max_age_seconds > 0
+        {
+            self.context.options.session.cookie_cache.max_age_seconds
+        } else {
+            self.context.options.session.expires_in_seconds
+        };
+        Ok(AuthCookie::session(
+            value,
+            secure_cookie,
+            &self.context.options.base_path,
+            max_age,
+        ))
+    }
+}
+
+enum VerifiedCookie {
+    Opaque(String),
+    Cache(CookieCacheClaims),
+}
+
+fn session_cookie_name(secure_cookie: bool) -> &'static str {
+    if secure_cookie {
+        "__Secure-better-auth.session_token"
+    } else {
+        "better-auth.session_token"
     }
 }
 

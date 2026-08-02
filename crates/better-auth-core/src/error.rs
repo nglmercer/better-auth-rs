@@ -15,6 +15,9 @@ pub enum AuthError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    #[error("rate limit exceeded; retry after {retry_after_seconds} seconds")]
+    RateLimited { retry_after_seconds: u64 },
+
     #[error("not found")]
     NotFound,
 
