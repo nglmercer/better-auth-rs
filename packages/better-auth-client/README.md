@@ -19,7 +19,21 @@ const session = await auth.getSession();
 await auth.signOut();
 ```
 
+Typed helpers cover every endpoint exposed by the Rust `AuthRouter`:
+
+```ts
+await auth.verifyEmail({ token });
+await auth.requestPasswordReset({ email: "user@example.com" });
+await auth.resetPassword({ token, new_password: "a-new-password" });
+```
+
+Use `auth.request<T>()` for plugin or application-specific endpoints. It
+always sends JSON, applies configured default headers, and accepts per-request
+headers, credentials, an `AbortSignal`, and an optional idempotency key.
+
 The SDK uses `fetch` and `credentials: "include"`, so browsers keep the
 server-issued HttpOnly session cookie. Cross-origin deployments still need
 their normal CORS and cookie configuration. Retries are limited to safe HTTP
-methods unless an `idempotencyKey` is supplied.
+methods unless an `idempotencyKey` is supplied; retry delays honor both
+seconds and HTTP-date `Retry-After` values and stop when the request is
+aborted.

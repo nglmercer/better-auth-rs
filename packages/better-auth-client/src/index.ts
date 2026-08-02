@@ -28,6 +28,31 @@ export interface AuthSessionResponse {
   session: AuthSession;
 }
 
+export interface VerifyEmailInput {
+  token: string;
+}
+
+export interface VerifyEmailResponse {
+  verified: boolean;
+}
+
+export interface RequestPasswordResetInput {
+  email: string;
+}
+
+export interface RequestPasswordResetResponse {
+  sent: boolean;
+}
+
+export interface ResetPasswordInput {
+  token: string;
+  new_password: string;
+}
+
+export interface ResetPasswordResponse {
+  reset: boolean;
+}
+
 export interface RetryOptions {
   maxRetries?: number;
   baseDelayMs?: number;
@@ -39,6 +64,8 @@ export interface AuthClientOptions {
   baseURL: string | URL;
   /** Inject a fetch implementation for tests, workers, or custom runtimes. */
   fetch?: typeof globalThis.fetch;
+  /** Headers applied to every request; per-request headers take precedence. */
+  headers?: HeadersInit;
   /** Browser clients should keep this as `include` for session cookies. */
   credentials?: RequestCredentials;
   retry?: RetryOptions;
@@ -85,6 +112,7 @@ export class AuthClient {
 
   private readonly baseURL: URL;
   private readonly fetchImpl: typeof globalThis.fetch;
+  private readonly defaultHeaders: Headers;
   private readonly credentials: RequestCredentials;
   private readonly retry: Required<RetryOptions>;
 
@@ -93,8 +121,16 @@ export class AuthClient {
     if (baseURL.protocol !== "http:" && baseURL.protocol !== "https:") {
       throw new TypeError("baseURL must use http or https");
     }
+    if (baseURL.search || baseURL.hash) {
+      throw new TypeError("baseURL must not include a query or fragment");
+    }
     this.baseURL = new URL(baseURL.toString().replace(/\/+$/, ""));
-    this.fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
+    const fetchImpl = options.fetch ?? globalThis.fetch;
+    if (typeof fetchImpl !== "function") {
+      throw new TypeError("a fetch implementation is required");
+    }
+    this.fetchImpl = options.fetch ?? fetchImpl.bind(globalThis);
+    this.defaultHeaders = new Headers(options.headers);
     this.credentials = options.credentials ?? "include";
     this.retry = {
       maxRetries: options.retry?.maxRetries ?? 2,
@@ -102,8 +138,11 @@ export class AuthClient {
       maxDelayMs: options.retry?.maxDelayMs ?? 2000,
     };
     if (
+      !Number.isInteger(this.retry.maxRetries) ||
       this.retry.maxRetries < 0 ||
+      !Number.isFinite(this.retry.baseDelayMs) ||
       this.retry.baseDelayMs <= 0 ||
+      !Number.isFinite(this.retry.maxDelayMs) ||
       this.retry.maxDelayMs < this.retry.baseDelayMs
     ) {
       throw new TypeError("invalid retry options");
@@ -116,36 +155,65 @@ export class AuthClient {
     });
   }
 
-  signOut(): Promise<void> {
-    return this.request<void>("/sign-out", { method: "POST", body: {} });
+  async signOut(): Promise<void> {
+    await this.request<unknown>("/sign-out", { method: "POST" });
+  }
+
+  verifyEmail(input: VerifyEmailInput): Promise<VerifyEmailResponse> {
+    return this.request<VerifyEmailResponse>("/verify-email", {
+      method: "POST",
+      body: input,
+    });
+  }
+
+  requestPasswordReset(
+    input: RequestPasswordResetInput,
+  ): Promise<RequestPasswordResetResponse> {
+    return this.request<RequestPasswordResetResponse>("/request-password-reset", {
+      method: "POST",
+      body: input,
+    });
+  }
+
+  resetPassword(input: ResetPasswordInput): Promise<ResetPasswordResponse> {
+    return this.request<ResetPasswordResponse>("/reset-password", {
+      method: "POST",
+      body: input,
+    });
   }
 
   request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+    const {
+      body: bodyValue,
+      headers: requestHeaders,
+      idempotencyKey,
+      ...requestOptions
+    } = options;
     const method = (options.method ?? "GET").toUpperCase();
-    const headers = new Headers(options.headers);
-    headers.set("Accept", "application/json");
-    if (options.idempotencyKey) {
-      headers.set("Idempotency-Key", options.idempotencyKey);
+    const headers = new Headers(this.defaultHeaders);
+    new Headers(requestHeaders).forEach((value, key) => headers.set(key, value));
+    if (!headers.has("Accept")) headers.set("Accept", "application/json");
+    if (idempotencyKey) {
+      headers.set("Idempotency-Key", idempotencyKey);
     }
-    const body = options.body === undefined ? undefined : JSON.stringify(options.body);
-    if (body !== undefined) {
+    const body = bodyValue === undefined ? undefined : JSON.stringify(bodyValue);
+    if (body !== undefined && !headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
     }
     const requestInit: RequestInit = {
-      ...options,
+      ...requestOptions,
       method,
       headers,
       body,
-      credentials: options.credentials ?? this.credentials,
+      credentials: requestOptions.credentials ?? this.credentials,
     };
-    delete (requestInit as RequestInit & { idempotencyKey?: unknown }).idempotencyKey;
 
-    const retrySafe = ["GET", "HEAD", "OPTIONS"].includes(method) || Boolean(options.idempotencyKey);
+    const retrySafe = ["GET", "HEAD", "OPTIONS"].includes(method) || Boolean(idempotencyKey);
     return this.execute<T>(this.url(path), requestInit, retrySafe);
   }
 
   private url(path: string): string {
-    if (!path.startsWith("/")) {
+    if (!path.startsWith("/") || path.startsWith("//")) {
       throw new TypeError("client paths must start with '/'");
     }
     return new URL(path.slice(1), `${this.baseURL.toString()}/`).toString();
@@ -158,10 +226,10 @@ export class AuthClient {
       try {
         response = await this.fetchImpl(url, init);
       } catch (error) {
-        if (!retrySafe || attempt >= this.retry.maxRetries) {
+        if (init.signal?.aborted || !retrySafe || attempt >= this.retry.maxRetries) {
           throw error;
         }
-        await delay(this.backoff(attempt));
+        await delay(this.backoff(attempt), init.signal ?? undefined);
         attempt += 1;
         continue;
       }
@@ -172,8 +240,16 @@ export class AuthClient {
       if (!retrySafe || !RETRYABLE_STATUSES.has(response.status) || attempt >= this.retry.maxRetries) {
         throw await toClientError(response);
       }
+      try {
+        await response.body?.cancel();
+      } catch {
+        // The retry should proceed even if the failed response cannot be cancelled.
+      }
       const retryAfter = parseRetryAfter(response.headers.get("Retry-After"));
-      await delay(Math.min(retryAfter ?? this.backoff(attempt), this.retry.maxDelayMs));
+      await delay(
+        Math.min(retryAfter ?? this.backoff(attempt), this.retry.maxDelayMs),
+        init.signal ?? undefined,
+      );
       attempt += 1;
     }
   }
@@ -218,13 +294,29 @@ async function toClientError(response: Response): Promise<AuthClientError> {
 function parseRetryAfter(value: string | null): number | undefined {
   if (!value) return undefined;
   const seconds = Number(value);
-  return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : undefined;
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? Math.max(0, timestamp - Date.now()) : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    return Promise.reject(signal.reason ?? new Error("The operation was aborted"));
+  }
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    const onAbort = () => {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", onAbort);
+      reject(signal?.reason ?? new Error("The operation was aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
