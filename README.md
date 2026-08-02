@@ -27,9 +27,11 @@ The foundation covers roadmap phases 0–5 at the contract/runtime level:
 - scrypt password hashing;
 - SameSite=Lax session-cookie construction;
 - Origin, Fetch Metadata, trusted-proxy, and trusted-IP-header helpers.
+- email/password sign-up and sign-in, persisted sessions, cookie lookup, and
+  sign-out on top of the adapter contract.
 
-OAuth/PKCE, full email/password endpoints, durable session lifecycle, framework
-adapters, and advanced plugins remain the next implementation layers. The
+OAuth/PKCE, framework adapters, rate-limit enforcement, cookie-cache JWE/JWT
+encoding, and advanced plugins remain the next implementation layers. The
 traits are intentionally small so those features can be added without making
 the core depend on a database or web framework.
 
@@ -40,4 +42,3 @@ cargo fmt --all -- --check
 cargo check --workspace
 cargo test --workspace
 ```
-

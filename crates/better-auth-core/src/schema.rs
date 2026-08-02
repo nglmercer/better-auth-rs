@@ -118,7 +118,8 @@ pub fn core_schema() -> SchemaExtension {
                 .field("id", FieldSchema::required(String).unique())
                 .field("user_id", FieldSchema::required(String))
                 .field("provider_id", FieldSchema::required(String))
-                .field("account_id", FieldSchema::required(String)),
+                .field("account_id", FieldSchema::required(String))
+                .field("password_hash", FieldSchema::optional(String)),
         )
         .table(
             "verification",
