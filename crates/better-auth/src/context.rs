@@ -78,12 +78,18 @@ impl AuthContext {
                 {
                     return Err(AuthError::Forbidden("request host is not allowed".into()));
                 }
-                Some(build_base_url(candidate.as_str(), &self.options.base_path)?)
+                Some(build_base_url(
+                    request_origin_url(&candidate).as_str(),
+                    &self.options.base_path,
+                )?)
             }
-            None => Some(request_url(
-                request,
-                self.options.advanced.trusted_proxy_headers,
-            )?),
+            None => {
+                let candidate = request_url(request, self.options.advanced.trusted_proxy_headers)?;
+                Some(build_base_url(
+                    request_origin_url(&candidate).as_str(),
+                    &self.options.base_path,
+                )?)
+            }
         };
 
         let trusted_origins = self.trusted_origins(base_url.as_ref());
@@ -109,7 +115,7 @@ impl AuthContext {
             origins.push(origin);
         }
         if let Some(url) = request_base {
-            let origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
+            let origin = origin_for_url(url);
             if !origins.iter().any(|existing| existing == &origin) {
                 origins.push(origin);
             }
@@ -170,6 +176,23 @@ fn build_base_url(raw: &str, base_path: &str) -> Result<Url> {
         url.set_path(&path);
     }
     Ok(url)
+}
+
+fn request_origin_url(url: &Url) -> Url {
+    let mut origin = url.clone();
+    origin.set_path("/");
+    origin.set_query(None);
+    origin.set_fragment(None);
+    origin
+}
+
+fn origin_for_url(url: &Url) -> String {
+    let mut origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
+    if let Some(port) = url.port() {
+        origin.push(':');
+        origin.push_str(&port.to_string());
+    }
+    origin
 }
 
 fn request_url(request: &RequestMetadata, trust_proxy_headers: bool) -> Result<Url> {
@@ -250,6 +273,7 @@ fn origin_matches(origin: &str, pattern: &str) -> bool {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn host_matches_public(host: &str, pattern: &str) -> bool {
     host_matches(host, pattern)
 }
@@ -281,5 +305,39 @@ mod tests {
     fn wildcard_hosts_do_not_match_the_bare_suffix() {
         assert!(host_matches_public("tenant.example.com", "*.example.com"));
         assert!(!host_matches_public("example.com", "*.example.com"));
+    }
+
+    #[test]
+    fn dynamic_base_url_uses_request_origin_not_endpoint_path() {
+        let options = AuthOptions {
+            secret: "a".repeat(32),
+            base_url: Some(BaseUrl::dynamic(["*.example.com"])),
+            ..AuthOptions::default()
+        };
+        let context =
+            AuthContext::new(options, Arc::new(MemoryDb::default()), None, Vec::new()).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "tenant.example.com".parse().unwrap());
+        let request = RequestMetadata::new(
+            Method::POST,
+            "/api/auth/sign-in?next=%2Fdashboard".parse().unwrap(),
+            headers,
+        );
+        let resolved = context.resolve_request(&request).unwrap();
+        assert_eq!(
+            resolved.base_url.unwrap().as_str(),
+            "http://tenant.example.com/api/auth"
+        );
+    }
+
+    #[test]
+    fn cookie_cache_max_age_follows_custom_session_expiry() {
+        let mut options = AuthOptions {
+            secret: "a".repeat(32),
+            ..AuthOptions::default()
+        };
+        options.session.expires_in_seconds = 900;
+        options.apply_defaults();
+        assert_eq!(options.session.cookie_cache.max_age_seconds, 900);
     }
 }

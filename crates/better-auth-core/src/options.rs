@@ -45,7 +45,9 @@ impl Default for CookieCacheOptions {
             enabled: false,
             strategy: CookieCacheStrategy::Jwe,
             refresh_cache: true,
-            max_age_seconds: 7 * 24 * 60 * 60,
+            // Zero means follow session.expires_in_seconds when the
+            // cookie-cache default is applied.
+            max_age_seconds: 0,
         }
     }
 }

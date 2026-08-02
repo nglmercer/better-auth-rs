@@ -113,3 +113,57 @@ impl PluginRegistry {
         &self.error_codes
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{FieldSchema, FieldType, TableSchema};
+
+    struct TestPlugin {
+        plugin_name: &'static str,
+        table: &'static str,
+        field_type: FieldType,
+    }
+
+    impl Plugin for TestPlugin {
+        fn name(&self) -> &'static str {
+            self.plugin_name
+        }
+
+        fn schema(&self) -> SchemaExtension {
+            SchemaExtension::default().table(
+                self.table,
+                TableSchema::default()
+                    .field("value", FieldSchema::required(self.field_type.clone())),
+            )
+        }
+    }
+
+    #[test]
+    fn plugin_schema_is_merged() {
+        let registry = PluginRegistry::build(vec![Arc::new(TestPlugin {
+            plugin_name: "one",
+            table: "plugin_state",
+            field_type: FieldType::String,
+        })])
+        .unwrap();
+        assert!(registry.schema().tables.contains_key("plugin_state"));
+    }
+
+    #[test]
+    fn conflicting_plugin_schema_is_rejected() {
+        let result = PluginRegistry::build(vec![
+            Arc::new(TestPlugin {
+                plugin_name: "one",
+                table: "plugin_state",
+                field_type: FieldType::String,
+            }),
+            Arc::new(TestPlugin {
+                plugin_name: "two",
+                table: "plugin_state",
+                field_type: FieldType::Integer,
+            }),
+        ]);
+        assert!(result.is_err());
+    }
+}

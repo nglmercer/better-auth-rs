@@ -47,3 +47,71 @@ pub fn extract_client_ip(context: &RequestContext, request: &RequestMetadata) ->
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::AuthContext;
+    use better_auth_core::{
+        adapter::memory::MemoryDb,
+        options::{AuthOptions, BaseUrl},
+    };
+    use http::{HeaderMap, Uri};
+    use std::sync::Arc;
+
+    fn context() -> RequestContext {
+        let auth = AuthContext::new(
+            AuthOptions {
+                secret: "s".repeat(32),
+                base_url: Some(BaseUrl::Static("https://example.com".into())),
+                advanced: better_auth_core::options::AdvancedOptions {
+                    trusted_proxy_headers: true,
+                    trusted_ip_headers: vec!["x-forwarded-for".into()],
+                },
+                ..AuthOptions::default()
+            },
+            Arc::new(MemoryDb::default()),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let request = RequestMetadata::new(Method::GET, Uri::from_static("/"), HeaderMap::new());
+        auth.resolve_request(&request).unwrap()
+    }
+
+    #[test]
+    fn cross_site_state_change_is_rejected() {
+        let context = context();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, "https://evil.example".parse().unwrap());
+        let request = RequestMetadata::new(Method::POST, Uri::from_static("/sign-in"), headers);
+        assert!(check_csrf(&context, &request).is_err());
+    }
+
+    #[test]
+    fn same_origin_state_change_and_trusted_proxy_ip_are_allowed() {
+        let context = context();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, "https://example.com".parse().unwrap());
+        headers.insert("x-forwarded-for", "203.0.113.10, 10.0.0.1".parse().unwrap());
+        let request = RequestMetadata::new(Method::POST, Uri::from_static("/sign-in"), headers);
+        check_csrf(&context, &request).unwrap();
+        assert_eq!(
+            extract_client_ip(&context, &request).unwrap().to_string(),
+            "203.0.113.10"
+        );
+    }
+
+    #[test]
+    fn untrusted_proxy_headers_are_ignored() {
+        let mut context = context();
+        context.auth.options = Arc::new(AuthOptions {
+            advanced: better_auth_core::options::AdvancedOptions::default(),
+            ..(*context.auth.options).clone()
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.10".parse().unwrap());
+        let request = RequestMetadata::new(Method::GET, Uri::from_static("/"), headers);
+        assert!(extract_client_ip(&context, &request).is_none());
+    }
+}
