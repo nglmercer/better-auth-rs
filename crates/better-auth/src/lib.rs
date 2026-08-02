@@ -61,4 +61,4 @@ pub use sso::{
     SamlResponse, SamlSignatureVerifier, SamlValidationConfig, SsoProtocol, ValidatedSamlProvider,
 };
 pub use verification::{EmailVerificationService, PasswordResetService, VerificationService};
-pub use webauthn::{WebAuthnAuthenticationResult, WebAuthnService};
+pub use webauthn::{DbPasskeyStore, WebAuthnAuthenticationResult, WebAuthnService};

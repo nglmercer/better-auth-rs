@@ -1,9 +1,9 @@
 use better_auth_core::error::{AuthError, Result};
 use saml_rs::{
-    AcsEndpoint, BrowserInput, CertificatePem, EntityId, FormField, IdpDescriptor,
-    MetadataTrustPolicy, PendingAuthnRequest, RelayStateParam, ReplayCache, ReplayKey,
-    ReplayPolicy, Saml, SamlError, SamlValidationContext, Sp, SpConfig, SpValidationPolicy,
-    SsoResponse, StartSso,
+    AcsEndpoint, AuthnRequestSigningPolicy, BrowserInput, CertificatePem, EntityId, FormField,
+    IdpDescriptor, MetadataTrustPolicy, PendingAuthnRequest, RelayStateParam, ReplayCache,
+    ReplayKey, ReplayPolicy, Saml, SamlError, SamlValidationContext, Sp, SpConfig,
+    SpValidationPolicy, SsoResponse, StartSso,
 };
 use std::{
     collections::HashMap,
@@ -61,9 +61,11 @@ impl SamlRsServiceProvider {
     pub fn new(entity_id: &str, assertion_consumer_service_url: &str) -> Result<Self> {
         let entity_id = EntityId::try_new(entity_id).map_err(saml_error)?;
         let acs = AcsEndpoint::post(assertion_consumer_service_url).map_err(saml_error)?;
+        let mut validation = SpValidationPolicy::strict();
+        validation.authn_requests = AuthnRequestSigningPolicy::DoNotSignForCompatibility;
         let config = SpConfig::builder(entity_id)
             .acs_endpoint(acs)
-            .validation(SpValidationPolicy::strict())
+            .validation(validation)
             .build()
             .map_err(saml_error)?;
         Ok(Self {
@@ -182,4 +184,43 @@ impl SamlRsServiceProvider {
 
 fn saml_error(error: impl std::fmt::Display) -> AuthError {
     AuthError::InvalidRequest(format!("SAML validation failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IDP_METADATA: &str = r#"
+        <md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata"
+            entityID="https://idp.example/metadata">
+          <md:IDPSSODescriptor
+              protocolSupportEnumeration="urn:oasis:names:tc:SAML:2.0:protocol">
+            <md:SingleSignOnService
+                Binding="urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"
+                Location="https://idp.example/sso"/>
+          </md:IDPSSODescriptor>
+        </md:EntityDescriptor>
+    "#;
+
+    #[test]
+    fn concrete_saml_provider_parses_metadata_and_exposes_sp_metadata() {
+        let provider =
+            SamlRsServiceProvider::new("https://sp.example/metadata", "https://sp.example/acs")
+                .unwrap();
+        assert!(provider.metadata_xml().contains("EntityDescriptor"));
+        let idp = provider
+            .parse_idp_metadata("https://idp.example/metadata", IDP_METADATA, &[])
+            .unwrap();
+        assert_eq!(idp.entity_id().as_str(), "https://idp.example/metadata");
+    }
+
+    #[test]
+    fn concrete_saml_provider_rejects_metadata_entity_mismatch() {
+        let provider =
+            SamlRsServiceProvider::new("https://sp.example/metadata", "https://sp.example/acs")
+                .unwrap();
+        assert!(provider
+            .parse_idp_metadata("https://wrong.example/metadata", IDP_METADATA, &[])
+            .is_err());
+    }
 }

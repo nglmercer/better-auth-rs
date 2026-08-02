@@ -34,6 +34,42 @@ impl OidcIdTokenValidator {
         Ok(self)
     }
 
+    pub fn replace_from_jwks(&mut self, jwks: &Value) -> Result<usize> {
+        let keys = jwks
+            .get("keys")
+            .and_then(Value::as_array)
+            .ok_or_else(|| AuthError::InvalidRequest("OIDC JWKS has no keys array".into()))?;
+        let mut replacement = HashMap::new();
+        for jwk in keys {
+            if jwk.get("kty").and_then(Value::as_str) != Some("RSA") {
+                continue;
+            }
+            let key_id = jwk
+                .get("kid")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AuthError::InvalidRequest("OIDC JWK has no kid".into()))?;
+            let modulus = jwk
+                .get("n")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AuthError::InvalidRequest("OIDC RSA JWK has no n".into()))?;
+            let exponent = jwk
+                .get("e")
+                .and_then(Value::as_str)
+                .ok_or_else(|| AuthError::InvalidRequest("OIDC RSA JWK has no e".into()))?;
+            let key = DecodingKey::from_rsa_components(modulus, exponent)
+                .map_err(|error| AuthError::Crypto(format!("invalid OIDC RSA JWK: {error}")))?;
+            replacement.insert(key_id.to_owned(), (key, Algorithm::RS256));
+        }
+        if replacement.is_empty() {
+            return Err(AuthError::InvalidRequest(
+                "OIDC JWKS has no supported RSA signing keys".into(),
+            ));
+        }
+        let count = replacement.len();
+        self.keys = replacement;
+        Ok(count)
+    }
+
     #[cfg(test)]
     fn add_test_hs_key(mut self, key_id: impl Into<String>, secret: &[u8]) -> Self {
         self.keys.insert(
@@ -117,6 +153,21 @@ mod tests {
             "subject-1"
         );
         assert!(validator.validate(&token, Some("wrong")).is_err());
+    }
+
+    #[test]
+    fn jwks_rotation_rejects_unsupported_or_incomplete_keys() {
+        let mut validator = OidcIdTokenValidator::new("https://issuer.example", "client-1");
+        let result = validator.replace_from_jwks(&json!({
+            "keys": [{
+                "kty": "EC",
+                "kid": "unsupported"
+            }]
+        }));
+        assert!(result.is_err());
+        assert!(validator
+            .replace_from_jwks(&json!({"keys": [{"kty":"RSA","kid":"missing"}]}))
+            .is_err());
     }
 
     fn now_seconds() -> u64 {

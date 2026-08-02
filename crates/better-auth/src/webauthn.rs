@@ -1,7 +1,14 @@
-use better_auth_core::error::{AuthError, Result};
+use better_auth_core::{
+    adapter::{DbAdapter, SecondaryStorage, StorageValue},
+    error::{AuthError, Result},
+};
 use serde::Serialize;
 use serde_json::Value;
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use url::Url;
 use uuid::Uuid;
 use webauthn_rs::prelude::*;
@@ -13,6 +20,7 @@ pub struct WebAuthnService {
     webauthn: Webauthn,
     registrations: Mutex<HashMap<String, PasskeyRegistration>>,
     authentications: Mutex<HashMap<String, PasskeyAuthentication>>,
+    state_storage: Option<Arc<dyn SecondaryStorage>>,
 }
 
 impl WebAuthnService {
@@ -25,7 +33,13 @@ impl WebAuthnService {
             webauthn,
             registrations: Mutex::new(HashMap::new()),
             authentications: Mutex::new(HashMap::new()),
+            state_storage: None,
         })
+    }
+
+    pub fn with_state_storage(mut self, storage: Arc<dyn SecondaryStorage>) -> Self {
+        self.state_storage = Some(storage);
+        self
     }
 
     pub fn start_registration(
@@ -68,6 +82,56 @@ impl WebAuthnService {
             .map_err(webauthn_error)
     }
 
+    pub async fn start_registration_persisted(
+        &self,
+        user_id: Uuid,
+        user_name: &str,
+        display_name: &str,
+        exclude_credentials: Vec<Passkey>,
+    ) -> Result<(String, Value)> {
+        let storage = self.state_storage()?;
+        let excluded = exclude_credentials
+            .iter()
+            .map(|credential| credential.cred_id().clone())
+            .collect();
+        let (challenge, state) = self
+            .webauthn
+            .start_passkey_registration(user_id, user_name, display_name, Some(excluded))
+            .map_err(webauthn_error)?;
+        let transaction_id = Uuid::new_v4().simple().to_string();
+        storage
+            .set(
+                &registration_key(&transaction_id),
+                StorageValue::with_ttl(
+                    serde_json::to_value(state).map_err(json_error)?,
+                    Duration::from_secs(5 * 60),
+                ),
+            )
+            .await?;
+        Ok((
+            transaction_id,
+            serde_json::to_value(challenge).map_err(json_error)?,
+        ))
+    }
+
+    pub async fn finish_registration_persisted(
+        &self,
+        transaction_id: &str,
+        response: Value,
+    ) -> Result<Passkey> {
+        let storage = self.state_storage()?;
+        let state = storage
+            .get_and_delete(&registration_key(transaction_id))
+            .await?
+            .ok_or(AuthError::Unauthorized)?;
+        let state: PasskeyRegistration = serde_json::from_value(state.value).map_err(json_error)?;
+        let response: RegisterPublicKeyCredential =
+            serde_json::from_value(response).map_err(json_error)?;
+        self.webauthn
+            .finish_passkey_registration(&response, &state)
+            .map_err(webauthn_error)
+    }
+
     pub fn start_authentication(&self, credentials: &[Passkey]) -> Result<(String, Value)> {
         if credentials.is_empty() {
             return Err(AuthError::InvalidRequest(
@@ -89,6 +153,36 @@ impl WebAuthnService {
         ))
     }
 
+    pub async fn start_authentication_persisted(
+        &self,
+        credentials: &[Passkey],
+    ) -> Result<(String, Value)> {
+        if credentials.is_empty() {
+            return Err(AuthError::InvalidRequest(
+                "no passkey credentials are registered".into(),
+            ));
+        }
+        let storage = self.state_storage()?;
+        let (challenge, state) = self
+            .webauthn
+            .start_passkey_authentication(credentials)
+            .map_err(webauthn_error)?;
+        let transaction_id = Uuid::new_v4().simple().to_string();
+        storage
+            .set(
+                &authentication_key(&transaction_id),
+                StorageValue::with_ttl(
+                    serde_json::to_value(state).map_err(json_error)?,
+                    Duration::from_secs(5 * 60),
+                ),
+            )
+            .await?;
+        Ok((
+            transaction_id,
+            serde_json::to_value(challenge).map_err(json_error)?,
+        ))
+    }
+
     pub fn finish_authentication(
         &self,
         transaction_id: &str,
@@ -101,6 +195,31 @@ impl WebAuthnService {
             .map_err(|_| lock_error())?
             .remove(transaction_id)
             .ok_or(AuthError::Unauthorized)?;
+        self.finish_authentication_with_state(state, response, credential)
+    }
+
+    pub async fn finish_authentication_persisted(
+        &self,
+        transaction_id: &str,
+        response: Value,
+        credential: &mut Passkey,
+    ) -> Result<WebAuthnAuthenticationResult> {
+        let storage = self.state_storage()?;
+        let state = storage
+            .get_and_delete(&authentication_key(transaction_id))
+            .await?
+            .ok_or(AuthError::Unauthorized)?;
+        let state: PasskeyAuthentication =
+            serde_json::from_value(state.value).map_err(json_error)?;
+        self.finish_authentication_with_state(state, response, credential)
+    }
+
+    fn finish_authentication_with_state(
+        &self,
+        state: PasskeyAuthentication,
+        response: Value,
+        credential: &mut Passkey,
+    ) -> Result<WebAuthnAuthenticationResult> {
         let response: PublicKeyCredential = serde_json::from_value(response).map_err(json_error)?;
         let result = self
             .webauthn
@@ -114,6 +233,62 @@ impl WebAuthnService {
             counter: result.counter(),
             credential_updated: updated,
         })
+    }
+
+    fn state_storage(&self) -> Result<&Arc<dyn SecondaryStorage>> {
+        self.state_storage.as_ref().ok_or_else(|| {
+            AuthError::InvalidConfiguration(
+                "configure WebAuthn state storage for persisted ceremonies".into(),
+            )
+        })
+    }
+}
+
+pub struct DbPasskeyStore {
+    adapter: Arc<dyn DbAdapter>,
+}
+
+impl DbPasskeyStore {
+    pub fn new(adapter: Arc<dyn DbAdapter>) -> Self {
+        Self { adapter }
+    }
+
+    pub async fn load_for_user(&self, user_id: &str) -> Result<Vec<Passkey>> {
+        self.adapter
+            .list("passkey")
+            .await?
+            .into_iter()
+            .filter(|(_, value)| value.get("user_id").and_then(Value::as_str) == Some(user_id))
+            .map(|(_, value)| {
+                serde_json::from_value(
+                    value
+                        .get("credential")
+                        .cloned()
+                        .ok_or_else(|| AuthError::Adapter("passkey has no credential".into()))?,
+                )
+                .map_err(json_error)
+            })
+            .collect()
+    }
+
+    pub async fn save(&self, user_id: &str, credential: &Passkey) -> Result<()> {
+        let credential_id = format!("{:?}", credential.cred_id());
+        let record = serde_json::json!({
+            "user_id": user_id,
+            "credential_id": credential_id.clone(),
+            "credential": credential,
+        });
+        if let Some((id, _)) = self
+            .adapter
+            .get_by_field("passkey", "credential_id", &Value::String(credential_id))
+            .await?
+        {
+            self.adapter.update("passkey", &id, record).await
+        } else {
+            self.adapter
+                .insert("passkey", &Uuid::new_v4().to_string(), record)
+                .await
+        }
     }
 }
 
@@ -136,9 +311,18 @@ fn lock_error() -> AuthError {
     AuthError::Adapter("WebAuthn state lock poisoned".into())
 }
 
+fn registration_key(transaction_id: &str) -> String {
+    format!("webauthn:registration:{transaction_id}")
+}
+
+fn authentication_key(transaction_id: &str) -> String {
+    format!("webauthn:authentication:{transaction_id}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use better_auth_core::adapter::memory::MemorySecondaryStorage;
 
     #[test]
     fn webauthn_service_builds_origin_bound_registration_challenges() {
@@ -152,5 +336,36 @@ mod tests {
             .start_registration(Uuid::new_v4(), "user@example.com", "User", Vec::new())
             .unwrap();
         assert!(challenge.get("publicKey").is_some());
+    }
+
+    #[tokio::test]
+    async fn persisted_registration_state_is_serialized_and_single_use() {
+        let storage = Arc::new(MemorySecondaryStorage::default());
+        let service = WebAuthnService::new(
+            "example.com",
+            Url::parse("https://example.com").unwrap(),
+            "Example",
+        )
+        .unwrap()
+        .with_state_storage(storage.clone());
+        let (transaction_id, challenge) = service
+            .start_registration_persisted(Uuid::new_v4(), "user@example.com", "User", Vec::new())
+            .await
+            .unwrap();
+        assert!(challenge.get("publicKey").is_some());
+        assert!(storage
+            .get(&registration_key(&transaction_id))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(service
+            .finish_registration_persisted(&transaction_id, Value::Null)
+            .await
+            .is_err());
+        assert!(storage
+            .get(&registration_key(&transaction_id))
+            .await
+            .unwrap()
+            .is_none());
     }
 }

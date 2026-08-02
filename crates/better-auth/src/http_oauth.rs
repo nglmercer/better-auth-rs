@@ -48,6 +48,33 @@ impl HttpOAuthProvider {
         self
     }
 
+    pub async fn refresh_oidc_jwks(&mut self, jwks_url: Url) -> Result<usize> {
+        if jwks_url.scheme() != "https" {
+            return Err(AuthError::InvalidConfiguration(
+                "OIDC JWKS endpoint must use HTTPS".into(),
+            ));
+        }
+        let body: Value = self
+            .client
+            .get(jwks_url)
+            .send()
+            .await
+            .map_err(network_error)?
+            .error_for_status()
+            .map_err(network_error)?
+            .json()
+            .await
+            .map_err(network_error)?;
+        self.id_token_validator
+            .as_mut()
+            .ok_or_else(|| {
+                AuthError::InvalidConfiguration(
+                    "configure an OIDC validator before refreshing JWKS".into(),
+                )
+            })?
+            .replace_from_jwks(&body)
+    }
+
     pub fn google(client_id: impl Into<String>, client_secret: impl Into<String>) -> Result<Self> {
         Self::new(
             "google",

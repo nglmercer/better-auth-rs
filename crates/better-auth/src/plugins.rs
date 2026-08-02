@@ -373,6 +373,7 @@ impl Plugin for PasskeyPlugin {
                 .field("credential_id", required(FieldType::String).unique())
                 .field("public_key", required(FieldType::Bytes))
                 .field("counter", required(FieldType::Integer))
+                .field("credential", required(FieldType::Json))
                 .field("transports", optional(FieldType::Json)),
         )
     }
