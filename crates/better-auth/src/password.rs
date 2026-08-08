@@ -1,15 +1,30 @@
-use better_auth_core::error::{AuthError, Result};
+use better_auth_core::{
+    error::{AuthError, Result},
+    options::PasswordHashOptions,
+};
 use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use scrypt::Scrypt;
+use scrypt::{Params, Scrypt};
 
-/// Hashes passwords using scrypt, matching Better Auth's secure default.
+const SCRYPT_OUTPUT_LENGTH: usize = 32;
+
+/// Hashes passwords using the configured scrypt parameters.
 pub fn hash_password(password: &str) -> Result<String> {
+    hash_password_with_options(password, &PasswordHashOptions::default())
+}
+
+pub fn hash_password_with_options(password: &str, options: &PasswordHashOptions) -> Result<String> {
     if password.is_empty() {
         return Err(AuthError::InvalidRequest("password cannot be empty".into()));
     }
     let salt = SaltString::generate(&mut password_hash::rand_core::OsRng);
     Scrypt
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_customized(
+            password.as_bytes(),
+            None,
+            None,
+            scrypt_params(options)?,
+            &salt,
+        )
         .map(|hash| hash.to_string())
         .map_err(|error| AuthError::Crypto(format!("password hashing failed: {error}")))
 }
@@ -18,6 +33,36 @@ pub fn verify_password(password: &str, encoded_hash: &str) -> Result<bool> {
     let parsed = PasswordHash::new(encoded_hash)
         .map_err(|error| AuthError::Crypto(format!("invalid password hash: {error}")))?;
     Ok(Scrypt.verify_password(password.as_bytes(), &parsed).is_ok())
+}
+
+/// Run the CPU- and memory-heavy hash on Tokio's blocking thread pool instead
+/// of occupying an async runtime worker while a request is being processed.
+pub async fn hash_password_async(password: &str, options: &PasswordHashOptions) -> Result<String> {
+    let password = password.to_owned();
+    let options = options.clone();
+    tokio::task::spawn_blocking(move || hash_password_with_options(&password, &options))
+        .await
+        .map_err(|error| AuthError::Crypto(format!("password hashing worker failed: {error}")))?
+}
+
+pub async fn verify_password_async(password: &str, encoded_hash: &str) -> Result<bool> {
+    let password = password.to_owned();
+    let encoded_hash = encoded_hash.to_owned();
+    tokio::task::spawn_blocking(move || verify_password(&password, &encoded_hash))
+        .await
+        .map_err(|error| {
+            AuthError::Crypto(format!("password verification worker failed: {error}"))
+        })?
+}
+
+fn scrypt_params(options: &PasswordHashOptions) -> Result<Params> {
+    Params::new(
+        options.scrypt_log_n,
+        options.scrypt_r,
+        options.scrypt_p,
+        SCRYPT_OUTPUT_LENGTH,
+    )
+    .map_err(|error| AuthError::InvalidConfiguration(format!("invalid scrypt parameters: {error}")))
 }
 
 #[cfg(test)]
@@ -29,5 +74,16 @@ mod tests {
         let hash = hash_password("correct horse battery staple").unwrap();
         assert!(verify_password("correct horse battery staple", &hash).unwrap());
         assert!(!verify_password("wrong", &hash).unwrap());
+    }
+
+    #[test]
+    fn configured_scrypt_cost_is_stored_in_the_hash() {
+        let options = PasswordHashOptions {
+            scrypt_log_n: 13,
+            ..PasswordHashOptions::default()
+        };
+        let hash = hash_password_with_options("password", &options).unwrap();
+        assert!(hash.contains("ln=13"));
+        assert!(verify_password("password", &hash).unwrap());
     }
 }

@@ -42,7 +42,10 @@ pub use oauth::{
     OAuthStateStorage, OAuthTokens, OAuthUserProfile, PkcePair, ProviderTokenVault,
 };
 pub use oidc::{OidcClaims, OidcIdTokenValidator};
-pub use password::{hash_password, verify_password};
+pub use password::{
+    hash_password, hash_password_async, hash_password_with_options, verify_password,
+    verify_password_async,
+};
 pub use plugins::{
     generate_scim_token, generate_totp_secret, totp_code, verify_scim_token, verify_totp,
     AdminGuard, AdminPlugin, AdminService, BackupCodeSet, Organization, OrganizationMember,

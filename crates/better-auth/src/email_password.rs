@@ -1,7 +1,7 @@
 use crate::{
     context::AuthContext,
     cookies::{request_cookies, AuthCookie, CookieCacheClaims, CookieCacheCodec, SecretKeySet},
-    hash_password, verify_password,
+    hash_password_async, verify_password_async,
 };
 use better_auth_core::{
     adapter::DbOperation,
@@ -104,7 +104,8 @@ impl EmailPasswordService {
             email_verified: false,
             image: None,
         };
-        let password_hash = hash_password(&input.password)?;
+        let password_hash =
+            hash_password_async(&input.password, &self.context.options.password_hash).await?;
         let account_id = format!("{}:{EMAIL_PROVIDER}", user.id);
         let account = json!({
             "id": account_id,
@@ -153,7 +154,7 @@ impl EmailPasswordService {
             .get("password_hash")
             .and_then(Value::as_str)
             .ok_or(AuthError::Unauthorized)?;
-        if !verify_password(&input.password, password_hash)? {
+        if !verify_password_async(&input.password, password_hash).await? {
             return Err(AuthError::Unauthorized);
         }
 

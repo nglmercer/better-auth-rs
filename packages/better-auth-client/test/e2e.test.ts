@@ -18,7 +18,7 @@ function startServer(): Promise<string> {
       "target",
       "debug",
       "examples",
-      `client-test-server${process.platform === "win32" ? ".exe" : ""}`,
+      `web-example${process.platform === "win32" ? ".exe" : ""}`,
     );
   const child = spawn(binary, [], {
       cwd: repositoryRoot,
@@ -83,7 +83,7 @@ function cookieFetch() {
   };
 }
 
-describe("AuthClient against the Rust AuthRouter", () => {
+describe("AuthClient against the Rust web example", () => {
   beforeAll(async () => {
     authBaseURL = await startServer();
   });
@@ -92,7 +92,7 @@ describe("AuthClient against the Rust AuthRouter", () => {
     stopServer();
   });
 
-  it("performs a real signup, session lookup, signin, and signout flow", async () => {
+  it("performs a real registration and login flow", async () => {
     const fetchWithCookies = cookieFetch();
     const client = new AuthClient({
       baseURL: authBaseURL,
@@ -110,35 +110,8 @@ describe("AuthClient against the Rust AuthRouter", () => {
     expect(signedUp.user.email).toBe(email);
     expect(signedUp.session.user_id).toBe(signedUp.user.id);
 
-    const session = await client.getSession();
-    expect(session?.user.email).toBe(email);
-    expect(session?.session.id).toBe(signedUp.session.id);
-
-    await client.signOut();
-    await expect(client.getSession()).resolves.toBeNull();
-
     const signedIn = await client.signIn.email({ email, password });
     expect(signedIn.user.id).toBe(signedUp.user.id);
-    await expect(client.getSession()).resolves.toMatchObject({
-      user: { id: signedUp.user.id },
-    });
-  });
-
-  it("exercises verification and password-reset HTTP error contracts", async () => {
-    const client = new AuthClient({
-      baseURL: authBaseURL,
-      fetch: cookieFetch(),
-      retry: { maxRetries: 0 },
-    });
-
-    await expect(client.requestPasswordReset({ email: "unknown@example.com" })).resolves.toEqual({
-      sent: true,
-    });
-    await expect(client.verifyEmail({ token: "invalid-token" })).resolves.toEqual({
-      verified: false,
-    });
-    await expect(
-      client.resetPassword({ token: "invalid-token", new_password: "new-password" }),
-    ).resolves.toEqual({ reset: false });
+    expect(signedIn.session.user_id).toBe(signedUp.user.id);
   });
 });

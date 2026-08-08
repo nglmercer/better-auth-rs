@@ -7,7 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-default = []
+default = ["axum"]
 axum = ["dep:axum"]
 sqlx = ["dep:sqlx"]
 saml = ["dep:saml-rs"]
@@ -44,4 +44,8 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 
 [[example]]
 name = "client-test-server"
+required-features = ["axum"]
+
+[[example]]
+name = "web-example"
 required-features = ["axum"]

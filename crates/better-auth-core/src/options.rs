@@ -78,6 +78,29 @@ pub struct AdvancedOptions {
     pub trusted_ip_headers: Vec<String>,
 }
 
+/// Password-hashing cost controls. New hashes use these values; verification
+/// always reads the parameters stored in the existing PHC hash, so changing
+/// the cost does not invalidate existing passwords.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PasswordHashOptions {
+    /// Scrypt's log2(N) work factor. The default uses 32 MiB per operation.
+    pub scrypt_log_n: u8,
+    pub scrypt_r: u32,
+    pub scrypt_p: u32,
+}
+
+impl Default for PasswordHashOptions {
+    fn default() -> Self {
+        Self {
+            // The scrypt crate's default is log_n=17 (128 MiB), which is too
+            // slow for the default local server on modest development hosts.
+            scrypt_log_n: 15,
+            scrypt_r: 8,
+            scrypt_p: 1,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AuthOptions {
     pub base_url: Option<BaseUrl>,
@@ -89,6 +112,8 @@ pub struct AuthOptions {
     pub trusted_origins: Vec<String>,
     pub trusted_providers: Vec<String>,
     pub advanced: AdvancedOptions,
+    #[serde(default)]
+    pub password_hash: PasswordHashOptions,
     /// Whether a primary relational adapter is configured. Secondary storage
     /// is intentionally separate because it does not hold account records.
     pub has_database: bool,
@@ -114,6 +139,7 @@ impl Default for AuthOptions {
             trusted_origins: Vec::new(),
             trusted_providers: Vec::new(),
             advanced: AdvancedOptions::default(),
+            password_hash: PasswordHashOptions::default(),
             has_database: false,
             has_secondary_storage: false,
             store_account_cookie: false,

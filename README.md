@@ -80,27 +80,26 @@ cargo test --workspace --all-features
 
 ### Run the web example
 
-The repository includes a small Axum server that wires the Rust auth router
-to an HTTP endpoint. Start it with:
+The repository includes a small Axum web example with a browser page and only
+the registration and login endpoints. Start it with:
 
 ```sh
-cargo run -p better-auth --features axum --example client-test-server
+cargo run -p better-auth --example web-example
 ```
 
-The server binds to an available localhost port and prints a line like:
+The server binds to an available localhost port and prints lines like:
 
 ```text
 READY http://127.0.0.1:43127/api/auth
+WEB http://127.0.0.1:43127/
 ```
 
-Leave that terminal running. In a second terminal, replace `43127` with the
-port printed by the server and verify the complete cookie-backed flow:
+Open the `WEB` URL in a browser to use the register and login forms. To verify
+the same client-facing endpoints with curl, replace `43127` with the port
+printed by the server:
 
 ```sh
 export AUTH_URL=http://127.0.0.1:43127/api/auth
-
-# No session yet.
-curl -s "$AUTH_URL/get-session"
 
 # Create a user and save the session cookie.
 curl -i -c /tmp/better-auth-cookies.txt \
@@ -108,18 +107,17 @@ curl -i -c /tmp/better-auth-cookies.txt \
   -d '{"email":"demo@example.com","name":"Demo User","password":"correct horse battery staple"}' \
   "$AUTH_URL/sign-up/email"
 
-# The saved cookie should return the new session.
-curl -s -b /tmp/better-auth-cookies.txt "$AUTH_URL/get-session"
-
-# Sign out and clear the session.
+# Log in with the same credentials and refresh the session cookie.
 curl -i -b /tmp/better-auth-cookies.txt \
   -c /tmp/better-auth-cookies.txt \
-  -X POST "$AUTH_URL/sign-out"
+  -H 'Content-Type: application/json' \
+  -d '{"email":"demo@example.com","password":"correct horse battery staple"}' \
+  "$AUTH_URL/sign-in/email"
 ```
 
-The runnable example is intentionally an in-memory test server; it is for
-local verification, not production deployment. Its source is
-`crates/better-auth/examples/client-test-server.rs`.
+The runnable example is intentionally an in-memory server; it is for local
+verification, not production deployment. Its source is
+`crates/better-auth/examples/web-example.rs`.
 
 ### Verify the TypeScript web client against the Rust server
 

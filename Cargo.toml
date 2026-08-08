@@ -20,7 +20,7 @@ reqwest = { version = "0.12", default-features = false, features = ["cookies", "
 rusqlite = { version = "0.32", features = ["bundled"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "any", "postgres", "mysql"] }
 saml-rs = "0.3"
-tokio = { version = "1", features = ["time"] }
+tokio = { version = "1", features = ["rt", "time"] }
 hmac = "0.12"
 http = "1"
 jsonwebtoken = "9"

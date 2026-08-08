@@ -1,4 +1,4 @@
-use crate::{context::AuthContext, hash_password};
+use crate::{context::AuthContext, hash_password_async};
 use better_auth_core::{
     adapter::SecondaryStorage,
     error::{AuthError, Result},
@@ -155,7 +155,10 @@ impl PasswordResetService {
         let Some(mut account) = self.context.adapter.get("account", &account_id).await? else {
             return Err(AuthError::NotFound);
         };
-        account["password_hash"] = hash_password(new_password)?.into();
+        account["password_hash"] =
+            hash_password_async(new_password, &self.context.options.password_hash)
+                .await?
+                .into();
         self.context
             .adapter
             .update("account", &account_id, account)
