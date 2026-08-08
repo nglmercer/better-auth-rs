@@ -62,10 +62,80 @@ For TypeScript consumers, use the fetch-native client package first. WASM is
 best reserved for optional Rust-owned pure computation or cryptography in the
 browser; NAPI should be introduced later only for Node.js backend bindings.
 
-## Verify
+## Run and verify
+
+This repository is a Cargo workspace of library crates. It does not define a
+root binary, so `cargo run` from the repository root fails with `a bin target
+must be available for cargo run`. Use the commands below instead.
+
+### Verify the Rust application code
+
+From the repository root, run the formatter, compiler checks, and test suite:
 
 ```sh
 cargo fmt --all -- --check
 cargo check --workspace --all-features
 cargo test --workspace --all-features
+```
+
+### Run the web example
+
+The repository includes a small Axum server that wires the Rust auth router
+to an HTTP endpoint. Start it with:
+
+```sh
+cargo run -p better-auth --features axum --example client-test-server
+```
+
+The server binds to an available localhost port and prints a line like:
+
+```text
+READY http://127.0.0.1:43127/api/auth
+```
+
+Leave that terminal running. In a second terminal, replace `43127` with the
+port printed by the server and verify the complete cookie-backed flow:
+
+```sh
+export AUTH_URL=http://127.0.0.1:43127/api/auth
+
+# No session yet.
+curl -s "$AUTH_URL/get-session"
+
+# Create a user and save the session cookie.
+curl -i -c /tmp/better-auth-cookies.txt \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"demo@example.com","name":"Demo User","password":"correct horse battery staple"}' \
+  "$AUTH_URL/sign-up/email"
+
+# The saved cookie should return the new session.
+curl -s -b /tmp/better-auth-cookies.txt "$AUTH_URL/get-session"
+
+# Sign out and clear the session.
+curl -i -b /tmp/better-auth-cookies.txt \
+  -c /tmp/better-auth-cookies.txt \
+  -X POST "$AUTH_URL/sign-out"
+```
+
+The runnable example is intentionally an in-memory test server; it is for
+local verification, not production deployment. Its source is
+`crates/better-auth/examples/client-test-server.rs`.
+
+### Verify the TypeScript web client against the Rust server
+
+The client E2E suite builds the same Axum example, starts it on an ephemeral
+port, and verifies sign-up, session lookup, sign-out, and sign-in over real
+HTTP:
+
+```sh
+cd packages/better-auth-client
+npm install
+npm run test:e2e
+```
+
+Run the unit and type tests as well with:
+
+```sh
+npm run test:types
+npm test
 ```
