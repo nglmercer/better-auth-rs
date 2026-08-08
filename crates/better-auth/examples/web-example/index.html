@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0b1020">
+    <title>Better Auth · Rust web example</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div class="brand-mark" aria-hidden="true">BA</div>
+        <div>
+          <p class="eyebrow">BETTER AUTH · RUST</p>
+          <h1>Authentication, ready to test.</h1>
+          <p class="lede">
+            A small local web example for exercising registration and login
+            with the Better Auth Rust client.
+          </p>
+        </div>
+        <div class="status-pill"><span></span> Local server</div>
+      </header>
+
+      <section class="auth-grid" aria-label="Authentication forms">
+        <form id="register" class="card auth-card" autocomplete="on">
+          <div class="card-heading">
+            <div>
+              <p class="eyebrow">NEW ACCOUNT</p>
+              <h2>Register</h2>
+            </div>
+            <span class="step">01</span>
+          </div>
+          <p class="card-copy">Create a local account and receive a session cookie.</p>
+
+          <label class="field">
+            <span>Email address</span>
+            <input name="email" type="email" autocomplete="email" placeholder="you@example.com" required>
+          </label>
+          <label class="field">
+            <span>Name</span>
+            <input name="name" autocomplete="name" placeholder="Ada Lovelace" required>
+          </label>
+          <label class="field">
+            <span>Password</span>
+            <input name="password" type="password" autocomplete="new-password" placeholder="Your password" required>
+          </label>
+          <button class="button button-primary" type="submit">
+            <span class="button-label">Register</span>
+            <span class="button-spinner" aria-hidden="true"></span>
+          </button>
+        </form>
+
+        <form id="login" class="card auth-card" autocomplete="on">
+          <div class="card-heading">
+            <div>
+              <p class="eyebrow">RETURNING USER</p>
+              <h2>Login</h2>
+            </div>
+            <span class="step">02</span>
+          </div>
+          <p class="card-copy">Use the account you just created to verify sign-in.</p>
+
+          <label class="field">
+            <span>Email address</span>
+            <input name="email" type="email" autocomplete="email" placeholder="you@example.com" required>
+          </label>
+          <label class="field">
+            <span>Password</span>
+            <input name="password" type="password" autocomplete="current-password" placeholder="Your password" required>
+          </label>
+          <button class="button button-secondary" type="submit">
+            <span class="button-label">Login</span>
+            <span class="button-spinner" aria-hidden="true"></span>
+          </button>
+        </form>
+      </section>
+
+      <section class="result-card" aria-live="polite" aria-atomic="true">
+        <div class="result-icon" aria-hidden="true">⌁</div>
+        <div>
+          <p class="eyebrow">REQUEST RESULT</p>
+          <h2 id="result-title">Ready when you are</h2>
+          <pre id="result">Submit a form to call the Rust API.</pre>
+        </div>
+      </section>
+
+      <footer>
+        <span>In-memory demo · local development only</span>
+        <span>POST /api/auth/sign-up/email · POST /api/auth/sign-in/email</span>
+      </footer>
+    </main>
+  </body>
+</html>

@@ -119,11 +119,15 @@ The runnable example is intentionally an in-memory server; it is for local
 verification, not production deployment. Its source is
 `crates/better-auth/examples/web-example.rs`.
 
+The example uses a lower scrypt cost (`log_n=13`) so local register/login
+requests stay responsive. The library default is configurable through
+`AuthOptions.password_hash`; production deployments should benchmark a higher
+cost for their hardware and security requirements.
+
 ### Verify the TypeScript web client against the Rust server
 
 The client E2E suite builds the same Axum example, starts it on an ephemeral
-port, and verifies sign-up, session lookup, sign-out, and sign-in over real
-HTTP:
+port, and verifies registration and login over real HTTP:
 
 ```sh
 cd packages/better-auth-client

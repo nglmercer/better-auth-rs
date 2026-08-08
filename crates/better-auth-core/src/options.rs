@@ -82,6 +82,7 @@ pub struct AdvancedOptions {
 /// always reads the parameters stored in the existing PHC hash, so changing
 /// the cost does not invalidate existing passwords.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct PasswordHashOptions {
     /// Scrypt's log2(N) work factor. The default uses 32 MiB per operation.
     pub scrypt_log_n: u8,
