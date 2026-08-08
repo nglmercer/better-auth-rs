@@ -80,8 +80,8 @@ cargo test --workspace --all-features
 
 ### Run the web example
 
-The repository includes a small Axum web example with a browser page and only
-the registration and login endpoints. Start it with:
+The repository includes a small Axum web example with a minimalist browser
+page for registration, login, and password recovery. Start it with:
 
 ```sh
 cargo run -p better-auth --example web-example
@@ -119,8 +119,8 @@ The runnable example is intentionally an in-memory server; it is for local
 verification, not production deployment. Its source is
 `crates/better-auth/examples/web-example.rs`.
 
-The example uses a lower scrypt cost (`log_n=13`) so local register/login
-requests stay responsive. The library default is configurable through
+The example uses a lower scrypt cost (`log_n=13`) so local auth requests stay
+responsive. The library default is configurable through
 `AuthOptions.password_hash`; production deployments should benchmark a higher
 cost for their hardware and security requirements.
 

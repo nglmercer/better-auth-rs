@@ -1,11 +1,39 @@
-const resultCard = document.querySelector(".result-card");
+const views = {
+  login: document.querySelector("#view-login"),
+  register: document.querySelector("#view-register"),
+  recovery: document.querySelector("#view-recovery"),
+};
+const tabs = document.querySelectorAll(".tab[data-view]");
+const viewTitle = document.querySelector("#view-title");
+const viewSubtitle = document.querySelector("#view-subtitle");
+const result = document.querySelector(".result");
 const resultTitle = document.querySelector("#result-title");
-const result = document.querySelector("#result");
+const resultMessage = document.querySelector("#result");
 
-function setResult(title, message, state) {
+const viewCopy = {
+  login: ["Welcome back", "Sign in to continue to your account."],
+  register: ["Create your account", "Welcome. Please fill in the details to get started."],
+  recovery: ["Recover your password", "We will help you get back into your account."],
+};
+
+function showView(name) {
+  Object.entries(views).forEach(([viewName, element]) => {
+    element.hidden = viewName !== name;
+  });
+
+  tabs.forEach((tab) => {
+    const active = tab.dataset.view === name;
+    tab.classList.toggle("is-active", active);
+    tab.setAttribute("aria-selected", String(active));
+  });
+
+  [viewTitle.textContent, viewSubtitle.textContent] = viewCopy[name];
+}
+
+function setResult(title, message, state = "") {
   resultTitle.textContent = title;
-  result.textContent = message;
-  resultCard.dataset.state = state;
+  resultMessage.textContent = message;
+  result.dataset.state = state;
 }
 
 async function submitForm(event, path) {
@@ -38,11 +66,25 @@ async function submitForm(event, path) {
     setResult("Request failed", String(error), "error");
   } finally {
     button.disabled = false;
-    label.textContent = path === "sign-up/email" ? "Register" : "Login";
+    label.textContent = button.dataset.defaultLabel;
   }
 }
 
-document.querySelector("#register").addEventListener("submit", (event) =>
-  submitForm(event, "sign-up/email"));
+document.querySelectorAll(".tab[data-view], [data-view='recovery'], [data-view='login']").forEach((button) => {
+  button.addEventListener("click", () => showView(button.dataset.view));
+});
+
 document.querySelector("#login").addEventListener("submit", (event) =>
   submitForm(event, "sign-in/email"));
+document.querySelector("#register").addEventListener("submit", (event) =>
+  submitForm(event, "sign-up/email"));
+document.querySelector("#request-recovery").addEventListener("submit", (event) =>
+  submitForm(event, "request-password-reset"));
+document.querySelector("#reset-password").addEventListener("submit", (event) =>
+  submitForm(event, "reset-password"));
+
+document.querySelectorAll("button[type=submit]").forEach((button) => {
+  button.dataset.defaultLabel = button.querySelector(".button-label").textContent;
+});
+
+showView("login");

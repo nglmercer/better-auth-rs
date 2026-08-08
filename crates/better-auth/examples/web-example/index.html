@@ -3,93 +3,124 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#0b1020">
+    <meta name="theme-color" content="#f7f7f5">
     <title>Better Auth · Rust web example</title>
     <link rel="stylesheet" href="/styles.css">
     <script src="/app.js" defer></script>
   </head>
   <body>
-    <main class="shell">
-      <header class="hero">
-        <div class="brand-mark" aria-hidden="true">BA</div>
-        <div>
-          <p class="eyebrow">BETTER AUTH · RUST</p>
-          <h1>Authentication, ready to test.</h1>
-          <p class="lede">
-            A small local web example for exercising registration and login
-            with the Better Auth Rust client.
-          </p>
+    <main class="page-shell">
+      <a class="wordmark" href="/" aria-label="Better Auth home">
+        <span class="wordmark-mark" aria-hidden="true">✦</span>
+        <span>better auth</span>
+      </a>
+
+      <section class="auth-card" aria-labelledby="view-title">
+        <header class="card-header">
+          <p class="eyebrow">RUST WEB EXAMPLE</p>
+          <h1 id="view-title">Welcome back</h1>
+          <p id="view-subtitle">Sign in to continue to your account.</p>
+        </header>
+
+        <nav class="auth-tabs" role="tablist" aria-label="Authentication views">
+          <button class="tab is-active" type="button" role="tab" aria-selected="true" data-view="login">
+            Sign in
+          </button>
+          <button class="tab" type="button" role="tab" aria-selected="false" data-view="register">
+            Create account
+          </button>
+        </nav>
+
+        <div id="view-login" class="auth-view">
+          <form id="login" autocomplete="on">
+            <label class="field">
+              <span>Email address</span>
+              <input name="email" type="email" autocomplete="email" placeholder="you@example.com" required>
+            </label>
+            <label class="field">
+              <span>Password</span>
+              <input name="password" type="password" autocomplete="current-password" placeholder="Enter your password" required>
+            </label>
+            <div class="field-actions">
+              <span></span>
+              <button class="text-button" type="button" data-view="recovery">Forgot password?</button>
+            </div>
+            <button class="button button-dark" type="submit">
+              <span class="button-label">Continue</span>
+              <span class="button-spinner" aria-hidden="true"></span>
+              <span class="button-arrow" aria-hidden="true">→</span>
+            </button>
+          </form>
         </div>
-        <div class="status-pill"><span></span> Local server</div>
-      </header>
 
-      <section class="auth-grid" aria-label="Authentication forms">
-        <form id="register" class="card auth-card" autocomplete="on">
-          <div class="card-heading">
-            <div>
-              <p class="eyebrow">NEW ACCOUNT</p>
-              <h2>Register</h2>
-            </div>
-            <span class="step">01</span>
+        <div id="view-register" class="auth-view" hidden>
+          <form id="register" autocomplete="on">
+            <label class="field">
+              <span>Name</span>
+              <input name="name" autocomplete="name" placeholder="Ada Lovelace" required>
+            </label>
+            <label class="field">
+              <span>Email address</span>
+              <input name="email" type="email" autocomplete="email" placeholder="you@example.com" required>
+            </label>
+            <label class="field">
+              <span>Password</span>
+              <input name="password" type="password" autocomplete="new-password" placeholder="Create a password" required>
+            </label>
+            <button class="button button-dark" type="submit">
+              <span class="button-label">Create account</span>
+              <span class="button-spinner" aria-hidden="true"></span>
+              <span class="button-arrow" aria-hidden="true">→</span>
+            </button>
+          </form>
+        </div>
+
+        <div id="view-recovery" class="auth-view" hidden>
+          <button class="back-button" type="button" data-view="login">← Back to sign in</button>
+          <p class="view-intro">Request a recovery token, then use it to choose a new password.</p>
+
+          <form id="request-recovery" autocomplete="on">
+            <label class="field">
+              <span>Email address</span>
+              <input name="email" type="email" autocomplete="email" placeholder="you@example.com" required>
+            </label>
+            <button class="button button-dark" type="submit">
+              <span class="button-label">Send recovery link</span>
+              <span class="button-spinner" aria-hidden="true"></span>
+              <span class="button-arrow" aria-hidden="true">→</span>
+            </button>
+          </form>
+
+          <div class="recovery-divider"><span>Already have a token?</span></div>
+
+          <form id="reset-password" autocomplete="off">
+            <label class="field">
+              <span>Recovery token</span>
+              <input name="token" autocomplete="one-time-code" placeholder="Paste your token" required>
+            </label>
+            <label class="field">
+              <span>New password</span>
+              <input name="new_password" type="password" autocomplete="new-password" placeholder="Choose a new password" required>
+            </label>
+            <button class="button button-light" type="submit">
+              <span class="button-label">Set new password</span>
+              <span class="button-spinner" aria-hidden="true"></span>
+              <span class="button-arrow" aria-hidden="true">→</span>
+            </button>
+          </form>
+          <p class="demo-note">This local example has no email delivery configured. Use a token from your configured mail service.</p>
+        </div>
+
+        <section class="result" aria-live="polite" aria-atomic="true">
+          <span class="result-icon" aria-hidden="true">⌁</span>
+          <div>
+            <strong id="result-title">Ready when you are</strong>
+            <pre id="result">Your request result will appear here.</pre>
           </div>
-          <p class="card-copy">Create a local account and receive a session cookie.</p>
-
-          <label class="field">
-            <span>Email address</span>
-            <input name="email" type="email" autocomplete="email" placeholder="you@example.com" required>
-          </label>
-          <label class="field">
-            <span>Name</span>
-            <input name="name" autocomplete="name" placeholder="Ada Lovelace" required>
-          </label>
-          <label class="field">
-            <span>Password</span>
-            <input name="password" type="password" autocomplete="new-password" placeholder="Your password" required>
-          </label>
-          <button class="button button-primary" type="submit">
-            <span class="button-label">Register</span>
-            <span class="button-spinner" aria-hidden="true"></span>
-          </button>
-        </form>
-
-        <form id="login" class="card auth-card" autocomplete="on">
-          <div class="card-heading">
-            <div>
-              <p class="eyebrow">RETURNING USER</p>
-              <h2>Login</h2>
-            </div>
-            <span class="step">02</span>
-          </div>
-          <p class="card-copy">Use the account you just created to verify sign-in.</p>
-
-          <label class="field">
-            <span>Email address</span>
-            <input name="email" type="email" autocomplete="email" placeholder="you@example.com" required>
-          </label>
-          <label class="field">
-            <span>Password</span>
-            <input name="password" type="password" autocomplete="current-password" placeholder="Your password" required>
-          </label>
-          <button class="button button-secondary" type="submit">
-            <span class="button-label">Login</span>
-            <span class="button-spinner" aria-hidden="true"></span>
-          </button>
-        </form>
+        </section>
       </section>
 
-      <section class="result-card" aria-live="polite" aria-atomic="true">
-        <div class="result-icon" aria-hidden="true">⌁</div>
-        <div>
-          <p class="eyebrow">REQUEST RESULT</p>
-          <h2 id="result-title">Ready when you are</h2>
-          <pre id="result">Submit a form to call the Rust API.</pre>
-        </div>
-      </section>
-
-      <footer>
-        <span>In-memory demo · local development only</span>
-        <span>POST /api/auth/sign-up/email · POST /api/auth/sign-in/email</span>
-      </footer>
+      <p class="page-note">In-memory demo · local development only</p>
     </main>
   </body>
 </html>

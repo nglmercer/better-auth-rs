@@ -51,7 +51,8 @@ npm run test:e2e
 
 Vitest tests should mock `fetch` for request and retry behavior. For HTTP
 integration tests, `test:e2e` builds the minimal Axum web example in
-`crates/better-auth/examples/web-example.rs`. It exposes only registration and
-login, binds to `127.0.0.1:0`, emits a readiness line, and is spawned and
-terminated by the E2E suite. Keep unit tests mocked for speed, and use E2E for
-the real HTTP contract and cookie-backed client flow.
+`crates/better-auth/examples/web-example.rs`. Its browser page covers
+registration, login, and password recovery; the E2E suite focuses on the
+registration/login cookie flow. The server binds to `127.0.0.1:0`, emits a
+readiness line, and is spawned and terminated by the suite. Keep unit tests
+mocked for speed, and use E2E for the real HTTP contract.
