@@ -43,7 +43,7 @@
             </label>
             <div class="field-actions">
               <span></span>
-              <button class="text-button" type="button" data-view="recovery">Forgot password?</button>
+              <button class="text-button" type="button" data-open-recovery>Forgot password?</button>
             </div>
             <button class="button button-dark" type="submit">
               <span class="button-label">Continue</span>
@@ -75,50 +75,101 @@
           </form>
         </div>
 
-        <div id="view-recovery" class="auth-view" hidden>
-          <button class="back-button" type="button" data-view="login">← Back to sign in</button>
-          <p class="view-intro">Request a recovery token, then use it to choose a new password.</p>
-
-          <form id="request-recovery" autocomplete="on">
-            <label class="field">
-              <span>Email address</span>
-              <input name="email" type="email" autocomplete="email" placeholder="you@example.com" required>
-            </label>
-            <button class="button button-dark" type="submit">
-              <span class="button-label">Send recovery link</span>
-              <span class="button-spinner" aria-hidden="true"></span>
-              <span class="button-arrow" aria-hidden="true">→</span>
-            </button>
-          </form>
-
-          <div class="recovery-divider"><span>Already have a token?</span></div>
-
-          <form id="reset-password" autocomplete="off">
-            <label class="field">
-              <span>Recovery token</span>
-              <input name="token" autocomplete="one-time-code" placeholder="Paste your token" required>
-            </label>
-            <label class="field">
-              <span>New password</span>
-              <input name="new_password" type="password" autocomplete="new-password" placeholder="Choose a new password" required>
-            </label>
-            <button class="button button-light" type="submit">
-              <span class="button-label">Set new password</span>
-              <span class="button-spinner" aria-hidden="true"></span>
-              <span class="button-arrow" aria-hidden="true">→</span>
-            </button>
-          </form>
-          <p class="demo-note">This local example has no email delivery configured. Use a token from your configured mail service.</p>
-        </div>
-
         <section class="result" aria-live="polite" aria-atomic="true">
           <span class="result-icon" aria-hidden="true">⌁</span>
           <div>
-            <strong id="result-title">Ready when you are</strong>
-            <pre id="result">Your request result will appear here.</pre>
+            <strong class="result-title">Ready when you are</strong>
+            <pre class="result-message">Your request result will appear here.</pre>
           </div>
         </section>
       </section>
+
+      <dialog id="recovery-modal" class="recovery-modal" aria-labelledby="recovery-title">
+        <div class="modal-card">
+          <button class="modal-close" type="button" data-close-recovery aria-label="Close recovery dialog">×</button>
+          <div class="recovery-progress" aria-label="Recovery progress">
+            <span class="progress-dot is-active" data-progress="1"></span>
+            <span class="progress-line"></span>
+            <span class="progress-dot" data-progress="2"></span>
+            <span class="progress-line"></span>
+            <span class="progress-dot" data-progress="3"></span>
+          </div>
+
+          <section class="recovery-step" data-recovery-step="1">
+            <div class="modal-icon" aria-hidden="true">↗</div>
+            <p class="eyebrow">ACCOUNT RECOVERY</p>
+            <h2 id="recovery-title">Forgot your password?</h2>
+            <p class="step-copy">Enter your email address and we’ll send you a recovery token.</p>
+
+            <form id="request-recovery" autocomplete="on">
+              <label class="field">
+                <span>Email address</span>
+                <input name="email" type="email" autocomplete="email" placeholder="you@example.com" required>
+              </label>
+              <button class="button button-dark" type="submit">
+                <span class="button-label">Continue</span>
+                <span class="button-spinner" aria-hidden="true"></span>
+                <span class="button-arrow" aria-hidden="true">→</span>
+              </button>
+            </form>
+            <button class="modal-link" type="button" data-close-recovery>← Back to sign in</button>
+          </section>
+
+          <section class="recovery-step" data-recovery-step="2" hidden>
+            <div class="modal-icon" aria-hidden="true">✉</div>
+            <p class="eyebrow">VERIFY YOUR EMAIL</p>
+            <h2>Check your inbox</h2>
+            <p class="step-copy">Paste the recovery token sent to <strong id="recovery-email">your email address</strong>.</p>
+
+            <form id="verify-recovery" autocomplete="off">
+              <label class="field">
+                <span>Recovery token</span>
+                <input name="token" autocomplete="one-time-code" placeholder="Paste your token" required>
+              </label>
+              <button class="button button-dark" type="submit">
+                <span class="button-label">Continue</span>
+                <span class="button-spinner" aria-hidden="true"></span>
+                <span class="button-arrow" aria-hidden="true">→</span>
+              </button>
+            </form>
+            <button class="modal-link" type="button" data-recovery-step-link="1">← Use a different email</button>
+            <p class="demo-note">This local example has no email delivery configured. Use a token from your configured mail service.</p>
+          </section>
+
+          <section class="recovery-step" data-recovery-step="3" hidden>
+            <div class="modal-icon" aria-hidden="true">✓</div>
+            <p class="eyebrow">NEW PASSWORD</p>
+            <h2>Reset your password</h2>
+            <p class="step-copy">Choose a new password to secure your account.</p>
+
+            <form id="reset-password" autocomplete="off">
+              <input name="token" type="hidden">
+              <label class="field">
+                <span>New password</span>
+                <input name="new_password" type="password" autocomplete="new-password" placeholder="Choose a new password" required>
+              </label>
+              <label class="field">
+                <span>Confirm password</span>
+                <input name="confirm_password" type="password" autocomplete="new-password" placeholder="Repeat your password" required>
+              </label>
+              <button class="button button-light" type="submit">
+                <span class="button-label">Reset password</span>
+                <span class="button-spinner" aria-hidden="true"></span>
+                <span class="button-arrow" aria-hidden="true">→</span>
+              </button>
+            </form>
+            <button class="modal-link" type="button" data-recovery-step-link="2">← Back to token</button>
+          </section>
+
+          <section class="result modal-result" aria-live="polite" aria-atomic="true">
+            <span class="result-icon" aria-hidden="true">⌁</span>
+            <div>
+              <strong class="result-title">Ready when you are</strong>
+              <pre class="result-message">Your recovery result will appear here.</pre>
+            </div>
+          </section>
+        </div>
+      </dialog>
 
       <p class="page-note">In-memory demo · local development only</p>
     </main>
