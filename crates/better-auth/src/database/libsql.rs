@@ -11,7 +11,11 @@ use better_auth_core::{
 use libsql::{params_from_iter, Builder, TransactionBehavior};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Map, Number, Value};
-use std::{path::PathBuf, sync::Mutex, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 #[derive(Clone, Debug)]
 pub enum LibSqlConfig {
@@ -33,48 +37,57 @@ pub struct RemoteReplica {
     pub sync_interval: Option<Duration>,
 }
 
+const SECONDARY_STORAGE_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS _better_auth_kv (storage_key TEXT PRIMARY KEY, value_json TEXT NOT NULL, expires_at INTEGER)";
+
+async fn build_database(config: LibSqlConfig) -> Result<libsql::Database> {
+    match config {
+        LibSqlConfig::Local { path } => {
+            Builder::new_local(path).build().await.map_err(libsql_error)
+        }
+        LibSqlConfig::Remote { url, auth_token } => {
+            Builder::new_remote(url, auth_token.expose_secret().to_owned())
+                .build()
+                .await
+                .map_err(libsql_error)
+        }
+        LibSqlConfig::RemoteReplica(replica) => {
+            let builder = Builder::new_remote_replica(
+                replica.path,
+                replica.url,
+                replica.auth_token.expose_secret().to_owned(),
+            );
+            if let Some(interval) = replica.sync_interval {
+                builder
+                    .sync_interval(interval)
+                    .build()
+                    .await
+                    .map_err(libsql_error)
+            } else {
+                builder.build().await.map_err(libsql_error)
+            }
+        }
+    }
+}
+
 pub struct LibSqlDbAdapter {
+    // Keep the owning Database alive. libSQL's embedded-replica background
+    // synchronizer is tied to this value's lifetime, not the cloned
+    // Connection handle.
+    database: Arc<libsql::Database>,
     connection: libsql::Connection,
     schema: Mutex<SchemaExtension>,
 }
 
 impl LibSqlDbAdapter {
     pub async fn connect(config: LibSqlConfig) -> Result<Self> {
-        let database = match config {
-            LibSqlConfig::Local { path } => Builder::new_local(path)
-                .build()
-                .await
-                .map_err(libsql_error)?,
-            LibSqlConfig::Remote { url, auth_token } => {
-                Builder::new_remote(url, auth_token.expose_secret().to_owned())
-                    .build()
-                    .await
-                    .map_err(libsql_error)?
-            }
-            LibSqlConfig::RemoteReplica(replica) => {
-                let builder = Builder::new_remote_replica(
-                    replica.path,
-                    replica.url,
-                    replica.auth_token.expose_secret().to_owned(),
-                );
-                if let Some(interval) = replica.sync_interval {
-                    builder
-                        .sync_interval(interval)
-                        .build()
-                        .await
-                        .map_err(libsql_error)?
-                } else {
-                    builder.build().await.map_err(libsql_error)?
-                }
-            }
-        };
+        let database = Arc::new(build_database(config).await?);
         let connection = database.connect().map_err(libsql_error)?;
-        let adapter = Self {
+        Ok(Self {
+            database,
             connection,
             schema: Mutex::new(core_schema()),
-        };
-        adapter.apply_core_migrations().await?;
-        Ok(adapter)
+        })
     }
 
     pub async fn local(path: impl Into<PathBuf>) -> Result<Self> {
@@ -98,6 +111,7 @@ impl LibSqlDbAdapter {
 
     pub fn secondary_storage(&self) -> LibSqlSecondaryStorage {
         LibSqlSecondaryStorage {
+            _database: Arc::clone(&self.database),
             connection: self.connection.clone(),
         }
     }
@@ -111,11 +125,6 @@ impl LibSqlDbAdapter {
 
     pub async fn apply_migrations(&self, plan: &MigrationPlan) -> Result<()> {
         plan.apply(self, SqlDialect::Sqlite).await
-    }
-
-    async fn apply_core_migrations(&self) -> Result<()> {
-        self.apply_migrations(&MigrationPlan::from_schema(&core_schema()))
-            .await
     }
 
     fn connection(&self) -> libsql::Connection {
@@ -240,23 +249,26 @@ impl DbAdapter for LibSqlDbAdapter {
 
 #[derive(Clone)]
 pub struct LibSqlSecondaryStorage {
+    // Retained solely to keep replica synchronization alive.
+    _database: Arc<libsql::Database>,
     connection: libsql::Connection,
 }
 
 impl LibSqlSecondaryStorage {
     pub async fn connect(config: LibSqlConfig) -> Result<Self> {
-        let adapter = LibSqlDbAdapter::connect(config).await?;
-        let storage = adapter.secondary_storage();
-        storage.ensure_table().await?;
-        Ok(storage)
+        let database = Arc::new(build_database(config).await?);
+        let connection = database.connect().map_err(libsql_error)?;
+        Ok(Self {
+            _database: database,
+            connection,
+        })
     }
 
-    async fn ensure_table(&self) -> Result<()> {
+    /// Creates the secondary-storage table. This is intentionally explicit so
+    /// connecting to a production database never changes its schema.
+    pub async fn migrate(&self) -> Result<()> {
         self.connection
-            .execute(
-                "CREATE TABLE IF NOT EXISTS _better_auth_kv (storage_key TEXT PRIMARY KEY, value_json TEXT NOT NULL, expires_at INTEGER)",
-                (),
-            )
+            .execute(SECONDARY_STORAGE_DDL, ())
             .await
             .map_err(libsql_error)?;
         Ok(())
@@ -265,29 +277,16 @@ impl LibSqlSecondaryStorage {
     fn connection(&self) -> libsql::Connection {
         self.connection.clone()
     }
-
-    async fn ensure_table_on_connection(&self) -> Result<()> {
-        self.connection
-            .execute(
-                "CREATE TABLE IF NOT EXISTS _better_auth_kv (storage_key TEXT PRIMARY KEY, value_json TEXT NOT NULL, expires_at INTEGER)",
-                (),
-            )
-            .await
-            .map_err(libsql_error)?;
-        Ok(())
-    }
 }
 
 #[async_trait::async_trait]
 impl SecondaryStorage for LibSqlSecondaryStorage {
     async fn get(&self, key: &str) -> Result<Option<StorageValue>> {
         let connection = self.connection();
-        self.ensure_table_on_connection().await?;
         read_kv(&connection, key).await
     }
 
     async fn set(&self, key: &str, value: StorageValue) -> Result<()> {
-        self.ensure_table_on_connection().await?;
         let expires_at = value
             .expires_in
             .map(|ttl| now_seconds() as i64 + ttl.as_secs() as i64);
@@ -306,7 +305,6 @@ impl SecondaryStorage for LibSqlSecondaryStorage {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        self.ensure_table_on_connection().await?;
         self.connection()
             .execute(
                 "DELETE FROM _better_auth_kv WHERE storage_key = ?1",
@@ -319,7 +317,6 @@ impl SecondaryStorage for LibSqlSecondaryStorage {
 
     async fn increment(&self, key: &str, amount: i64, expires_in: Duration) -> Result<i64> {
         let connection = self.connection();
-        self.ensure_table_on_connection().await?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
@@ -353,7 +350,6 @@ impl SecondaryStorage for LibSqlSecondaryStorage {
 
     async fn get_and_delete(&self, key: &str) -> Result<Option<StorageValue>> {
         let connection = self.connection();
-        self.ensure_table_on_connection().await?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await

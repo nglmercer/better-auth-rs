@@ -20,7 +20,7 @@ pub use sqlx::{
 mod tests {
     use super::*;
     use better_auth_core::adapter::{DbAdapter, DbOperation, OrderBy, Query, SecondaryStorage};
-    use better_auth_core::migration::{MigrationExecutor, MigrationPlan};
+    use better_auth_core::migration::{MigrationExecutor, MigrationPlan, SqlDialect};
     use serde_json::Value;
     use std::{sync::Arc, time::Duration};
 
@@ -177,6 +177,12 @@ mod tests {
     #[tokio::test]
     async fn sqlite_db_transactions_are_atomic() {
         let adapter = SqliteDbAdapter::in_memory().unwrap();
+        adapter
+            .apply_migrations(&MigrationPlan::from_schema(
+                &better_auth_core::schema::core_schema(),
+            ))
+            .await
+            .unwrap();
         let result = adapter
             .transaction(vec![
                 DbOperation::InsertRecord {
@@ -211,8 +217,27 @@ mod tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn sqlite_connection_does_not_apply_schema_implicitly() {
+        let adapter = SqliteDbAdapter::in_memory().unwrap();
+        assert!(adapter.find_many("user", Query::new()).await.is_err());
+        adapter
+            .apply_migrations(&MigrationPlan::from_schema(
+                &better_auth_core::schema::core_schema(),
+            ))
+            .await
+            .unwrap();
+        assert!(adapter
+            .find_many("user", Query::new())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn sqlite_secondary_storage_supports_increment_and_one_time_reads() {
         let storage = SqliteSecondaryStorage::in_memory().unwrap();
+        storage.migrate().unwrap();
         assert_eq!(
             storage
                 .increment("counter", 1, Duration::from_secs(60))
@@ -262,6 +287,12 @@ mod tests {
             .remove("additional_fields");
         let adapter = SqliteDbAdapter::open(&path).unwrap();
         adapter
+            .apply_migrations(&MigrationPlan::from_schema(
+                &better_auth_core::schema::core_schema(),
+            ))
+            .await
+            .unwrap();
+        adapter
             .execute("ALTER TABLE \"user\" DROP COLUMN \"additional_fields\";")
             .await
             .unwrap();
@@ -299,6 +330,12 @@ mod tests {
     #[tokio::test]
     async fn sqlite_queries_are_executed_by_the_database() {
         let adapter = SqliteDbAdapter::in_memory().unwrap();
+        adapter
+            .apply_migrations(&MigrationPlan::from_schema(
+                &better_auth_core::schema::core_schema(),
+            ))
+            .await
+            .unwrap();
         adapter_conformance(&adapter).await;
         for (id, email) in [
             ("query-one", "one@example.com"),
@@ -339,6 +376,12 @@ mod tests {
     #[tokio::test]
     async fn libsql_local_adapter_uses_relational_tables_and_atomic_kv() {
         let adapter = LibSqlDbAdapter::local(":memory:").await.unwrap();
+        adapter
+            .apply_migrations(&MigrationPlan::from_schema(
+                &better_auth_core::schema::core_schema(),
+            ))
+            .await
+            .unwrap();
         adapter_conformance(&adapter).await;
         adapter
             .insert_record(
@@ -371,6 +414,31 @@ mod tests {
         );
 
         let storage = adapter.secondary_storage();
+        storage.migrate().await.unwrap();
+        secondary_storage_conformance(Arc::new(storage)).await;
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn libsql_remote_conformance_when_configured() {
+        let (Ok(url), Ok(token)) = (
+            std::env::var("BETTER_AUTH_TEST_LIBSQL_URL"),
+            std::env::var("BETTER_AUTH_TEST_LIBSQL_TOKEN"),
+        ) else {
+            return;
+        };
+        let adapter = LibSqlDbAdapter::remote(&url, secrecy::SecretString::from(token))
+            .await
+            .unwrap();
+        adapter
+            .apply_migrations(&MigrationPlan::from_schema(
+                &better_auth_core::schema::core_schema(),
+            ))
+            .await
+            .unwrap();
+        adapter_conformance(&adapter).await;
+        let storage = adapter.secondary_storage();
+        storage.migrate().await.unwrap();
         secondary_storage_conformance(Arc::new(storage)).await;
     }
 
@@ -381,8 +449,16 @@ mod tests {
             return;
         };
         let adapter = SqlxDbAdapter::postgres(&url).await.unwrap();
+        adapter
+            .apply_migrations(
+                &MigrationPlan::from_schema(&better_auth_core::schema::core_schema()),
+                SqlDialect::Postgres,
+            )
+            .await
+            .unwrap();
         adapter_conformance(&adapter).await;
         let storage = SqlxSecondaryStorage::postgres(&url).await.unwrap();
+        storage.migrate().await.unwrap();
         secondary_storage_conformance(Arc::new(storage)).await;
     }
 
@@ -393,6 +469,16 @@ mod tests {
             return;
         };
         let adapter = SqlxDbAdapter::mysql(&url).await.unwrap();
+        adapter
+            .apply_migrations(
+                &MigrationPlan::from_schema(&better_auth_core::schema::core_schema()),
+                SqlDialect::MySql,
+            )
+            .await
+            .unwrap();
         adapter_conformance(&adapter).await;
+        let storage = SqlxSecondaryStorage::mysql(&url).await.unwrap();
+        storage.migrate().await.unwrap();
+        secondary_storage_conformance(Arc::new(storage)).await;
     }
 }

@@ -36,17 +36,10 @@ impl SqlxDbAdapter {
         validate_sqlx_url(url, backend)?;
         sqlx::any::install_default_drivers();
         let pool = sqlx::AnyPool::connect(url).await.map_err(sqlx_error)?;
-        let schema = core_schema();
-        for statement in MigrationPlan::from_schema(&schema).sql(match backend {
-            SqlxBackend::Postgres => SqlDialect::Postgres,
-            SqlxBackend::MySql => SqlDialect::MySql,
-        }) {
-            pool.execute(statement.as_str()).await.map_err(sqlx_error)?;
-        }
         Ok(Self {
             pool,
             backend,
-            schema: Arc::new(Mutex::new(schema)),
+            schema: Arc::new(Mutex::new(core_schema())),
         })
     }
 
@@ -235,9 +228,6 @@ impl SqlxSecondaryStorage {
         validate_sqlx_url(url, backend)?;
         sqlx::any::install_default_drivers();
         let pool = sqlx::AnyPool::connect(url).await.map_err(sqlx_error)?;
-        pool.execute(sqlx_kv_ddl(backend))
-            .await
-            .map_err(sqlx_error)?;
         Ok(Self { pool, backend })
     }
 
@@ -247,6 +237,16 @@ impl SqlxSecondaryStorage {
 
     pub async fn mysql(url: &str) -> Result<Self> {
         Self::connect(url, SqlxBackend::MySql).await
+    }
+
+    /// Creates the secondary-storage table. This is intentionally explicit so
+    /// connecting to a production database never changes its schema.
+    pub async fn migrate(&self) -> Result<()> {
+        self.pool
+            .execute(sqlx_kv_ddl(self.backend))
+            .await
+            .map_err(sqlx_error)?;
+        Ok(())
     }
 }
 

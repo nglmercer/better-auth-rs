@@ -45,13 +45,9 @@ impl SqliteDbAdapter {
         connection
             .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(sqlite_error)?;
-        let schema = core_schema();
-        for statement in MigrationPlan::from_schema(&schema).sql(SqlDialect::Sqlite) {
-            connection.execute_batch(&statement).map_err(sqlite_error)?;
-        }
         Ok(Self {
             connection: Mutex::new(connection),
-            schema: Mutex::new(schema),
+            schema: Mutex::new(core_schema()),
         })
     }
 
@@ -253,8 +249,12 @@ impl SqliteSecondaryStorage {
         Self::from_connection(Connection::open_in_memory().map_err(sqlite_error)?)
     }
 
-    fn from_connection(connection: Connection) -> Result<Self> {
-        connection
+    /// Creates the secondary-storage table. This is intentionally explicit so
+    /// connecting to a production database never changes its schema.
+    pub fn migrate(&self) -> Result<()> {
+        self.connection
+            .lock()
+            .map_err(|_| lock_error())?
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS _better_auth_kv (\
                     storage_key TEXT PRIMARY KEY,\
@@ -262,7 +262,10 @@ impl SqliteSecondaryStorage {
                     expires_at INTEGER\
                 );",
             )
-            .map_err(sqlite_error)?;
+            .map_err(sqlite_error)
+    }
+
+    fn from_connection(connection: Connection) -> Result<Self> {
         Ok(Self {
             connection: Mutex::new(connection),
         })

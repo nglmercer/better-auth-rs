@@ -1,0 +1,36 @@
+name: Rust CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      # Optional repository secrets enable the environment-gated live adapter
+      # conformance test without making forked pull requests depend on them.
+      BETTER_AUTH_TEST_LIBSQL_URL: ${{ secrets.BETTER_AUTH_TEST_LIBSQL_URL }}
+      BETTER_AUTH_TEST_LIBSQL_TOKEN: ${{ secrets.BETTER_AUTH_TEST_LIBSQL_TOKEN }}
+      BETTER_AUTH_TEST_POSTGRES_URL: ${{ secrets.BETTER_AUTH_TEST_POSTGRES_URL }}
+      BETTER_AUTH_TEST_MYSQL_URL: ${{ secrets.BETTER_AUTH_TEST_MYSQL_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SQLite development headers
+        run: sudo apt-get update && sudo apt-get install --yes libsqlite3-dev pkg-config
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-features
+
+      - name: Run workspace tests
+        run: cargo test --workspace --all-features

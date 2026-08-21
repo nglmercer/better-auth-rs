@@ -5,7 +5,7 @@ use crate::{
     session::AuthPrincipal,
 };
 use better_auth_core::{
-    adapter::{DbAdapter, SecondaryStorage},
+    adapter::{DbAdapter, DbOperation, Query, SecondaryStorage},
     error::{AuthError, Result},
     migration::MigrationPlan,
     options::{AuthOptions, BaseUrl},
@@ -14,6 +14,7 @@ use better_auth_core::{
     PluginRegistry,
 };
 use http::{header, HeaderMap, Method, Uri};
+use serde_json::Value;
 use std::{net::IpAddr, sync::Arc};
 use url::Url;
 
@@ -33,6 +34,20 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
+    /// Starts a context builder. Database presence is derived from whether
+    /// `.database(...)` is called, so authentication cannot silently remain in
+    /// cookie-only mode because a legacy boolean was omitted.
+    pub fn builder(options: AuthOptions) -> AuthContextBuilder {
+        AuthContextBuilder {
+            options,
+            adapter: None,
+            secondary_storage: None,
+            plugins: Vec::new(),
+            password_provider: None,
+            lifecycle_hooks: Vec::new(),
+        }
+    }
+
     pub fn new(
         options: AuthOptions,
         adapter: Arc<dyn DbAdapter>,
@@ -42,7 +57,14 @@ impl AuthContext {
         let provider = Arc::new(ScryptPhcPasswordProvider::new(
             options.password_hash.clone(),
         ));
-        Self::new_with_password_provider(options, adapter, secondary_storage, plugins, provider)
+        Self::from_parts(
+            options,
+            Some(adapter),
+            secondary_storage,
+            plugins,
+            provider,
+            Vec::new(),
+        )
     }
 
     pub fn new_with_hooks(
@@ -83,16 +105,51 @@ impl AuthContext {
     }
 
     pub fn new_with_password_provider_and_hooks(
-        mut options: AuthOptions,
+        options: AuthOptions,
         adapter: Arc<dyn DbAdapter>,
         secondary_storage: Option<Arc<dyn SecondaryStorage>>,
         plugins: Vec<Arc<dyn Plugin>>,
         password_provider: Arc<dyn PasswordProvider>,
         lifecycle_hooks: Vec<Arc<dyn AuthHooks>>,
     ) -> Result<Self> {
+        Self::from_parts(
+            options,
+            Some(adapter),
+            secondary_storage,
+            plugins,
+            password_provider,
+            lifecycle_hooks,
+        )
+    }
+
+    /// Builds an auth context without a primary database. Cookie-cache
+    /// sessions remain available, while database-backed services return a
+    /// configuration error instead of touching an accidental adapter.
+    pub fn without_database(
+        options: AuthOptions,
+        secondary_storage: Option<Arc<dyn SecondaryStorage>>,
+        plugins: Vec<Arc<dyn Plugin>>,
+    ) -> Result<Self> {
+        Self::builder(options)
+            .secondary_storage(secondary_storage)
+            .plugins(plugins)
+            .build()
+    }
+
+    fn from_parts(
+        mut options: AuthOptions,
+        adapter: Option<Arc<dyn DbAdapter>>,
+        secondary_storage: Option<Arc<dyn SecondaryStorage>>,
+        plugins: Vec<Arc<dyn Plugin>>,
+        password_provider: Arc<dyn PasswordProvider>,
+        lifecycle_hooks: Vec<Arc<dyn AuthHooks>>,
+    ) -> Result<Self> {
+        options.has_database = adapter.is_some();
         options.has_secondary_storage = secondary_storage.is_some();
         options.apply_defaults();
         options.validate()?;
+
+        let adapter: Arc<dyn DbAdapter> = adapter.unwrap_or_else(|| Arc::new(UnavailableDbAdapter));
 
         let base_url = match options.base_url.as_ref() {
             Some(BaseUrl::Static(value)) => Some(build_base_url(value, &options.base_path)?),
@@ -245,6 +302,93 @@ impl AuthContext {
         }
         origins
     }
+}
+
+/// Builder for applications that want database presence to be explicit in
+/// the type of configuration rather than in a separately maintained boolean.
+pub struct AuthContextBuilder {
+    options: AuthOptions,
+    adapter: Option<Arc<dyn DbAdapter>>,
+    secondary_storage: Option<Arc<dyn SecondaryStorage>>,
+    plugins: Vec<Arc<dyn Plugin>>,
+    password_provider: Option<Arc<dyn PasswordProvider>>,
+    lifecycle_hooks: Vec<Arc<dyn AuthHooks>>,
+}
+
+impl AuthContextBuilder {
+    pub fn database(mut self, adapter: Arc<dyn DbAdapter>) -> Self {
+        self.adapter = Some(adapter);
+        self
+    }
+
+    pub fn secondary_storage(mut self, storage: Option<Arc<dyn SecondaryStorage>>) -> Self {
+        self.secondary_storage = storage;
+        self
+    }
+
+    pub fn plugins(mut self, plugins: Vec<Arc<dyn Plugin>>) -> Self {
+        self.plugins = plugins;
+        self
+    }
+
+    pub fn password_provider(mut self, provider: Arc<dyn PasswordProvider>) -> Self {
+        self.password_provider = Some(provider);
+        self
+    }
+
+    pub fn hooks(mut self, hooks: Vec<Arc<dyn AuthHooks>>) -> Self {
+        self.lifecycle_hooks = hooks;
+        self
+    }
+
+    pub fn build(self) -> Result<AuthContext> {
+        let password_provider = self.password_provider.unwrap_or_else(|| {
+            Arc::new(ScryptPhcPasswordProvider::new(
+                self.options.password_hash.clone(),
+            ))
+        });
+        AuthContext::from_parts(
+            self.options,
+            self.adapter,
+            self.secondary_storage,
+            self.plugins,
+            password_provider,
+            self.lifecycle_hooks,
+        )
+    }
+}
+
+struct UnavailableDbAdapter;
+
+#[async_trait::async_trait]
+impl DbAdapter for UnavailableDbAdapter {
+    async fn find_one(&self, _table: &str, _query: Query) -> Result<Option<Value>> {
+        Err(no_database_error())
+    }
+
+    async fn find_many(&self, _table: &str, _query: Query) -> Result<Vec<Value>> {
+        Err(no_database_error())
+    }
+
+    async fn insert_record(&self, _table: &str, _record: Value) -> Result<Value> {
+        Err(no_database_error())
+    }
+
+    async fn update_where(&self, _table: &str, _query: Query, _changes: Value) -> Result<u64> {
+        Err(no_database_error())
+    }
+
+    async fn delete_where(&self, _table: &str, _query: Query) -> Result<u64> {
+        Err(no_database_error())
+    }
+
+    async fn transaction(&self, _operations: Vec<DbOperation>) -> Result<()> {
+        Err(no_database_error())
+    }
+}
+
+fn no_database_error() -> AuthError {
+    AuthError::InvalidConfiguration("a primary database is not configured".into())
 }
 
 #[derive(Clone)]
@@ -462,5 +606,17 @@ mod tests {
         options.session.expires_in_seconds = 900;
         options.apply_defaults();
         assert_eq!(options.session.cookie_cache.max_age_seconds, 900);
+    }
+
+    #[test]
+    fn builder_derives_database_presence_from_the_adapter() {
+        let without_database = AuthContext::builder(options()).build().unwrap();
+        assert!(!without_database.options.has_database);
+
+        let with_database = AuthContext::builder(options())
+            .database(Arc::new(MemoryDb::default()))
+            .build()
+            .unwrap();
+        assert!(with_database.options.has_database);
     }
 }

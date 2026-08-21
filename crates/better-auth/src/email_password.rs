@@ -43,6 +43,20 @@ pub struct SignInInput {
     pub password: String,
 }
 
+/// A pre-hashed credential imported from an existing application. The hash is
+/// stored byte-for-byte and is only verified or upgraded after a successful
+/// password login through the configured `PasswordProvider`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ImportCredential {
+    pub id: Option<String>,
+    pub email: String,
+    pub name: String,
+    pub email_verified: bool,
+    pub password_hash: String,
+    #[serde(default)]
+    pub additional_fields: Map<String, Value>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Session {
     pub id: String,
@@ -59,6 +73,82 @@ pub struct AuthResult {
     /// application opts into bearer transport. Web responses need not expose
     /// it when cookies are the configured transport.
     pub session_token: String,
+}
+
+/// Imports existing users without requiring the plaintext password. Imported
+/// hashes are intentionally not re-encoded; the normal sign-in flow can use a
+/// composite provider to verify a legacy format and automatically rehash it.
+#[derive(Clone)]
+pub struct CredentialService {
+    context: AuthContext,
+}
+
+impl CredentialService {
+    pub fn new(context: AuthContext) -> Self {
+        Self { context }
+    }
+
+    pub fn context(&self) -> &AuthContext {
+        &self.context
+    }
+
+    pub async fn import(&self, credential: ImportCredential) -> Result<User> {
+        require_database(&self.context)?;
+        let email = normalize_email(&credential.email)?;
+        validate_name(&credential.name)?;
+        if credential.password_hash.is_empty() {
+            return Err(AuthError::InvalidRequest(
+                "password_hash cannot be empty".into(),
+            ));
+        }
+        let id = credential.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        if id.trim().is_empty() {
+            return Err(AuthError::InvalidRequest("user id cannot be empty".into()));
+        }
+        if self
+            .context
+            .adapter
+            .find_one(USER_TABLE, Query::new().eq("email", email.clone()))
+            .await?
+            .is_some()
+        {
+            return Err(AuthError::InvalidRequest(
+                "email is already registered".into(),
+            ));
+        }
+
+        let mut user = User {
+            id,
+            email,
+            name: credential.name,
+            email_verified: credential.email_verified,
+            image: None,
+            additional_fields: credential.additional_fields,
+        };
+        self.context.before_user_create(&mut user).await?;
+        let account = json!({
+            "id": format!("{}:{EMAIL_PROVIDER}", user.id),
+            "user_id": user.id,
+            "provider_id": EMAIL_PROVIDER,
+            "account_id": user.email,
+            "password_hash": credential.password_hash,
+        });
+        self.context
+            .adapter
+            .transaction(vec![
+                DbOperation::InsertRecord {
+                    table: USER_TABLE.into(),
+                    record: serde_json::to_value(&user).map_err(serialize_error)?,
+                },
+                DbOperation::InsertRecord {
+                    table: ACCOUNT_TABLE.into(),
+                    record: account,
+                },
+            ])
+            .await?;
+        self.context.after_user_create(&user).await?;
+        Ok(user)
+    }
 }
 
 /// Core email/password operations. Request handlers should call these methods
@@ -234,13 +324,17 @@ impl EmailPasswordService {
     }
 
     fn require_database(&self) -> Result<()> {
-        if self.context.options.has_database {
-            Ok(())
-        } else {
-            Err(AuthError::InvalidConfiguration(
-                "email/password authentication requires a primary database".into(),
-            ))
-        }
+        require_database(&self.context)
+    }
+}
+
+fn require_database(context: &AuthContext) -> Result<()> {
+    if context.options.has_database {
+        Ok(())
+    } else {
+        Err(AuthError::InvalidConfiguration(
+            "email/password authentication requires a primary database".into(),
+        ))
     }
 }
 
@@ -287,7 +381,7 @@ where
 mod tests {
     use super::*;
     use better_auth_core::{
-        adapter::memory::MemoryDb,
+        adapter::{memory::MemoryDb, DbAdapter, Query},
         options::{AuthOptions, BaseUrl},
     };
     use http::HeaderMap;
@@ -361,5 +455,43 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn credential_import_preserves_the_supplied_hash() {
+        let adapter = Arc::new(MemoryDb::default());
+        let context = AuthContext::new(
+            AuthOptions {
+                secret: "i".repeat(32),
+                ..AuthOptions::default()
+            },
+            adapter.clone(),
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let service = CredentialService::new(context);
+        let user = service
+            .import(ImportCredential {
+                id: Some("legacy-user".into()),
+                email: "Legacy@Example.com".into(),
+                name: "Legacy User".into(),
+                email_verified: true,
+                password_hash: "legacy-salt:legacy-key".into(),
+                additional_fields: Map::from_iter([("country".into(), Value::String("PE".into()))]),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(user.id, "legacy-user");
+        let account = adapter
+            .find_one(
+                ACCOUNT_TABLE,
+                Query::new().eq("id", "legacy-user:credential"),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(account["password_hash"], "legacy-salt:legacy-key");
     }
 }

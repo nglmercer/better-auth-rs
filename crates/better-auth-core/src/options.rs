@@ -162,8 +162,9 @@ pub struct AuthOptions {
     pub advanced: AdvancedOptions,
     #[serde(default)]
     pub password_hash: PasswordHashOptions,
-    /// Whether a primary relational adapter is configured. Secondary storage
-    /// is intentionally separate because it does not hold account records.
+    /// Legacy serialized compatibility field. `AuthContext` derives this from
+    /// whether a primary adapter is configured; applications should use
+    /// `AuthContext::builder(...).database(...)` instead of maintaining it.
     pub has_database: bool,
     pub has_secondary_storage: bool,
     pub store_account_cookie: bool,

@@ -1,4 +1,5 @@
 use crate::context::AuthContext;
+use crate::session::SessionService;
 use better_auth_core::{
     adapter::{Query, SecondaryStorage},
     error::{AuthError, Result},
@@ -122,14 +123,16 @@ impl EmailVerificationService {
 pub struct PasswordResetService {
     context: AuthContext,
     verification: VerificationService,
+    sessions: SessionService,
 }
 
 impl PasswordResetService {
-    pub fn new(context: AuthContext, storage: Arc<dyn SecondaryStorage>) -> Self {
-        Self {
+    pub fn new(context: AuthContext, storage: Arc<dyn SecondaryStorage>) -> Result<Self> {
+        Ok(Self {
+            sessions: SessionService::new(context.clone())?,
             context,
             verification: VerificationService::new(storage),
-        }
+        })
     }
 
     pub async fn issue(&self, email: &str, ttl: Duration) -> Result<Option<String>> {
@@ -179,6 +182,7 @@ impl PasswordResetService {
             .adapter
             .update_where("account", Query::new().eq("id", account_id), account)
             .await?;
+        self.sessions.revoke_all_for_user(&user_id).await?;
         self.context.after_password_change(&user_id).await?;
         Ok(true)
     }
@@ -209,7 +213,11 @@ fn serialize_error(error: impl std::fmt::Display) -> AuthError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use better_auth_core::adapter::memory::MemorySecondaryStorage;
+    use crate::email_password::{EmailPasswordService, SignUpInput};
+    use better_auth_core::{
+        adapter::memory::{MemoryDb, MemorySecondaryStorage},
+        options::{AuthOptions, BaseUrl},
+    };
 
     #[tokio::test]
     async fn verification_tokens_are_single_use_and_purpose_bound() {
@@ -224,5 +232,53 @@ mod tests {
             Some("user-1".into())
         );
         assert_eq!(service.consume("email", &token).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn password_reset_revokes_existing_sessions() {
+        let adapter = Arc::new(MemoryDb::default());
+        let storage = Arc::new(MemorySecondaryStorage::default());
+        let context = AuthContext::new(
+            AuthOptions {
+                secret: "p".repeat(32),
+                base_url: Some(BaseUrl::Static("https://example.com".into())),
+                ..AuthOptions::default()
+            },
+            adapter,
+            Some(storage.clone()),
+            Vec::new(),
+        )
+        .unwrap();
+        let email = EmailPasswordService::new(context.clone()).unwrap();
+        let result = email
+            .sign_up(
+                SignUpInput {
+                    email: "reset@example.com".into(),
+                    name: "Reset User".into(),
+                    password: "old password".into(),
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        let reset = PasswordResetService::new(context, storage).unwrap();
+        let token = reset
+            .issue("reset@example.com", Duration::from_secs(60))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reset.reset(&token, "new password").await.unwrap());
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", result.session_token).parse().unwrap(),
+        );
+        assert!(email
+            .sessions()
+            .resolve_with_transport(&headers, true, crate::session::SessionTransport::Bearer)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

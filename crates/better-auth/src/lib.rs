@@ -28,7 +28,7 @@ pub mod webauthn;
 
 pub use better_auth_core as core;
 pub use client::{AuthClient, RetryPolicy};
-pub use context::{AuthContext, RequestContext, RequestMetadata};
+pub use context::{AuthContext, AuthContextBuilder, RequestContext, RequestMetadata};
 pub use cookies::{
     session_cookie_from_options, session_cookie_name, AuthCookie, CookieCacheClaims,
     CookieCacheCodec, CookieSameSite, SecretKeySet,
@@ -42,7 +42,10 @@ pub use database::{
 };
 #[cfg(feature = "sqlite")]
 pub use database::{SqliteDbAdapter, SqliteSecondaryStorage};
-pub use email_password::{AuthResult, EmailPasswordService, SignInInput, SignUpInput, User};
+pub use email_password::{
+    AuthResult, CredentialService, EmailPasswordService, ImportCredential, SignInInput,
+    SignUpInput, User,
+};
 pub use hooks::AuthHooks;
 pub use http_oauth::HttpOAuthProvider;
 pub use jwt::JwtService;

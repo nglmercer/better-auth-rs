@@ -90,15 +90,15 @@ impl AuthRouter {
         })
     }
 
-    pub fn with_verification_services(mut self) -> Self {
+    pub fn with_verification_services(mut self) -> Result<Self> {
         if let Some(storage) = self.context.secondary_storage.clone() {
             self.email_verification = Some(EmailVerificationService::new(
                 self.context.clone(),
                 storage.clone(),
             ));
-            self.password_reset = Some(PasswordResetService::new(self.context.clone(), storage));
+            self.password_reset = Some(PasswordResetService::new(self.context.clone(), storage)?);
         }
-        self
+        Ok(self)
     }
 
     pub fn with_sign_in_rate_limit(

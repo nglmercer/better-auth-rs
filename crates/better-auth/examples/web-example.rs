@@ -56,7 +56,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Arc::new(MemorySecondaryStorage::default())),
         Vec::new(),
     )?;
-    let router = Arc::new(AuthRouter::new(context)?.with_verification_services());
+    let router = Arc::new(AuthRouter::new(context)?.with_verification_services()?);
     let app = Router::new()
         .route("/", get(index))
         .route("/styles.css", get(styles))

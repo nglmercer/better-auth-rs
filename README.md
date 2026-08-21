@@ -79,17 +79,37 @@ better-auth = { version = "0.1", features = ["libsql"] }
 ```
 
 ```rust,no_run
-use better_auth::{LibSqlDbAdapter, SessionService};
+use better_auth::{AuthContext, LibSqlDbAdapter};
+use better_auth::core::options::AuthOptions;
+use std::sync::Arc;
 
-let db = LibSqlDbAdapter::local("auth.db").await?;
-let secondary = db.secondary_storage();
-// Build AuthContext with `Arc::new(db)` and `Arc::new(secondary)`.
+let db = Arc::new(LibSqlDbAdapter::local("auth.db").await?);
+let secondary = Arc::new(db.secondary_storage());
+let auth = AuthContext::builder(AuthOptions {
+    secret: "replace-with-a-secret-at-least-32-bytes".into(),
+    ..AuthOptions::default()
+})
+    .database(db.clone())
+    .secondary_storage(Some(secondary.clone()))
+    .build()?;
+
+// Connecting does not change the database. Run this during deployment,
+// before serving requests.
+db.apply_migrations(&auth.migration_plan()).await?;
+secondary.migrate().await?;
 ```
 
 Use `LibSqlDbAdapter::remote("libsql://...", token)` for a Turso database or
 `LibSqlDbAdapter::remote_replica(...)` for an embedded replica. Apply the
-merged `AuthContext::migration_plan()` during deployment, before serving
-requests.
+merged `AuthContext::migration_plan()` and secondary-storage migration during
+deployment, before serving requests. `connect()` is connection-only; a
+development convenience wrapper can be built by an application if it wants
+automatic migrations.
+
+For an existing password database, use `CredentialService::import` with the
+stored hash unchanged. Configure a `CompositePasswordProvider` so the first
+successful login verifies the legacy format and automatically replaces it with
+the primary PHC hash. Password resets revoke all stored sessions for the user.
 
 ## Run and verify
 
