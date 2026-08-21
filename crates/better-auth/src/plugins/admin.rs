@@ -1,6 +1,6 @@
 use super::shared::endpoint;
 use better_auth_core::{
-    adapter::DbAdapter,
+    adapter::{DbAdapter, Query},
     error::{AuthError, Result},
     plugin::{Endpoint, Plugin},
 };
@@ -57,7 +57,7 @@ impl AdminService {
     pub async fn set_role(&self, actor_id: &str, user_id: &str, role: &str) -> Result<()> {
         let actor = self
             .adapter
-            .get("user", actor_id)
+            .find_one("user", Query::new().eq("id", actor_id.to_owned()))
             .await?
             .ok_or(AuthError::Unauthorized)?;
         if !self.guard.allows(
@@ -70,10 +70,13 @@ impl AdminService {
         }
         let mut user = self
             .adapter
-            .get("user", user_id)
+            .find_one("user", Query::new().eq("id", user_id.to_owned()))
             .await?
             .ok_or(AuthError::NotFound)?;
         user["role"] = role.into();
-        self.adapter.update("user", user_id, user).await
+        self.adapter
+            .update_where("user", Query::new().eq("id", user_id.to_owned()), user)
+            .await?;
+        Ok(())
     }
 }

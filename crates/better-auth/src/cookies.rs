@@ -5,7 +5,7 @@ use aes_gcm::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use better_auth_core::{
     error::{AuthError, Result},
-    options::AuthOptions,
+    options::{AuthOptions, CookieOptions},
 };
 use hmac::{Hmac, Mac};
 use http::HeaderMap;
@@ -16,20 +16,13 @@ use std::collections::HashMap;
 
 type HmacSha256 = Hmac<Sha256>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CookieSameSite {
-    Lax,
-    Strict,
-    None,
-}
+pub use better_auth_core::options::CookieSameSite;
 
-impl CookieSameSite {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Lax => "Lax",
-            Self::Strict => "Strict",
-            Self::None => "None",
-        }
+fn same_site_as_str(value: CookieSameSite) -> &'static str {
+    match value {
+        CookieSameSite::Lax => "Lax",
+        CookieSameSite::Strict => "Strict",
+        CookieSameSite::None => "None",
     }
 }
 
@@ -42,31 +35,64 @@ pub struct AuthCookie {
     pub http_only: bool,
     pub same_site: CookieSameSite,
     pub path: String,
+    pub domain: Option<String>,
 }
 
 impl AuthCookie {
+    /// Compatibility constructor using explicit legacy cookie attributes.
     pub fn session(value: impl Into<String>, secure: bool, base_path: &str, max_age: u64) -> Self {
-        let prefix = if secure { "__Secure-" } else { "" };
+        let options = CookieOptions {
+            path: base_path.to_owned(),
+            ..CookieOptions::default()
+        };
+        Self::session_with_options(value, secure, &options, max_age)
+    }
+
+    /// Builds a session cookie from the application cookie policy. `secure` is
+    /// the request transport hint and is overridden by an explicit policy.
+    pub fn session_with_options(
+        value: impl Into<String>,
+        transport_secure: bool,
+        options: &CookieOptions,
+        max_age: u64,
+    ) -> Self {
+        let secure = options.secure.unwrap_or(transport_secure);
         Self {
-            name: format!("{prefix}better-auth.session_token"),
+            name: session_cookie_name(options, transport_secure),
             value: value.into(),
             max_age_seconds: Some(max_age),
             secure,
-            http_only: true,
-            same_site: CookieSameSite::Lax,
-            path: base_path.to_owned(),
+            http_only: options.http_only,
+            same_site: options.same_site,
+            path: options.path.clone(),
+            domain: options.domain.clone(),
         }
     }
 
+    /// Compatibility constructor using explicit legacy cookie attributes.
     pub fn removal(name: impl Into<String>, secure: bool, base_path: &str) -> Self {
+        let options = CookieOptions {
+            path: base_path.to_owned(),
+            ..CookieOptions::default()
+        };
+        Self::removal_with_options(name, secure, &options)
+    }
+
+    pub fn removal_with_options(
+        name: impl Into<String>,
+        transport_secure: bool,
+        options: &CookieOptions,
+    ) -> Self {
+        let secure = options.secure.unwrap_or(transport_secure);
         Self {
             name: name.into(),
             value: String::new(),
             max_age_seconds: Some(0),
             secure,
-            http_only: true,
-            same_site: CookieSameSite::Lax,
-            path: base_path.to_owned(),
+            http_only: options.http_only,
+            same_site: options.same_site,
+            path: options.path.clone(),
+            domain: options.domain.clone(),
         }
     }
 
@@ -76,7 +102,7 @@ impl AuthCookie {
             self.name,
             self.value,
             self.path,
-            self.same_site.as_str()
+            same_site_as_str(self.same_site)
         );
         if let Some(max_age) = self.max_age_seconds {
             header.push_str(&format!("; Max-Age={max_age}"));
@@ -86,6 +112,9 @@ impl AuthCookie {
         }
         if self.secure {
             header.push_str("; Secure");
+        }
+        if let Some(domain) = &self.domain {
+            header.push_str(&format!("; Domain={domain}"));
         }
         header
     }
@@ -405,12 +434,22 @@ pub fn session_cookie_from_options(
     value: impl Into<String>,
     secure: bool,
 ) -> AuthCookie {
-    AuthCookie::session(
+    AuthCookie::session_with_options(
         value,
         secure,
-        &options.base_path,
+        &options.cookie,
         options.session.expires_in_seconds,
     )
+}
+
+/// Resolves the session-cookie name consistently for reading, setting, and
+/// removing the cookie.
+pub fn session_cookie_name(options: &CookieOptions, transport_secure: bool) -> String {
+    let secure = options.secure.unwrap_or(transport_secure);
+    options.name.clone().unwrap_or_else(|| {
+        let prefix = if secure { "__Secure-" } else { "" };
+        format!("{prefix}better-auth.session_token")
+    })
 }
 
 #[cfg(test)]
@@ -453,5 +492,28 @@ mod tests {
             assert_eq!(claims.data["role"], "user");
             assert!(codec.decode(strategy, &token, 200).is_err());
         }
+    }
+
+    #[test]
+    fn session_cookie_uses_independent_application_policy() {
+        let options = AuthOptions {
+            secret: "c".repeat(32),
+            cookie: better_auth_core::options::CookieOptions {
+                name: Some("app_session".into()),
+                path: "/".into(),
+                domain: Some("example.com".into()),
+                secure: Some(true),
+                http_only: false,
+                same_site: CookieSameSite::Strict,
+            },
+            ..AuthOptions::default()
+        };
+        let cookie = session_cookie_from_options(&options, "token", false);
+        assert_eq!(cookie.name, "app_session");
+        assert!(cookie.secure);
+        assert_eq!(cookie.path, "/");
+        assert_eq!(cookie.domain.as_deref(), Some("example.com"));
+        assert!(cookie.to_set_cookie_header().contains("Domain=example.com"));
+        assert!(!cookie.to_set_cookie_header().contains("HttpOnly"));
     }
 }

@@ -1,6 +1,6 @@
-use crate::{context::AuthContext, hash_password_async};
+use crate::context::AuthContext;
 use better_auth_core::{
-    adapter::SecondaryStorage,
+    adapter::{Query, SecondaryStorage},
     error::{AuthError, Result},
 };
 use serde::{Deserialize, Serialize};
@@ -81,7 +81,13 @@ impl EmailVerificationService {
     }
 
     pub async fn issue(&self, user_id: &str, ttl: Duration) -> Result<String> {
-        if self.context.adapter.get("user", user_id).await?.is_none() {
+        if self
+            .context
+            .adapter
+            .find_one("user", Query::new().eq("id", user_id.to_owned()))
+            .await?
+            .is_none()
+        {
             return Err(AuthError::NotFound);
         }
         self.verification
@@ -100,11 +106,14 @@ impl EmailVerificationService {
         let mut user = self
             .context
             .adapter
-            .get("user", &user_id)
+            .find_one("user", Query::new().eq("id", user_id.clone()))
             .await?
             .ok_or(AuthError::NotFound)?;
         user["email_verified"] = true.into();
-        self.context.adapter.update("user", &user_id, user).await?;
+        self.context
+            .adapter
+            .update_where("user", Query::new().eq("id", user_id), user)
+            .await?;
         Ok(true)
     }
 }
@@ -125,10 +134,10 @@ impl PasswordResetService {
 
     pub async fn issue(&self, email: &str, ttl: Duration) -> Result<Option<String>> {
         let email = email.trim().to_ascii_lowercase();
-        let Some((_, user)) = self
+        let Some(user) = self
             .context
             .adapter
-            .get_by_field("user", "email", &serde_json::Value::String(email))
+            .find_one("user", Query::new().eq("email", email))
             .await?
         else {
             return Ok(None);
@@ -152,17 +161,25 @@ impl PasswordResetService {
             return Ok(false);
         };
         let account_id = format!("{user_id}:credential");
-        let Some(mut account) = self.context.adapter.get("account", &account_id).await? else {
+        let Some(mut account) = self
+            .context
+            .adapter
+            .find_one("account", Query::new().eq("id", account_id.clone()))
+            .await?
+        else {
             return Err(AuthError::NotFound);
         };
-        account["password_hash"] =
-            hash_password_async(new_password, &self.context.options.password_hash)
-                .await?
-                .into();
+        account["password_hash"] = self
+            .context
+            .password_provider
+            .hash(new_password)
+            .await?
+            .into();
         self.context
             .adapter
-            .update("account", &account_id, account)
+            .update_where("account", Query::new().eq("id", account_id), account)
             .await?;
+        self.context.after_password_change(&user_id).await?;
         Ok(true)
     }
 }

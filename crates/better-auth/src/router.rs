@@ -5,7 +5,10 @@ use crate::{
     rate_limit::{RateLimitPolicy, RateLimiter},
     verification::{EmailVerificationService, PasswordResetService},
 };
-use better_auth_core::error::{AuthError, Result};
+use better_auth_core::{
+    error::{AuthError, Result},
+    plugin::{EndpointRequest, HookRequest, HookResponse},
+};
 use http::{header, HeaderMap, Method, StatusCode, Uri};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
@@ -109,17 +112,40 @@ impl AuthRouter {
     }
 
     pub async fn handle(&self, request: HttpRequest) -> HttpResponse {
-        match self.handle_result(request).await {
+        let hook_request = HookRequest {
+            method: request.method.clone(),
+            path: request.uri.path().to_owned(),
+            headers: request.headers.clone(),
+            body: serde_json::from_slice(&request.body).ok(),
+        };
+        for hook in self.context.plugins.hooks() {
+            if let Err(error) = hook.on_request(&hook_request).await {
+                return error_response(error);
+            }
+        }
+
+        let mut response = match self.handle_result(request).await {
             Ok(response) => response,
             Err(error) => error_response(error),
+        };
+        let hook_response = HookResponse {
+            status: response.status,
+            headers: response.headers.clone(),
+        };
+        for hook in self.context.plugins.hooks() {
+            if let Err(error) = hook.on_response(&hook_request, &hook_response).await {
+                response = error_response(error);
+                break;
+            }
         }
+        response
     }
 
     async fn handle_result(&self, request: HttpRequest) -> Result<HttpResponse> {
         let request_context = self.context.resolve_request(&request.metadata())?;
         let path = request.uri.path();
         let base_path = self.context.options.base_path.trim_end_matches('/');
-        let endpoint = path
+        let endpoint_path_name = path
             .strip_prefix(base_path)
             .unwrap_or(path)
             .trim_end_matches('/');
@@ -128,7 +154,33 @@ impl AuthRouter {
             .as_ref()
             .is_some_and(|url| url.scheme() == "https");
 
-        match (request.method.clone(), endpoint) {
+        if let Some(endpoint) = self
+            .context
+            .plugins
+            .endpoint_handlers()
+            .iter()
+            .find(|registered| {
+                registered.endpoint.method == request.method
+                    && registered.endpoint.path == endpoint_path_name
+            })
+        {
+            let response = endpoint
+                .handler
+                .handle(EndpointRequest {
+                    method: request.method.clone(),
+                    path: endpoint_path_name.to_owned(),
+                    headers: request.headers.clone(),
+                    body: request.body.clone(),
+                })
+                .await?;
+            return Ok(HttpResponse {
+                status: response.status,
+                headers: response.headers,
+                body: response.body,
+            });
+        }
+
+        match (request.method.clone(), endpoint_path_name) {
             (Method::POST, "/sign-up/email") => {
                 check_csrf(&request_context, &request.metadata())?;
                 let input: SignUpInput = parse_json(&request.body)?;
@@ -210,7 +262,7 @@ impl AuthRouter {
                 let reset = service.reset(&input.token, &input.new_password).await?;
                 Ok(HttpResponse::json(StatusCode::OK, json!({"reset": reset})))
             }
-            _ if endpoint.starts_with('/') => Err(AuthError::NotFound),
+            _ if endpoint_path_name.starts_with('/') => Err(AuthError::NotFound),
             _ => Err(AuthError::NotFound),
         }
     }

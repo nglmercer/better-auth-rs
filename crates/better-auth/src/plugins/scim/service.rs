@@ -10,7 +10,7 @@ use super::{
     ScimBulkOperation, ScimBulkResponse, ScimGroup, ScimGroupMember, ScimTokenRecord,
 };
 use better_auth_core::{
-    adapter::{DbAdapter, DbOperation},
+    adapter::{record_id, DbAdapter, DbOperation, Query},
     error::{AuthError, Result},
 };
 use serde_json::json;
@@ -44,9 +44,8 @@ impl ScimService {
             expires_at,
         };
         self.adapter
-            .insert(
+            .insert_record(
                 "scim_token",
-                &record.id,
                 serde_json::to_value(&record).map_err(serialize_error)?,
             )
             .await?;
@@ -60,9 +59,9 @@ impl ScimService {
         now_seconds: u64,
     ) -> Result<ScimTokenRecord> {
         let hash = hash_secret(token);
-        let Some((_, value)) = self
+        let Some(value) = self
             .adapter
-            .get_by_field("scim_token", "token_hash", &serde_json::Value::String(hash))
+            .find_one("scim_token", Query::new().eq("token_hash", hash))
             .await?
         else {
             return Err(AuthError::Unauthorized);
@@ -86,10 +85,7 @@ impl ScimService {
             "email_verified": true,
             "role": "user",
         });
-        let id = user["id"]
-            .as_str()
-            .ok_or_else(|| AuthError::Adapter("SCIM user has no id".into()))?;
-        self.adapter.insert("user", id, user.clone()).await?;
+        self.adapter.insert_record("user", user.clone()).await?;
         Ok(user)
     }
 
@@ -100,11 +96,17 @@ impl ScimService {
     ) -> Result<serde_json::Value> {
         let mut user = self
             .adapter
-            .get("user", user_id)
+            .find_one("user", Query::new().eq("id", user_id.to_owned()))
             .await?
             .ok_or(AuthError::NotFound)?;
         user = apply_scim_user_patch(user, &patch)?;
-        self.adapter.update("user", user_id, user.clone()).await?;
+        self.adapter
+            .update_where(
+                "user",
+                Query::new().eq("id", user_id.to_owned()),
+                user.clone(),
+            )
+            .await?;
         Ok(user)
     }
 
@@ -115,17 +117,25 @@ impl ScimService {
     pub async fn get_user(&self, user_id: &str) -> Result<serde_json::Value> {
         let user = self
             .adapter
-            .get("user", user_id)
+            .find_one("user", Query::new().eq("id", user_id.to_owned()))
             .await?
             .ok_or(AuthError::NotFound)?;
         Ok(scim_user_resource(user_id, &user))
     }
 
     pub async fn delete_user(&self, user_id: &str) -> Result<()> {
-        if self.adapter.get("user", user_id).await?.is_none() {
+        if self
+            .adapter
+            .find_one("user", Query::new().eq("id", user_id.to_owned()))
+            .await?
+            .is_none()
+        {
             return Err(AuthError::NotFound);
         }
-        self.adapter.delete("user", user_id).await
+        self.adapter
+            .delete_where("user", Query::new().eq("id", user_id.to_owned()))
+            .await?;
+        Ok(())
     }
 
     pub async fn create_group(
@@ -145,9 +155,8 @@ impl ScimService {
             organization_id: organization_id.into(),
         };
         self.adapter
-            .insert(
+            .insert_record(
                 "scim_group",
-                &group.id,
                 serde_json::to_value(&group).map_err(serialize_error)?,
             )
             .await?;
@@ -172,10 +181,10 @@ impl ScimService {
         }
         let groups = self
             .adapter
-            .list("scim_group")
+            .find_many("scim_group", Query::new())
             .await?
             .into_iter()
-            .filter_map(|(_, value)| serde_json::from_value::<ScimGroup>(value).ok())
+            .filter_map(|value| serde_json::from_value::<ScimGroup>(value).ok())
             .filter(|group| group.organization_id == organization_id)
             .collect::<Vec<_>>();
         let total = groups.len();
@@ -218,9 +227,9 @@ impl ScimService {
             group.display_name = value.trim().into();
         }
         self.adapter
-            .update(
+            .update_where(
                 "scim_group",
-                group_id,
+                Query::new().eq("id", group_id.to_owned()),
                 serde_json::to_value(&group).map_err(serialize_error)?,
             )
             .await?;
@@ -232,29 +241,27 @@ impl ScimService {
 
     pub async fn delete_group(&self, group_id: &str) -> Result<()> {
         self.load_group(group_id).await?;
-        let operations = self
-            .adapter
-            .list("scim_group_member")
-            .await?
-            .into_iter()
-            .filter(|(_, value)| {
-                value.get("group_id").and_then(serde_json::Value::as_str) == Some(group_id)
-            })
-            .map(|(id, _)| DbOperation::Delete {
+        let operations = vec![
+            DbOperation::DeleteWhere {
                 table: "scim_group_member".into(),
-                id,
-            })
-            .chain(std::iter::once(DbOperation::Delete {
+                query: Query::new().eq("group_id", group_id.to_owned()),
+            },
+            DbOperation::DeleteWhere {
                 table: "scim_group".into(),
-                id: group_id.into(),
-            }))
-            .collect();
+                query: Query::new().eq("id", group_id.to_owned()),
+            },
+        ];
         self.adapter.transaction(operations).await
     }
 
     pub async fn add_group_member(&self, group_id: &str, user_id: &str) -> Result<()> {
         self.load_group(group_id).await?;
-        if self.adapter.get("user", user_id).await?.is_none() {
+        if self
+            .adapter
+            .find_one("user", Query::new().eq("id", user_id.to_owned()))
+            .await?
+            .is_none()
+        {
             return Err(AuthError::NotFound);
         }
         let member = ScimGroupMember {
@@ -262,22 +269,26 @@ impl ScimService {
             user_id: user_id.into(),
         };
         self.adapter
-            .insert(
+            .insert_record(
                 "scim_group_member",
-                &scim_group_member_id(group_id, user_id),
-                serde_json::to_value(member).map_err(serialize_error)?,
+                with_id(
+                    serde_json::to_value(member).map_err(serialize_error)?,
+                    scim_group_member_id(group_id, user_id),
+                )?,
             )
-            .await
+            .await?;
+        Ok(())
     }
 
     pub async fn remove_group_member(&self, group_id: &str, user_id: &str) -> Result<()> {
         self.load_group(group_id).await?;
         self.adapter
-            .delete(
+            .delete_where(
                 "scim_group_member",
-                &scim_group_member_id(group_id, user_id),
+                Query::new().eq("id", scim_group_member_id(group_id, user_id)),
             )
-            .await
+            .await?;
+        Ok(())
     }
 
     pub async fn list_users_filtered(
@@ -306,11 +317,12 @@ impl ScimService {
         let predicate = ScimFilter::parse(filter)?;
         let mut records = self
             .adapter
-            .list("user")
+            .find_many("user", Query::new())
             .await?
             .into_iter()
-            .filter(|(_, user)| predicate.matches(user))
-            .collect::<Vec<_>>();
+            .filter(|user| predicate.matches(user))
+            .map(|user| Ok((record_id(&user)?, user)))
+            .collect::<Result<Vec<_>>>()?;
         if let Some(sort_by) = sort_by {
             let sort_by = normalize_scim_attribute(sort_by)?;
             records.sort_by(|left, right| {
@@ -367,9 +379,8 @@ impl ScimService {
                     let id = Uuid::new_v4().to_string();
                     let mut user = user;
                     user["id"] = id.clone().into();
-                    planned.push(DbOperation::Insert {
+                    planned.push(DbOperation::InsertRecord {
                         table: "user".into(),
-                        id: id.clone(),
                         record: user.clone(),
                     });
                     Ok((201, Some(scim_user_resource(&id, &user))))
@@ -377,7 +388,7 @@ impl ScimService {
                 ("PUT", false) | ("PATCH", false) => {
                     let existing = self
                         .adapter
-                        .get("user", id)
+                        .find_one("user", Query::new().eq("id", id.to_owned()))
                         .await?
                         .ok_or(AuthError::NotFound)?;
                     let data = operation.data.clone().ok_or_else(|| {
@@ -390,20 +401,25 @@ impl ScimService {
                     };
                     let mut updated = updated;
                     updated["id"] = id.into();
-                    planned.push(DbOperation::Update {
+                    planned.push(DbOperation::UpdateWhere {
                         table: "user".into(),
-                        id: id.into(),
-                        record: updated.clone(),
+                        query: Query::new().eq("id", id.to_owned()),
+                        changes: updated.clone(),
                     });
                     Ok((200, Some(scim_user_resource(id, &updated))))
                 }
                 ("DELETE", false) => {
-                    if self.adapter.get("user", id).await?.is_none() {
+                    if self
+                        .adapter
+                        .find_one("user", Query::new().eq("id", id.to_owned()))
+                        .await?
+                        .is_none()
+                    {
                         Err(AuthError::NotFound)
                     } else {
-                        planned.push(DbOperation::Delete {
+                        planned.push(DbOperation::DeleteWhere {
                             table: "user".into(),
-                            id: id.into(),
+                            query: Query::new().eq("id", id.to_owned()),
                         });
                         Ok((204, None))
                     }
@@ -452,7 +468,7 @@ impl ScimService {
     async fn load_group(&self, group_id: &str) -> Result<ScimGroup> {
         let value = self
             .adapter
-            .get("scim_group", group_id)
+            .find_one("scim_group", Query::new().eq("id", group_id.to_owned()))
             .await?
             .ok_or(AuthError::NotFound)?;
         serde_json::from_value(value).map_err(serialize_error)
@@ -461,11 +477,13 @@ impl ScimService {
     async fn group_resource(&self, group: &ScimGroup) -> Result<serde_json::Value> {
         let members = self
             .adapter
-            .list("scim_group_member")
+            .find_many(
+                "scim_group_member",
+                Query::new().eq("group_id", group.id.clone()),
+            )
             .await?
             .into_iter()
-            .filter_map(|(_, value)| serde_json::from_value::<ScimGroupMember>(value).ok())
-            .filter(|member| member.group_id == group.id)
+            .filter_map(|value| serde_json::from_value::<ScimGroupMember>(value).ok())
             .map(|member| json!({"value": member.user_id}))
             .collect::<Vec<_>>();
         Ok(json!({
@@ -487,19 +505,10 @@ impl ScimService {
                 "SCIM group members must be an array".into(),
             ));
         };
-        let mut operations = self
-            .adapter
-            .list("scim_group_member")
-            .await?
-            .into_iter()
-            .filter(|(_, value)| {
-                value.get("group_id").and_then(serde_json::Value::as_str) == Some(group_id)
-            })
-            .map(|(id, _)| DbOperation::Delete {
-                table: "scim_group_member".into(),
-                id,
-            })
-            .collect::<Vec<_>>();
+        let mut operations = vec![DbOperation::DeleteWhere {
+            table: "scim_group_member".into(),
+            query: Query::new().eq("group_id", group_id.to_owned()),
+        }];
         for member in members {
             let user_id = member
                 .get("value")
@@ -508,19 +517,34 @@ impl ScimService {
                 .ok_or_else(|| {
                     AuthError::InvalidRequest("SCIM group member requires value".into())
                 })?;
-            if self.adapter.get("user", user_id).await?.is_none() {
+            if self
+                .adapter
+                .find_one("user", Query::new().eq("id", user_id.to_owned()))
+                .await?
+                .is_none()
+            {
                 return Err(AuthError::NotFound);
             }
             let member = ScimGroupMember {
                 group_id: group_id.into(),
                 user_id: user_id.into(),
             };
-            operations.push(DbOperation::Insert {
+            operations.push(DbOperation::InsertRecord {
                 table: "scim_group_member".into(),
-                id: scim_group_member_id(group_id, user_id),
-                record: serde_json::to_value(member).map_err(serialize_error)?,
+                record: with_id(
+                    serde_json::to_value(member).map_err(serialize_error)?,
+                    scim_group_member_id(group_id, user_id),
+                )?,
             });
         }
         self.adapter.transaction(operations).await
     }
+}
+
+fn with_id(mut record: serde_json::Value, id: String) -> Result<serde_json::Value> {
+    record
+        .as_object_mut()
+        .ok_or_else(|| AuthError::Adapter("SCIM record is not an object".into()))?
+        .insert("id".into(), id.into());
+    Ok(record)
 }

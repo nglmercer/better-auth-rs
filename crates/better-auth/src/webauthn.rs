@@ -1,5 +1,5 @@
 use better_auth_core::{
-    adapter::{DbAdapter, SecondaryStorage, StorageValue},
+    adapter::{DbAdapter, Query, SecondaryStorage, StorageValue},
     error::{AuthError, Result},
 };
 use serde::Serialize;
@@ -255,11 +255,10 @@ impl DbPasskeyStore {
 
     pub async fn load_for_user(&self, user_id: &str) -> Result<Vec<Passkey>> {
         self.adapter
-            .list("passkey")
+            .find_many("passkey", Query::new().eq("user_id", user_id.to_owned()))
             .await?
             .into_iter()
-            .filter(|(_, value)| value.get("user_id").and_then(Value::as_str) == Some(user_id))
-            .map(|(_, value)| {
+            .map(|value| {
                 serde_json::from_value(
                     value
                         .get("credential")
@@ -278,16 +277,29 @@ impl DbPasskeyStore {
             "credential_id": credential_id.clone(),
             "credential": credential,
         });
-        if let Some((id, _)) = self
+        if self
             .adapter
-            .get_by_field("passkey", "credential_id", &Value::String(credential_id))
+            .find_one(
+                "passkey",
+                Query::new().eq("credential_id", credential_id.clone()),
+            )
             .await?
+            .is_some()
         {
-            self.adapter.update("passkey", &id, record).await
-        } else {
             self.adapter
-                .insert("passkey", &Uuid::new_v4().to_string(), record)
-                .await
+                .update_where(
+                    "passkey",
+                    Query::new().eq("credential_id", credential_id),
+                    record,
+                )
+                .await?;
+            Ok(())
+        } else {
+            let id = Uuid::new_v4().to_string();
+            let mut record = record;
+            record["id"] = id.into();
+            self.adapter.insert_record("passkey", record).await?;
+            Ok(())
         }
     }
 }

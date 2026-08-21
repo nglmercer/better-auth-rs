@@ -11,9 +11,18 @@ pub mod options;
 pub mod plugin;
 pub mod schema;
 
-pub use adapter::{DbAdapter, DbOperation, SecondaryStorage, StorageValue};
+pub use adapter::{
+    record_id, DbAdapter, DbOperation, Filter, FilterOp, OrderBy, OrderDirection, Query,
+    SecondaryStorage, StorageValue,
+};
 pub use error::{AuthError, Result};
 pub use migration::{MigrationExecutor, MigrationPlan, MigrationStep, SqlDialect};
-pub use options::{AuthOptions, BaseUrl, CookieCacheStrategy, PasswordHashOptions, SessionOptions};
-pub use plugin::{Endpoint, Hook, Plugin, PluginRegistry};
-pub use schema::{SchemaExtension, TableSchema};
+pub use options::{
+    AuthOptions, BaseUrl, CookieCacheOptions, CookieCacheStrategy, CookieOptions, CookieSameSite,
+    PasswordHashOptions, SessionOptions,
+};
+pub use plugin::{
+    Endpoint, EndpointHandler, EndpointRequest, EndpointResponse, ExecutableEndpoint, Hook, Plugin,
+    PluginRegistry,
+};
+pub use schema::{FieldSchema, FieldType, SchemaExtension, TableSchema};

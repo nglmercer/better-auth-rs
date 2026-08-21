@@ -7,9 +7,11 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["axum"]
+default = ["axum", "sqlite"]
 axum = ["dep:axum"]
+sqlite = ["dep:rusqlite"]
 sqlx = ["dep:sqlx"]
+libsql = ["dep:libsql", "dep:secrecy"]
 saml = ["dep:saml-rs"]
 
 [dependencies]
@@ -20,14 +22,16 @@ base64.workspace = true
 better-auth-core = { path = "../better-auth-core" }
 data-encoding.workspace = true
 reqwest.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 saml-rs = { workspace = true, optional = true }
 tokio.workspace = true
 hmac.workspace = true
 http.workspace = true
 jsonwebtoken.workspace = true
+libsql = { workspace = true, optional = true }
 password-hash.workspace = true
+secrecy = { workspace = true, optional = true }
 sha1.workspace = true
 scrypt.workspace = true
 serde.workspace = true

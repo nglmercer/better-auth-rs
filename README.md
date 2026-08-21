@@ -20,7 +20,8 @@ The workspace now covers all roadmap phases at a framework-neutral baseline:
 - configuration validation and the no-durable-store cookie-cache defaults;
 - static, request-derived, and allowed-host dynamic base URLs;
 - relational and secondary-storage adapter contracts, including TTL and atomic
-  increment semantics;
+  increment semantics, database-side filtering, ordering, pagination, and
+  transaction operations;
 - core schema plus conflict-safe plugin schema merging;
 - plugin endpoints, hooks, and error-code aggregation;
 - versioned HMAC envelopes for direct secret-version lookup during rotation;
@@ -50,17 +51,45 @@ The workspace now covers all roadmap phases at a framework-neutral baseline:
   MockEngine tests.
 - SQLite relational and secondary-storage adapters, optional SQLx
   Postgres/MySQL adapters with dialect-aware placeholders, and migration
-  execution.
+  execution. The `sqlite` feature is enabled by default; it can be disabled
+  for a libSQL-only build;
+- a feature-gated libSQL adapter for local databases, remote Turso connections,
+  and embedded replicas;
+- a standalone `SessionService`/`AuthPrincipal` API with cookie or opt-in
+  bearer transport, configurable cookie policy, pluggable password providers
+  with automatic rehashing, and executable plugin endpoints/lifecycle hooks.
 
 The remaining work is deployment hardening: live MySQL conformance, signed
 SAML and browser-level WebAuthn fixtures, scheduled OIDC JWKS refresh, browser
-client examples, and independent security review. The traits remain small so
-these integrations do not make the core depend on one database or web
-framework.
+client examples, and independent security review. The contracts remain
+database- and framework-neutral so these integrations do not make the core
+depend on one database or web framework.
 
 For TypeScript consumers, use the fetch-native client package first. WASM is
 best reserved for optional Rust-owned pure computation or cryptography in the
 browser; NAPI should be introduced later only for Node.js backend bindings.
+
+### LibSQL/Turso
+
+Enable the adapter explicitly and choose local or remote storage without
+changing auth services:
+
+```toml
+better-auth = { version = "0.1", features = ["libsql"] }
+```
+
+```rust,no_run
+use better_auth::{LibSqlDbAdapter, SessionService};
+
+let db = LibSqlDbAdapter::local("auth.db").await?;
+let secondary = db.secondary_storage();
+// Build AuthContext with `Arc::new(db)` and `Arc::new(secondary)`.
+```
+
+Use `LibSqlDbAdapter::remote("libsql://...", token)` for a Turso database or
+`LibSqlDbAdapter::remote_replica(...)` for an embedded replica. Apply the
+merged `AuthContext::migration_plan()` during deployment, before serving
+requests.
 
 ## Run and verify
 

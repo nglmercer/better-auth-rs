@@ -1,13 +1,15 @@
 use crate::{
     context::AuthContext,
     cookies::{AuthCookie, CookieCacheCodec, SecretKeySet},
-    email_password::{AuthResult, EmailPasswordService, User},
+    email_password::{AuthResult, User},
+    session::{AuthPrincipal, SessionService},
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use better_auth_core::{
-    adapter::{DbOperation, SecondaryStorage, StorageValue},
+    adapter::{DbOperation, Query, SecondaryStorage, StorageValue},
     error::{AuthError, Result},
+    options::CookieOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -102,7 +104,7 @@ pub struct OAuthStateManager {
     storage: Option<Arc<dyn SecondaryStorage>>,
     keys: SecretKeySet,
     mode: OAuthStateStorage,
-    base_path: String,
+    cookie: CookieOptions,
 }
 
 impl OAuthStateManager {
@@ -111,6 +113,21 @@ impl OAuthStateManager {
         keys: SecretKeySet,
         mode: OAuthStateStorage,
         base_path: impl Into<String>,
+    ) -> Result<Self> {
+        let base_path = base_path.into();
+        let cookie = CookieOptions {
+            path: base_path.clone(),
+            ..CookieOptions::default()
+        };
+        Self::new_with_cookie_options(storage, keys, mode, base_path, cookie)
+    }
+
+    pub fn new_with_cookie_options(
+        storage: Option<Arc<dyn SecondaryStorage>>,
+        keys: SecretKeySet,
+        mode: OAuthStateStorage,
+        _base_path: impl Into<String>,
+        cookie: CookieOptions,
     ) -> Result<Self> {
         if mode == OAuthStateStorage::Verification && storage.is_none() {
             return Err(AuthError::InvalidConfiguration(
@@ -121,7 +138,7 @@ impl OAuthStateManager {
             storage,
             keys,
             mode,
-            base_path: base_path.into(),
+            cookie,
         })
     }
 
@@ -183,10 +200,11 @@ impl OAuthStateManager {
                     name: "better-auth.oauth_state".into(),
                     value: signed,
                     max_age_seconds: Some(provider.state_ttl.as_secs()),
-                    secure: secure_cookie,
-                    http_only: true,
-                    same_site: crate::cookies::CookieSameSite::Lax,
-                    path: self.base_path.clone(),
+                    secure: self.cookie.secure.unwrap_or(secure_cookie),
+                    http_only: self.cookie.http_only,
+                    same_site: self.cookie.same_site,
+                    path: self.cookie.path.clone(),
+                    domain: self.cookie.domain.clone(),
                 })
             }
         };
@@ -278,11 +296,12 @@ pub struct OAuthService {
 impl OAuthService {
     pub fn new(context: AuthContext, mode: OAuthStateStorage) -> Result<Self> {
         let keys = SecretKeySet::from_options(&context.options)?;
-        let state = OAuthStateManager::new(
+        let state = OAuthStateManager::new_with_cookie_options(
             context.secondary_storage.clone(),
             keys.clone(),
             mode,
             context.options.base_path.clone(),
+            context.options.cookie.clone(),
         )?;
         Ok(Self {
             context,
@@ -327,9 +346,16 @@ impl OAuthService {
         let user = self
             .find_or_create_user(provider.id(), &profile, &tokens)
             .await?;
-        EmailPasswordService::new(self.context.clone())?
-            .create_session_for_user(user, secure_cookie)
-            .await
+        let result = SessionService::new(self.context.clone())?
+            .create(user, secure_cookie)
+            .await?;
+        self.context
+            .after_sign_in(&AuthPrincipal {
+                user: result.user.clone(),
+                session: result.session.clone(),
+            })
+            .await?;
+        Ok(result)
     }
 
     async fn find_or_create_user(
@@ -339,7 +365,12 @@ impl OAuthService {
         tokens: &OAuthTokens,
     ) -> Result<User> {
         let account_id = format!("oauth:{provider_id}:{}", profile.provider_account_id);
-        if let Some(account) = self.context.adapter.get(ACCOUNT_TABLE, &account_id).await? {
+        if let Some(account) = self
+            .context
+            .adapter
+            .find_one(ACCOUNT_TABLE, Query::new().eq("id", account_id.clone()))
+            .await?
+        {
             let user_id = account
                 .get("user_id")
                 .and_then(Value::as_str)
@@ -347,7 +378,7 @@ impl OAuthService {
             let value = self
                 .context
                 .adapter
-                .get(USER_TABLE, user_id)
+                .find_one(USER_TABLE, Query::new().eq("id", user_id.to_owned()))
                 .await?
                 .ok_or(AuthError::Unauthorized)?;
             return serde_json::from_value(value).map_err(serialize_error);
@@ -360,10 +391,10 @@ impl OAuthService {
             })?
             .trim()
             .to_ascii_lowercase();
-        let (user, new_user) = if let Some((_, value)) = self
+        let (user, new_user) = if let Some(value) = self
             .context
             .adapter
-            .get_by_field(USER_TABLE, "email", &Value::String(email.clone()))
+            .find_one(USER_TABLE, Query::new().eq("email", email.clone()))
             .await?
         {
             (
@@ -371,26 +402,27 @@ impl OAuthService {
                 None,
             )
         } else {
-            let user = User {
+            let mut user = User {
                 id: Uuid::new_v4().to_string(),
                 email,
                 name: profile.name.clone().unwrap_or_else(|| "User".into()),
                 email_verified: profile.email_verified,
                 image: profile.image.clone(),
+                additional_fields: serde_json::Map::new(),
             };
+            self.context.before_user_create(&mut user).await?;
             (user.clone(), Some(user))
         };
+        let is_new_user = new_user.is_some();
         let mut operations = Vec::with_capacity(2);
         if let Some(new_user) = new_user {
-            operations.push(DbOperation::Insert {
+            operations.push(DbOperation::InsertRecord {
                 table: USER_TABLE.into(),
-                id: new_user.id.clone(),
                 record: serde_json::to_value(new_user).map_err(serialize_error)?,
             });
         }
-        operations.push(DbOperation::Insert {
+        operations.push(DbOperation::InsertRecord {
             table: ACCOUNT_TABLE.into(),
-            id: account_id.clone(),
             record: json!({
                 "id": account_id,
                 "user_id": user.id,
@@ -400,6 +432,9 @@ impl OAuthService {
             }),
         });
         self.context.adapter.transaction(operations).await?;
+        if is_new_user {
+            self.context.after_user_create(&user).await?;
+        }
         Ok(user)
     }
 }

@@ -1,12 +1,19 @@
 use super::common::{json_error, now_seconds};
 use better_auth_core::{
-    adapter::{DbAdapter, DbOperation, SecondaryStorage, StorageValue},
+    adapter::{
+        record_id, DbAdapter, DbOperation, FilterOp, OrderDirection, Query as CoreQuery,
+        SecondaryStorage, StorageValue,
+    },
     error::{AuthError, Result},
     migration::{MigrationExecutor, MigrationPlan, SqlDialect},
+    schema::{core_schema, FieldType, SchemaExtension},
 };
-use serde_json::Value;
-use sqlx::{Executor, Row};
-use std::time::Duration;
+use serde_json::{Map, Number, Value};
+use sqlx::{any::AnyArguments, Executor, Row, ValueRef};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 #[cfg(feature = "sqlx")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +27,7 @@ pub enum SqlxBackend {
 pub struct SqlxDbAdapter {
     pool: sqlx::AnyPool,
     backend: SqlxBackend,
+    schema: Arc<Mutex<SchemaExtension>>,
 }
 
 #[cfg(feature = "sqlx")]
@@ -28,13 +36,18 @@ impl SqlxDbAdapter {
         validate_sqlx_url(url, backend)?;
         sqlx::any::install_default_drivers();
         let pool = sqlx::AnyPool::connect(url).await.map_err(sqlx_error)?;
-        let adapter = Self { pool, backend };
-        adapter
-            .pool
-            .execute(sqlx_records_ddl(backend))
-            .await
-            .map_err(sqlx_error)?;
-        Ok(adapter)
+        let schema = core_schema();
+        for statement in MigrationPlan::from_schema(&schema).sql(match backend {
+            SqlxBackend::Postgres => SqlDialect::Postgres,
+            SqlxBackend::MySql => SqlDialect::MySql,
+        }) {
+            pool.execute(statement.as_str()).await.map_err(sqlx_error)?;
+        }
+        Ok(Self {
+            pool,
+            backend,
+            schema: Arc::new(Mutex::new(schema)),
+        })
     }
 
     pub async fn postgres(url: &str) -> Result<Self> {
@@ -47,6 +60,13 @@ impl SqlxDbAdapter {
 
     pub async fn apply_migrations(&self, plan: &MigrationPlan, dialect: SqlDialect) -> Result<()> {
         plan.apply(self, dialect).await
+    }
+
+    pub fn register_schema(&self, schema: &SchemaExtension) -> Result<()> {
+        self.schema
+            .lock()
+            .map_err(|_| sqlx_lock_error())?
+            .merge(schema)
     }
 }
 
@@ -63,153 +83,139 @@ impl MigrationExecutor for SqlxDbAdapter {
         self.pool.execute(statement).await.map_err(sqlx_error)?;
         Ok(())
     }
+
+    async fn column_exists(&self, table: &str, column: &str) -> Result<Option<bool>> {
+        let statement = match self.backend {
+            SqlxBackend::Postgres => {
+                "SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ? AND column_name = ? LIMIT 1"
+            }
+            SqlxBackend::MySql => {
+                "SELECT 1 FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ? LIMIT 1"
+            }
+        };
+        let statement = sqlx_bind_sql(self.backend, statement);
+        let row = sqlx::query(&statement)
+            .bind(table)
+            .bind(column)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(sqlx_error)?;
+        Ok(Some(row.is_some()))
+    }
 }
 
 #[cfg(feature = "sqlx")]
 #[async_trait::async_trait]
 impl DbAdapter for SqlxDbAdapter {
-    async fn get(&self, table: &str, id: &str) -> Result<Option<Value>> {
-        let row = sqlx::query(&sqlx_bind_sql(
-            self.backend,
-            "SELECT record_json FROM _better_auth_records WHERE table_name = ? AND record_id = ?",
-        ))
-        .bind(table)
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(sqlx_error)?;
-        row.map(|row| {
-            serde_json::from_str(
-                row.try_get::<String, _>("record_json")
-                    .map_err(sqlx_error)?
-                    .as_str(),
-            )
-            .map_err(json_error)
-        })
-        .transpose()
+    fn register_schema(&self, schema: &SchemaExtension) -> Result<()> {
+        Self::register_schema(self, schema)
     }
 
-    async fn insert(&self, table: &str, id: &str, record: Value) -> Result<()> {
-        sqlx::query(&sqlx_bind_sql(
-            self.backend,
-            "INSERT INTO _better_auth_records(table_name, record_id, record_json) VALUES (?, ?, ?)",
-        ))
-        .bind(table)
-        .bind(id)
-        .bind(record.to_string())
-        .execute(&self.pool)
-        .await
-        .map_err(sqlx_error)?;
-        Ok(())
+    async fn find_one(&self, table: &str, mut query: CoreQuery) -> Result<Option<Value>> {
+        query.limit = Some(query.limit.unwrap_or(1).min(1));
+        Ok(self.find_many(table, query).await?.into_iter().next())
     }
 
-    async fn update(&self, table: &str, id: &str, record: Value) -> Result<()> {
-        let result = sqlx::query(&sqlx_bind_sql(
-            self.backend,
-            "UPDATE _better_auth_records SET record_json = ? WHERE table_name = ? AND record_id = ?",
-        ))
-        .bind(record.to_string())
-        .bind(table)
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map_err(sqlx_error)?;
-        if result.rows_affected() == 0 {
-            return Err(AuthError::NotFound);
+    async fn find_many(&self, table: &str, query: CoreQuery) -> Result<Vec<Value>> {
+        let (where_sql, mut values) = where_clause(&query, self.backend)?;
+        let mut sql = format!("SELECT * FROM {}", quote_identifier(table, self.backend)?);
+        sql.push_str(&where_sql);
+        sql.push_str(&order_clause(&query, self.backend)?);
+        append_pagination(&mut sql, &query, &mut values);
+        let sql = sqlx_bind_sql(self.backend, &sql);
+        let rows = bind_values(sqlx::query(&sql), values)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(sqlx_error)?;
+        let schema = self.schema.lock().map_err(|_| sqlx_lock_error())?;
+        rows.iter()
+            .map(|row| row_to_json(row, table, &schema))
+            .collect()
+    }
+
+    async fn insert_record(&self, table: &str, record: Value) -> Result<Value> {
+        let object = record_object(&record)?;
+        let (sql, values) = insert_statement(table, object, self.backend)?;
+        bind_values(sqlx::query(&sqlx_bind_sql(self.backend, &sql)), values)
+            .execute(&self.pool)
+            .await
+            .map_err(sqlx_error)?;
+        Ok(record)
+    }
+
+    async fn update_where(&self, table: &str, query: CoreQuery, changes: Value) -> Result<u64> {
+        let object = record_object(&changes)?;
+        if object.is_empty() {
+            return Ok(0);
         }
-        Ok(())
-    }
-
-    async fn delete(&self, table: &str, id: &str) -> Result<()> {
-        sqlx::query(&sqlx_bind_sql(
-            self.backend,
-            "DELETE FROM _better_auth_records WHERE table_name = ? AND record_id = ?",
-        ))
-        .bind(table)
-        .bind(id)
+        let (where_sql, mut values) = where_clause(&query, self.backend)?;
+        let mut fields = object.keys().cloned().collect::<Vec<_>>();
+        fields.sort();
+        let assignments = fields
+            .iter()
+            .map(|field| {
+                format!(
+                    "{} = ?",
+                    quote_identifier(field, self.backend).expect("validated identifier")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut change_values = fields
+            .iter()
+            .map(|field| {
+                object
+                    .get(field)
+                    .ok_or_else(|| AuthError::Adapter("change field disappeared".into()))
+                    .and_then(json_value_for_sqlx)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        change_values.append(&mut values);
+        let sql = format!(
+            "UPDATE {} SET {assignments}{where_sql}",
+            quote_identifier(table, self.backend)?
+        );
+        let result = bind_values(
+            sqlx::query(&sqlx_bind_sql(self.backend, &sql)),
+            change_values,
+        )
         .execute(&self.pool)
         .await
         .map_err(sqlx_error)?;
-        Ok(())
+        Ok(result.rows_affected())
     }
 
-    async fn get_by_field(
-        &self,
-        table: &str,
-        field: &str,
-        value: &Value,
-    ) -> Result<Option<(String, Value)>> {
-        let records = self.list(table).await?;
-        Ok(records
-            .into_iter()
-            .find(|(_, record)| record.get(field) == Some(value)))
+    async fn delete_where(&self, table: &str, query: CoreQuery) -> Result<u64> {
+        let (where_sql, values) = where_clause(&query, self.backend)?;
+        let sql = format!(
+            "DELETE FROM {}{where_sql}",
+            quote_identifier(table, self.backend)?
+        );
+        let result = bind_values(sqlx::query(&sqlx_bind_sql(self.backend, &sql)), values)
+            .execute(&self.pool)
+            .await
+            .map_err(sqlx_error)?;
+        Ok(result.rows_affected())
     }
 
     async fn list(&self, table: &str) -> Result<Vec<(String, Value)>> {
-        let rows = sqlx::query(&sqlx_bind_sql(
-            self.backend,
-            "SELECT record_id, record_json FROM _better_auth_records WHERE table_name = ? ORDER BY record_id",
-        ))
-        .bind(table)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(sqlx_error)?;
-        rows.into_iter()
-            .map(|row| {
-                let id = row.try_get::<String, _>("record_id").map_err(sqlx_error)?;
-                let record = serde_json::from_str(
-                    row.try_get::<String, _>("record_json")
-                        .map_err(sqlx_error)?
-                        .as_str(),
-                )
-                .map_err(json_error)?;
-                Ok((id, record))
-            })
+        let records = self.find_many(table, CoreQuery::new()).await?;
+        records
+            .into_iter()
+            .map(|record| Ok((record_id(&record)?, record)))
             .collect()
     }
 
     async fn transaction(&self, operations: Vec<DbOperation>) -> Result<()> {
         let mut transaction = self.pool.begin().await.map_err(sqlx_error)?;
         for operation in operations {
-            match operation {
-                DbOperation::Insert { table, id, record } => {
-                    sqlx::query(&sqlx_bind_sql(
-                        self.backend,
-                        "INSERT INTO _better_auth_records(table_name, record_id, record_json) VALUES (?, ?, ?)",
-                    ))
-                    .bind(table)
-                    .bind(id)
-                    .bind(record.to_string())
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(sqlx_error)?;
-                }
-                DbOperation::Update { table, id, record } => {
-                    let result = sqlx::query(&sqlx_bind_sql(
-                        self.backend,
-                        "UPDATE _better_auth_records SET record_json = ? WHERE table_name = ? AND record_id = ?",
-                    ))
-                    .bind(record.to_string())
-                    .bind(table)
-                    .bind(id)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(sqlx_error)?;
-                    if result.rows_affected() == 0 {
-                        return Err(AuthError::NotFound);
-                    }
-                }
-                DbOperation::Delete { table, id } => {
-                    sqlx::query(&sqlx_bind_sql(
-                        self.backend,
-                        "DELETE FROM _better_auth_records WHERE table_name = ? AND record_id = ?",
-                    ))
-                    .bind(table)
-                    .bind(id)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(sqlx_error)?;
-                }
+            let (sql, values, require_change) = operation_statement(operation, self.backend)?;
+            let result = bind_values(sqlx::query(&sqlx_bind_sql(self.backend, &sql)), values)
+                .execute(&mut *transaction)
+                .await
+                .map_err(sqlx_error)?;
+            if require_change && result.rows_affected() == 0 {
+                return Err(AuthError::NotFound);
             }
         }
         transaction.commit().await.map_err(sqlx_error)
@@ -265,21 +271,27 @@ impl SecondaryStorage for SqlxSecondaryStorage {
             .expires_in
             .map(|ttl| now_seconds() as i64 + ttl.as_secs() as i64);
         let mut transaction = self.pool.begin().await.map_err(sqlx_error)?;
-        sqlx::query(&sqlx_bind_sql(
-            self.backend,
-            "DELETE FROM _better_auth_kv WHERE storage_key = ?",
-        ))
-        .bind(key)
+        bind_values(
+            sqlx::query(&sqlx_bind_sql(
+                self.backend,
+                "DELETE FROM _better_auth_kv WHERE storage_key = ?",
+            )),
+            vec![Value::String(key.to_owned())],
+        )
         .execute(&mut *transaction)
         .await
         .map_err(sqlx_error)?;
-        sqlx::query(&sqlx_bind_sql(
-            self.backend,
-            "INSERT INTO _better_auth_kv(storage_key, value_json, expires_at) VALUES (?, ?, ?)",
-        ))
-        .bind(key)
-        .bind(value.value.to_string())
-        .bind(expires_at)
+        bind_values(
+            sqlx::query(&sqlx_bind_sql(
+                self.backend,
+                "INSERT INTO _better_auth_kv(storage_key, value_json, expires_at) VALUES (?, ?, ?)",
+            )),
+            vec![
+                Value::String(key.to_owned()),
+                Value::String(value.value.to_string()),
+                expires_at.map(Value::from).unwrap_or(Value::Null),
+            ],
+        )
         .execute(&mut *transaction)
         .await
         .map_err(sqlx_error)?;
@@ -287,11 +299,13 @@ impl SecondaryStorage for SqlxSecondaryStorage {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        sqlx::query(&sqlx_bind_sql(
-            self.backend,
-            "DELETE FROM _better_auth_kv WHERE storage_key = ?",
-        ))
-        .bind(key)
+        bind_values(
+            sqlx::query(&sqlx_bind_sql(
+                self.backend,
+                "DELETE FROM _better_auth_kv WHERE storage_key = ?",
+            )),
+            vec![Value::String(key.to_owned())],
+        )
         .execute(&self.pool)
         .await
         .map_err(sqlx_error)?;
@@ -312,21 +326,27 @@ impl SecondaryStorage for SqlxSecondaryStorage {
             .and_then(|value| value.expires_in)
             .map(|ttl| now_seconds() as i64 + ttl.as_secs() as i64)
             .unwrap_or(now_seconds() as i64 + expires_in.as_secs() as i64);
-        sqlx::query(&sqlx_bind_sql(
-            self.backend,
-            "DELETE FROM _better_auth_kv WHERE storage_key = ?",
-        ))
-        .bind(key)
+        bind_values(
+            sqlx::query(&sqlx_bind_sql(
+                self.backend,
+                "DELETE FROM _better_auth_kv WHERE storage_key = ?",
+            )),
+            vec![Value::String(key.to_owned())],
+        )
         .execute(&mut *transaction)
         .await
         .map_err(sqlx_error)?;
-        sqlx::query(&sqlx_bind_sql(
-            self.backend,
-            "INSERT INTO _better_auth_kv(storage_key, value_json, expires_at) VALUES (?, ?, ?)",
-        ))
-        .bind(key)
-        .bind(Value::from(next).to_string())
-        .bind(expires_at)
+        bind_values(
+            sqlx::query(&sqlx_bind_sql(
+                self.backend,
+                "INSERT INTO _better_auth_kv(storage_key, value_json, expires_at) VALUES (?, ?, ?)",
+            )),
+            vec![
+                Value::String(key.to_owned()),
+                Value::from(next).to_string().into(),
+                Value::from(expires_at),
+            ],
+        )
         .execute(&mut *transaction)
         .await
         .map_err(sqlx_error)?;
@@ -337,11 +357,13 @@ impl SecondaryStorage for SqlxSecondaryStorage {
     async fn get_and_delete(&self, key: &str) -> Result<Option<StorageValue>> {
         let mut transaction = self.pool.begin().await.map_err(sqlx_error)?;
         let result = read_sqlx_kv(&mut transaction, self.backend, key, true).await?;
-        sqlx::query(&sqlx_bind_sql(
-            self.backend,
-            "DELETE FROM _better_auth_kv WHERE storage_key = ?",
-        ))
-        .bind(key)
+        bind_values(
+            sqlx::query(&sqlx_bind_sql(
+                self.backend,
+                "DELETE FROM _better_auth_kv WHERE storage_key = ?",
+            )),
+            vec![Value::String(key.to_owned())],
+        )
         .execute(&mut *transaction)
         .await
         .map_err(sqlx_error)?;
@@ -362,11 +384,13 @@ async fn read_sqlx_kv(
     } else {
         "SELECT value_json, expires_at FROM _better_auth_kv WHERE storage_key = ?"
     };
-    let row = sqlx::query(&sqlx_bind_sql(backend, query))
-        .bind(key)
-        .fetch_optional(&mut **transaction)
-        .await
-        .map_err(sqlx_error)?;
+    let row = bind_values(
+        sqlx::query(&sqlx_bind_sql(backend, query)),
+        vec![Value::String(key.to_owned())],
+    )
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(sqlx_error)?;
     let Some(row) = row else {
         return Ok(None);
     };
@@ -382,6 +406,384 @@ async fn read_sqlx_kv(
         value: serde_json::from_str(&raw).map_err(json_error)?,
         expires_in: expires_at.map(|expires_at| Duration::from_secs((expires_at - now) as u64)),
     }))
+}
+
+#[cfg(feature = "sqlx")]
+fn record_object(record: &Value) -> Result<&Map<String, Value>> {
+    record
+        .as_object()
+        .ok_or_else(|| AuthError::Adapter("database records must be JSON objects".into()))
+}
+
+#[cfg(feature = "sqlx")]
+fn insert_statement(
+    table: &str,
+    object: &Map<String, Value>,
+    backend: SqlxBackend,
+) -> Result<(String, Vec<Value>)> {
+    let mut fields = object.keys().cloned().collect::<Vec<_>>();
+    fields.sort();
+    let quoted_fields = fields
+        .iter()
+        .map(|field| quote_identifier(field, backend))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    let placeholders = (0..fields.len())
+        .map(|_| "?".to_owned())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values = fields
+        .iter()
+        .map(|field| {
+            object
+                .get(field)
+                .cloned()
+                .ok_or_else(|| AuthError::Adapter("record field disappeared".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((
+        format!(
+            "INSERT INTO {} ({quoted_fields}) VALUES ({placeholders})",
+            quote_identifier(table, backend)?
+        ),
+        values,
+    ))
+}
+
+#[cfg(feature = "sqlx")]
+fn operation_statement(
+    operation: DbOperation,
+    backend: SqlxBackend,
+) -> Result<(String, Vec<Value>, bool)> {
+    match operation {
+        DbOperation::Insert { table, id, record } => {
+            let record = record_with_id(record, &id)?;
+            let (sql, values) = insert_statement(&table, record_object(&record)?, backend)?;
+            Ok((sql, values, false))
+        }
+        DbOperation::InsertRecord { table, record } => {
+            let (sql, values) = insert_statement(&table, record_object(&record)?, backend)?;
+            Ok((sql, values, false))
+        }
+        DbOperation::Update { table, id, record } => {
+            let (sql, values) = update_statement(
+                &table,
+                CoreQuery::new().eq("id", id),
+                record_object(&record)?,
+                backend,
+            )?;
+            Ok((sql, values, true))
+        }
+        DbOperation::UpdateWhere {
+            table,
+            query,
+            changes,
+        } => {
+            let (sql, values) = update_statement(&table, query, record_object(&changes)?, backend)?;
+            Ok((sql, values, false))
+        }
+        DbOperation::Delete { table, id } => {
+            let (where_sql, values) = where_clause(&CoreQuery::new().eq("id", id), backend)?;
+            Ok((
+                format!(
+                    "DELETE FROM {}{where_sql}",
+                    quote_identifier(&table, backend)?
+                ),
+                values,
+                false,
+            ))
+        }
+        DbOperation::DeleteWhere { table, query } => {
+            let (where_sql, values) = where_clause(&query, backend)?;
+            Ok((
+                format!(
+                    "DELETE FROM {}{where_sql}",
+                    quote_identifier(&table, backend)?
+                ),
+                values,
+                false,
+            ))
+        }
+    }
+}
+
+#[cfg(feature = "sqlx")]
+fn update_statement(
+    table: &str,
+    query: CoreQuery,
+    changes: &Map<String, Value>,
+    backend: SqlxBackend,
+) -> Result<(String, Vec<Value>)> {
+    let mut fields = changes.keys().cloned().collect::<Vec<_>>();
+    fields.sort();
+    let assignments = fields
+        .iter()
+        .map(|field| Ok(format!("{} = ?", quote_identifier(field, backend)?)))
+        .collect::<Result<Vec<_>>>()?
+        .join(", ");
+    let (where_sql, mut values) = where_clause(&query, backend)?;
+    let mut change_values = fields
+        .iter()
+        .map(|field| {
+            changes
+                .get(field)
+                .cloned()
+                .ok_or_else(|| AuthError::Adapter("change field disappeared".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    change_values.append(&mut values);
+    Ok((
+        format!(
+            "UPDATE {} SET {assignments}{where_sql}",
+            quote_identifier(table, backend)?
+        ),
+        change_values,
+    ))
+}
+
+#[cfg(feature = "sqlx")]
+fn quote_identifier(identifier: &str, backend: SqlxBackend) -> Result<String> {
+    if identifier.is_empty()
+        || !identifier
+            .chars()
+            .all(|character| character == '_' || character.is_ascii_alphanumeric())
+    {
+        return Err(AuthError::Adapter(format!(
+            "invalid SQL identifier: {identifier}"
+        )));
+    }
+    Ok(match backend {
+        SqlxBackend::MySql => format!("`{identifier}`"),
+        SqlxBackend::Postgres => format!("\"{identifier}\""),
+    })
+}
+
+#[cfg(feature = "sqlx")]
+fn where_clause(query: &CoreQuery, backend: SqlxBackend) -> Result<(String, Vec<Value>)> {
+    let mut values = Vec::new();
+    let mut predicates = Vec::new();
+    for filter in &query.filters {
+        let field = quote_identifier(&filter.field, backend)?;
+        match filter.op {
+            FilterOp::Eq
+            | FilterOp::Ne
+            | FilterOp::Lt
+            | FilterOp::Lte
+            | FilterOp::Gt
+            | FilterOp::Gte => {
+                let operator = match filter.op {
+                    FilterOp::Eq => "=",
+                    FilterOp::Ne => "<>",
+                    FilterOp::Lt => "<",
+                    FilterOp::Lte => "<=",
+                    FilterOp::Gt => ">",
+                    FilterOp::Gte => ">=",
+                    FilterOp::In => unreachable!(),
+                };
+                predicates.push(format!("{field} {operator} ?"));
+                values.push(filter.value.clone());
+            }
+            FilterOp::In => {
+                let Some(items) = filter.value.as_array() else {
+                    return Err(AuthError::Adapter(format!(
+                        "IN filter for {} must contain an array",
+                        filter.field
+                    )));
+                };
+                if items.is_empty() {
+                    predicates.push("1 = 0".into());
+                } else {
+                    let placeholders = items
+                        .iter()
+                        .map(|item| {
+                            values.push(item.clone());
+                            "?"
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    predicates.push(format!("{field} IN ({placeholders})"));
+                }
+            }
+        }
+    }
+    if predicates.is_empty() {
+        Ok((String::new(), values))
+    } else {
+        Ok((format!(" WHERE {}", predicates.join(" AND ")), values))
+    }
+}
+
+#[cfg(feature = "sqlx")]
+fn order_clause(query: &CoreQuery, backend: SqlxBackend) -> Result<String> {
+    if query.order_by.is_empty() {
+        return Ok(format!(
+            " ORDER BY {} ASC",
+            quote_identifier("id", backend)?
+        ));
+    }
+    let orders = query
+        .order_by
+        .iter()
+        .map(|order| {
+            let direction = match order.direction {
+                OrderDirection::Asc => "ASC",
+                OrderDirection::Desc => "DESC",
+            };
+            Ok(format!(
+                "{} {direction}",
+                quote_identifier(&order.field, backend)?
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!(" ORDER BY {}", orders.join(", ")))
+}
+
+#[cfg(feature = "sqlx")]
+fn append_pagination(sql: &mut String, query: &CoreQuery, values: &mut Vec<Value>) {
+    if let Some(limit) = query.limit {
+        sql.push_str(" LIMIT ?");
+        values.push(Value::from(limit));
+    } else if query.offset.is_some() {
+        sql.push_str(" LIMIT -1");
+    }
+    if let Some(offset) = query.offset {
+        sql.push_str(" OFFSET ?");
+        values.push(Value::from(offset));
+    }
+}
+
+#[cfg(feature = "sqlx")]
+fn bind_values<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::Any, AnyArguments<'q>>,
+    values: Vec<Value>,
+) -> sqlx::query::Query<'q, sqlx::Any, AnyArguments<'q>> {
+    for value in values {
+        query =
+            match value {
+                Value::Null => query.bind(Option::<String>::None),
+                Value::Bool(value) => query.bind(value),
+                Value::Number(value) => {
+                    if let Some(value) = value.as_i64() {
+                        query.bind(value)
+                    } else if let Some(value) = value.as_f64() {
+                        query.bind(value)
+                    } else {
+                        panic!("JSON numbers must be representable")
+                    }
+                }
+                Value::String(value) => query.bind(value),
+                Value::Array(value) => query
+                    .bind(serde_json::to_string(&value).expect("JSON values must be serializable")),
+                Value::Object(value) => query
+                    .bind(serde_json::to_string(&value).expect("JSON values must be serializable")),
+            };
+    }
+    query
+}
+
+#[cfg(feature = "sqlx")]
+fn json_value_for_sqlx(value: &Value) -> Result<Value> {
+    Ok(value.clone())
+}
+
+#[cfg(feature = "sqlx")]
+fn row_to_json(row: &sqlx::any::AnyRow, table: &str, schema: &SchemaExtension) -> Result<Value> {
+    let mut object = Map::new();
+    for column in row.columns() {
+        let name = column.name.to_string();
+        let field_type = schema
+            .tables
+            .get(table)
+            .and_then(|table| table.fields.get(name.as_str()))
+            .map(|field| &field.field_type);
+        object.insert(
+            name.clone(),
+            any_value_to_json(row, name.as_str(), field_type)?,
+        );
+    }
+    Ok(Value::Object(object))
+}
+
+#[cfg(feature = "sqlx")]
+fn any_value_to_json(
+    row: &sqlx::any::AnyRow,
+    index: &str,
+    field_type: Option<&FieldType>,
+) -> Result<Value> {
+    let raw = row.try_get_raw(index).map_err(sqlx_error)?;
+    if raw.is_null() {
+        return Ok(Value::Null);
+    }
+    if matches!(field_type, Some(FieldType::Boolean)) {
+        if let Ok(value) = row.try_get::<bool, _>(index) {
+            return Ok(Value::Bool(value));
+        }
+        return Ok(Value::Bool(
+            row.try_get::<i64, _>(index).map_err(sqlx_error)? != 0,
+        ));
+    }
+    if matches!(field_type, Some(FieldType::Bytes)) {
+        return Ok(Value::Array(
+            row.try_get::<Vec<u8>, _>(index)
+                .map_err(sqlx_error)?
+                .into_iter()
+                .map(Value::from)
+                .collect(),
+        ));
+    }
+    if let Ok(value) = row.try_get::<String, _>(index) {
+        if matches!(field_type, Some(FieldType::Json)) {
+            return serde_json::from_str(&value).map_err(json_error);
+        }
+        return Ok(Value::String(value));
+    }
+    if let Ok(value) = row.try_get::<i64, _>(index) {
+        return Ok(Value::Number(value.into()));
+    }
+    if let Ok(value) = row.try_get::<f64, _>(index) {
+        return Ok(Number::from_f64(value)
+            .map(Value::Number)
+            .unwrap_or(Value::Null));
+    }
+    Err(AuthError::Adapter(format!(
+        "unsupported SQL value in column {index}"
+    )))
+}
+
+#[cfg(feature = "sqlx")]
+fn record_with_id(record: Value, id: &str) -> Result<Value> {
+    let Value::Object(mut object) = record else {
+        return Err(AuthError::Adapter(
+            "database records must be JSON objects".into(),
+        ));
+    };
+    object.insert("id".into(), Value::String(id.to_owned()));
+    Ok(Value::Object(object))
+}
+
+#[cfg(feature = "sqlx")]
+fn sqlx_error(error: sqlx::Error) -> AuthError {
+    AuthError::Adapter(format!("SQLx adapter error: {error}"))
+}
+
+#[cfg(feature = "sqlx")]
+fn sqlx_lock_error() -> AuthError {
+    AuthError::Adapter("SQLx adapter schema lock poisoned".into())
+}
+
+#[cfg(feature = "sqlx")]
+fn validate_sqlx_url(url: &str, backend: SqlxBackend) -> Result<()> {
+    let allowed = match backend {
+        SqlxBackend::Postgres => ["postgres://", "postgresql://"].as_slice(),
+        SqlxBackend::MySql => ["mysql://"].as_slice(),
+    };
+    if !allowed.iter().any(|prefix| url.starts_with(prefix)) {
+        return Err(AuthError::InvalidConfiguration(format!(
+            "database URL does not match {:?}",
+            allowed
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "sqlx")]
@@ -404,38 +806,9 @@ fn sqlx_bind_sql(backend: SqlxBackend, sql: &str) -> String {
 }
 
 #[cfg(feature = "sqlx")]
-fn sqlx_records_ddl(backend: SqlxBackend) -> &'static str {
-    match backend {
-        SqlxBackend::Postgres => "CREATE TABLE IF NOT EXISTS _better_auth_records (table_name VARCHAR(255) NOT NULL, record_id VARCHAR(255) NOT NULL, record_json TEXT NOT NULL, PRIMARY KEY(table_name, record_id))",
-        SqlxBackend::MySql => "CREATE TABLE IF NOT EXISTS _better_auth_records (table_name VARCHAR(255) NOT NULL, record_id VARCHAR(255) NOT NULL, record_json TEXT NOT NULL, PRIMARY KEY(table_name, record_id))",
-    }
-}
-
-#[cfg(feature = "sqlx")]
 fn sqlx_kv_ddl(backend: SqlxBackend) -> &'static str {
     match backend {
         SqlxBackend::Postgres => "CREATE TABLE IF NOT EXISTS _better_auth_kv (storage_key VARCHAR(255) PRIMARY KEY, value_json TEXT NOT NULL, expires_at BIGINT NULL)",
         SqlxBackend::MySql => "CREATE TABLE IF NOT EXISTS _better_auth_kv (storage_key VARCHAR(255) PRIMARY KEY, value_json TEXT NOT NULL, expires_at BIGINT NULL)",
     }
-}
-
-#[cfg(feature = "sqlx")]
-fn validate_sqlx_url(url: &str, backend: SqlxBackend) -> Result<()> {
-    let valid = match backend {
-        SqlxBackend::Postgres => url.starts_with("postgres://") || url.starts_with("postgresql://"),
-        SqlxBackend::MySql => url.starts_with("mysql://"),
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(AuthError::InvalidConfiguration(format!(
-            "database URL does not match {:?} backend",
-            backend
-        )))
-    }
-}
-
-#[cfg(feature = "sqlx")]
-fn sqlx_error(error: impl std::fmt::Display) -> AuthError {
-    AuthError::Adapter(format!("SQLx adapter error: {error}"))
 }

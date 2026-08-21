@@ -19,6 +19,39 @@ impl Endpoint {
             description: description.into(),
         }
     }
+
+    pub fn with_handler(self, handler: Arc<dyn EndpointHandler>) -> ExecutableEndpoint {
+        ExecutableEndpoint {
+            endpoint: self,
+            handler,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct EndpointRequest {
+    pub method: Method,
+    pub path: String,
+    pub headers: HeaderMap,
+    pub body: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EndpointResponse {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: Vec<u8>,
+}
+
+#[async_trait]
+pub trait EndpointHandler: Send + Sync {
+    async fn handle(&self, request: EndpointRequest) -> Result<EndpointResponse>;
+}
+
+#[derive(Clone)]
+pub struct ExecutableEndpoint {
+    pub endpoint: Endpoint,
+    pub handler: Arc<dyn EndpointHandler>,
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +94,9 @@ pub trait Plugin: Send + Sync {
     fn hooks(&self) -> Vec<Arc<dyn Hook>> {
         Vec::new()
     }
+    fn endpoint_handlers(&self) -> Vec<ExecutableEndpoint> {
+        Vec::new()
+    }
 }
 
 #[derive(Default)]
@@ -68,6 +104,7 @@ pub struct PluginRegistry {
     plugins: Vec<Arc<dyn Plugin>>,
     endpoints: Vec<Endpoint>,
     hooks: Vec<Arc<dyn Hook>>,
+    endpoint_handlers: Vec<ExecutableEndpoint>,
     schema: SchemaExtension,
     error_codes: BTreeMap<String, String>,
 }
@@ -81,6 +118,9 @@ impl PluginRegistry {
         for plugin in &registry.plugins {
             registry.endpoints.extend(plugin.endpoints());
             registry.hooks.extend(plugin.hooks());
+            registry
+                .endpoint_handlers
+                .extend(plugin.endpoint_handlers());
             registry.schema.merge(&plugin.schema())?;
             for (code, message) in plugin.error_codes() {
                 if registry.error_codes.insert(code.clone(), message).is_some() {
@@ -103,6 +143,10 @@ impl PluginRegistry {
 
     pub fn hooks(&self) -> &[Arc<dyn Hook>] {
         &self.hooks
+    }
+
+    pub fn endpoint_handlers(&self) -> &[ExecutableEndpoint] {
+        &self.endpoint_handlers
     }
 
     pub fn schema(&self) -> &SchemaExtension {

@@ -31,6 +31,51 @@ pub enum CookieCacheStrategy {
     Jwt,
 }
 
+/// The SameSite policy used when Better Auth emits a cookie.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CookieSameSite {
+    Lax,
+    Strict,
+    None,
+}
+
+impl Default for CookieSameSite {
+    fn default() -> Self {
+        Self::Lax
+    }
+}
+
+/// Cookie attributes are deliberately independent from `AuthOptions::base_path`.
+/// An application may mount auth handlers below `/api/auth` while sharing the
+/// session with its API and WebSocket routes at `/`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct CookieOptions {
+    /// Custom session-cookie name. The standard Better Auth name is used when
+    /// this is absent; secure transport still receives the `__Secure-` prefix.
+    pub name: Option<String>,
+    pub path: String,
+    pub domain: Option<String>,
+    /// `None` follows the request transport (`https` => secure).
+    pub secure: Option<bool>,
+    pub http_only: bool,
+    pub same_site: CookieSameSite,
+}
+
+impl Default for CookieOptions {
+    fn default() -> Self {
+        Self {
+            name: None,
+            path: "/".to_owned(),
+            domain: None,
+            secure: None,
+            http_only: true,
+            same_site: CookieSameSite::Lax,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CookieCacheOptions {
     pub enabled: bool,
@@ -106,6 +151,8 @@ impl Default for PasswordHashOptions {
 pub struct AuthOptions {
     pub base_url: Option<BaseUrl>,
     pub base_path: String,
+    #[serde(default)]
+    pub cookie: CookieOptions,
     pub secret: String,
     pub secret_version: String,
     pub secret_rotation: Vec<SecretVersion>,
@@ -133,6 +180,7 @@ impl Default for AuthOptions {
         Self {
             base_url: None,
             base_path: "/api/auth".to_owned(),
+            cookie: CookieOptions::default(),
             secret: String::new(),
             secret_version: "current".to_owned(),
             secret_rotation: Vec::new(),
@@ -170,6 +218,12 @@ impl AuthOptions {
         if !self.base_path.starts_with('/') {
             self.base_path.insert(0, '/');
         }
+
+        if self.cookie.path.is_empty() {
+            self.cookie.path = "/".to_owned();
+        } else if !self.cookie.path.starts_with('/') {
+            self.cookie.path.insert(0, '/');
+        }
     }
 
     pub fn all_secrets(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -189,6 +243,26 @@ impl AuthOptions {
         if self.base_path == "/" || !self.base_path.starts_with('/') {
             return Err(crate::AuthError::InvalidConfiguration(
                 "base_path must be an absolute non-root path".to_owned(),
+            ));
+        }
+        if self.cookie.path.is_empty() || !self.cookie.path.starts_with('/') {
+            return Err(crate::AuthError::InvalidConfiguration(
+                "cookie.path must be an absolute path".to_owned(),
+            ));
+        }
+        if self.cookie.same_site == CookieSameSite::None && self.cookie.secure == Some(false) {
+            return Err(crate::AuthError::InvalidConfiguration(
+                "SameSite=None cookies must be secure".to_owned(),
+            ));
+        }
+        if self
+            .cookie
+            .name
+            .as_deref()
+            .is_some_and(|name| name.trim().is_empty())
+        {
+            return Err(crate::AuthError::InvalidConfiguration(
+                "cookie.name cannot be empty".to_owned(),
             ));
         }
 

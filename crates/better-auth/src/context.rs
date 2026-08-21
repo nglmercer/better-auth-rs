@@ -1,6 +1,13 @@
+use crate::password::{PasswordProvider, ScryptPhcPasswordProvider};
+use crate::{
+    email_password::{Session, User},
+    hooks::AuthHooks,
+    session::AuthPrincipal,
+};
 use better_auth_core::{
     adapter::{DbAdapter, SecondaryStorage},
     error::{AuthError, Result},
+    migration::MigrationPlan,
     options::{AuthOptions, BaseUrl},
     plugin::Plugin,
     schema::{core_schema, SchemaExtension},
@@ -17,6 +24,8 @@ use url::Url;
 pub struct AuthContext {
     pub options: Arc<AuthOptions>,
     pub adapter: Arc<dyn DbAdapter>,
+    pub password_provider: Arc<dyn PasswordProvider>,
+    pub lifecycle_hooks: Arc<Vec<Arc<dyn AuthHooks>>>,
     pub secondary_storage: Option<Arc<dyn SecondaryStorage>>,
     pub plugins: Arc<PluginRegistry>,
     pub schema: Arc<SchemaExtension>,
@@ -25,10 +34,61 @@ pub struct AuthContext {
 
 impl AuthContext {
     pub fn new(
+        options: AuthOptions,
+        adapter: Arc<dyn DbAdapter>,
+        secondary_storage: Option<Arc<dyn SecondaryStorage>>,
+        plugins: Vec<Arc<dyn Plugin>>,
+    ) -> Result<Self> {
+        let provider = Arc::new(ScryptPhcPasswordProvider::new(
+            options.password_hash.clone(),
+        ));
+        Self::new_with_password_provider(options, adapter, secondary_storage, plugins, provider)
+    }
+
+    pub fn new_with_hooks(
+        options: AuthOptions,
+        adapter: Arc<dyn DbAdapter>,
+        secondary_storage: Option<Arc<dyn SecondaryStorage>>,
+        plugins: Vec<Arc<dyn Plugin>>,
+        hooks: Vec<Arc<dyn AuthHooks>>,
+    ) -> Result<Self> {
+        let provider = Arc::new(ScryptPhcPasswordProvider::new(
+            options.password_hash.clone(),
+        ));
+        Self::new_with_password_provider_and_hooks(
+            options,
+            adapter,
+            secondary_storage,
+            plugins,
+            provider,
+            hooks,
+        )
+    }
+
+    pub fn new_with_password_provider(
+        options: AuthOptions,
+        adapter: Arc<dyn DbAdapter>,
+        secondary_storage: Option<Arc<dyn SecondaryStorage>>,
+        plugins: Vec<Arc<dyn Plugin>>,
+        password_provider: Arc<dyn PasswordProvider>,
+    ) -> Result<Self> {
+        Self::new_with_password_provider_and_hooks(
+            options,
+            adapter,
+            secondary_storage,
+            plugins,
+            password_provider,
+            Vec::new(),
+        )
+    }
+
+    pub fn new_with_password_provider_and_hooks(
         mut options: AuthOptions,
         adapter: Arc<dyn DbAdapter>,
         secondary_storage: Option<Arc<dyn SecondaryStorage>>,
         plugins: Vec<Arc<dyn Plugin>>,
+        password_provider: Arc<dyn PasswordProvider>,
+        lifecycle_hooks: Vec<Arc<dyn AuthHooks>>,
     ) -> Result<Self> {
         options.has_secondary_storage = secondary_storage.is_some();
         options.apply_defaults();
@@ -42,10 +102,13 @@ impl AuthContext {
         let plugins = Arc::new(PluginRegistry::build(plugins)?);
         let mut schema = core_schema();
         schema.merge(plugins.schema())?;
+        adapter.register_schema(&schema)?;
 
         Ok(Self {
             options: Arc::new(options),
             adapter,
+            password_provider,
+            lifecycle_hooks: Arc::new(lifecycle_hooks),
             secondary_storage,
             plugins,
             schema: Arc::new(schema),
@@ -62,6 +125,66 @@ impl AuthContext {
             }
             origin
         })
+    }
+
+    /// Returns the migration plan for the merged core and plugin schema. The
+    /// application decides when and how to apply it, which keeps startup,
+    /// deployment, and multi-instance migration policy explicit.
+    pub fn migration_plan(&self) -> MigrationPlan {
+        MigrationPlan::from_schema(&self.schema)
+    }
+
+    pub fn migration_plan_from(&self, previous: &SchemaExtension) -> Result<MigrationPlan> {
+        MigrationPlan::diff(previous, &self.schema)
+    }
+
+    pub async fn before_user_create(&self, user: &mut User) -> Result<()> {
+        for hook in self.lifecycle_hooks.iter() {
+            hook.before_user_create(user).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn after_user_create(&self, user: &User) -> Result<()> {
+        for hook in self.lifecycle_hooks.iter() {
+            hook.after_user_create(user).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn before_session_create(&self, user: &User) -> Result<()> {
+        for hook in self.lifecycle_hooks.iter() {
+            hook.before_session_create(user).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn after_sign_in(&self, principal: &AuthPrincipal) -> Result<()> {
+        for hook in self.lifecycle_hooks.iter() {
+            hook.after_sign_in(principal).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn after_password_change(&self, user_id: &str) -> Result<()> {
+        for hook in self.lifecycle_hooks.iter() {
+            hook.after_password_change(user_id).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn before_user_delete(&self, user_id: &str) -> Result<()> {
+        for hook in self.lifecycle_hooks.iter() {
+            hook.before_user_delete(user_id).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn after_session_create(&self, user: &User, session: &Session) -> Result<()> {
+        for hook in self.lifecycle_hooks.iter() {
+            hook.after_session_create(user, session).await?;
+        }
+        Ok(())
     }
 
     pub fn resolve_request(&self, request: &RequestMetadata) -> Result<RequestContext> {

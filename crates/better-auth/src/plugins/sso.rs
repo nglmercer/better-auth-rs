@@ -1,7 +1,7 @@
 use super::shared::{endpoint, required, serialize_error};
 use crate::sso::SsoProtocol;
 use better_auth_core::{
-    adapter::DbAdapter,
+    adapter::{DbAdapter, Query},
     error::{AuthError, Result},
     plugin::{Endpoint, Plugin},
     schema::{FieldType, SchemaExtension, TableSchema},
@@ -84,16 +84,20 @@ impl SsoConnectionService {
     pub async fn create(&self, connection: SsoConnectionConfig) -> Result<()> {
         connection.validate()?;
         self.adapter
-            .insert(
+            .insert_record(
                 "sso_connection",
-                &connection.id,
                 serde_json::to_value(&connection).map_err(serialize_error)?,
             )
-            .await
+            .await?;
+        Ok(())
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<SsoConnectionConfig>> {
-        let Some(value) = self.adapter.get("sso_connection", id).await? else {
+        let Some(value) = self
+            .adapter
+            .find_one("sso_connection", Query::new().eq("id", id.to_owned()))
+            .await?
+        else {
             return Ok(None);
         };
         Ok(Some(

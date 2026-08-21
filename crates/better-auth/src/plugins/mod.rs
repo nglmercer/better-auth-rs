@@ -80,18 +80,16 @@ mod tests {
     async fn admin_and_scim_services_enforce_and_persist_roles() {
         let adapter = Arc::new(MemoryDb::default());
         adapter
-            .insert(
+            .insert_record(
                 "user",
-                "admin",
-                json!({"id":"admin","email":"admin@example.com","name":"Admin","email_verified":true,"role":"admin"}),
+                json!({"id":"admin","email":"admin@example.com","name":"Admin","email_verified":true,"role":"admin","additional_fields":{}}),
             )
             .await
             .unwrap();
         adapter
-            .insert(
+            .insert_record(
                 "user",
-                "user",
-                json!({"id":"user","email":"user@example.com","name":"User","email_verified":true,"role":"user"}),
+                json!({"id":"user","email":"user@example.com","name":"User","email_verified":true,"role":"user","additional_fields":{}}),
             )
             .await
             .unwrap();

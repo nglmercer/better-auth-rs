@@ -1,12 +1,13 @@
 use super::shared::{endpoint, member_id, required, serialize_error, slugify};
 use better_auth_core::{
-    adapter::{DbAdapter, DbOperation},
+    adapter::{DbAdapter, DbOperation, Query},
     error::{AuthError, Result},
     plugin::{Endpoint, Plugin},
     schema::{FieldType, SchemaExtension, TableSchema},
 };
 use http::Method;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -101,17 +102,19 @@ impl OrganizationService {
             role: "owner".into(),
         };
         let member_id = member_id(&member.organization_id, &member.user_id);
+        let member_record = with_id(
+            serde_json::to_value(&member).map_err(serialize_error)?,
+            member_id,
+        )?;
         self.adapter
             .transaction(vec![
-                DbOperation::Insert {
+                DbOperation::InsertRecord {
                     table: "organization".into(),
-                    id: organization.id.clone(),
                     record: serde_json::to_value(&organization).map_err(serialize_error)?,
                 },
-                DbOperation::Insert {
+                DbOperation::InsertRecord {
                     table: "organization_member".into(),
-                    id: member_id,
-                    record: serde_json::to_value(&member).map_err(serialize_error)?,
+                    record: member_record,
                 },
             ])
             .await?;
@@ -126,7 +129,10 @@ impl OrganizationService {
     ) -> Result<OrganizationMember> {
         if self
             .adapter
-            .get("organization", organization_id)
+            .find_one(
+                "organization",
+                Query::new().eq("id", organization_id.to_owned()),
+            )
             .await?
             .is_none()
         {
@@ -138,10 +144,12 @@ impl OrganizationService {
             role: role.to_owned(),
         };
         self.adapter
-            .insert(
+            .insert_record(
                 "organization_member",
-                &member_id(organization_id, user_id),
-                serde_json::to_value(&member).map_err(serialize_error)?,
+                with_id(
+                    serde_json::to_value(&member).map_err(serialize_error)?,
+                    member_id(organization_id, user_id),
+                )?,
             )
             .await?;
         Ok(member)
@@ -154,7 +162,10 @@ impl OrganizationService {
     ) -> Result<Option<OrganizationMember>> {
         let Some(value) = self
             .adapter
-            .get("organization_member", &member_id(organization_id, user_id))
+            .find_one(
+                "organization_member",
+                Query::new().eq("id", member_id(organization_id, user_id)),
+            )
             .await?
         else {
             return Ok(None);
@@ -163,4 +174,12 @@ impl OrganizationService {
             serde_json::from_value(value).map_err(serialize_error)?,
         ))
     }
+}
+
+fn with_id(mut record: Value, id: String) -> Result<Value> {
+    record
+        .as_object_mut()
+        .ok_or_else(|| AuthError::Adapter("organization record is not an object".into()))?
+        .insert("id".into(), Value::String(id));
+    Ok(record)
 }
