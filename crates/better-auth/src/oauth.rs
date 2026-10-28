@@ -639,7 +639,7 @@ fn serialize_error(error: impl std::fmt::Display) -> AuthError {
 mod tests {
     use super::*;
     use better_auth_core::{
-        adapter::memory::{MemoryDb, MemorySecondaryStorage},
+        adapter::{memory::{MemoryDb, MemorySecondaryStorage}, DbAdapter},
         options::{AuthOptions, BaseUrl},
     };
 
@@ -770,4 +770,199 @@ mod tests {
         assert_eq!(result.user.email, "oauth@example.com");
         assert_eq!(result.session.user_id, result.user.id);
     }
+    struct FixtureProvider {
+        name: &'static str,
+        account: &'static str,
+        email: &'static str,
+        verified: bool,
+    }
+
+    #[async_trait]
+    impl OAuthProvider for FixtureProvider {
+        fn id(&self) -> &str {
+            self.name
+        }
+
+        async fn exchange_code(
+            &self,
+            _code: &str,
+            _redirect_uri: &str,
+            _code_verifier: &str,
+        ) -> Result<OAuthTokens> {
+            Ok(OAuthTokens {
+                access_token: "fixture-access".into(),
+                refresh_token: None,
+                expires_at: None,
+                token_type: "Bearer".into(),
+                id_token: None,
+            })
+        }
+
+        async fn profile(&self, _tokens: &OAuthTokens) -> Result<OAuthUserProfile> {
+            Ok(OAuthUserProfile {
+                provider_account_id: self.account.into(),
+                email: Some(self.email.into()),
+                name: Some("OAuth Fixture".into()),
+                image: None,
+                email_verified: self.verified,
+            })
+        }
+    }
+
+    struct LegacyProvisioner {
+        db: Arc<MemoryDb>,
+    }
+
+    #[async_trait]
+    impl OAuthUserProvisioner for LegacyProvisioner {
+        async fn create_user(&self, profile: &OAuthUserProfile) -> Result<User> {
+            self.db.insert_record(
+                "legacy_users",
+                json!({ "id": "42", "email": profile.email }),
+            ).await?;
+            Ok(User {
+                id: "42".into(),
+                email: profile.email.as_deref().unwrap().to_ascii_lowercase(),
+                name: profile.name.clone().unwrap_or_else(|| "User".into()),
+                email_verified: profile.email_verified,
+                image: profile.image.clone(),
+                additional_fields: serde_json::Map::new(),
+            })
+        }
+
+        async fn rollback_user(&self, user: &User) -> Result<()> {
+            self.db
+                .delete_where("legacy_users", Query::new().eq("id", user.id.clone()))
+                .await?;
+            Ok(())
+        }
+    }
+
+    fn fixture_context(db: Arc<MemoryDb>) -> AuthContext {
+        AuthContext::new(
+            AuthOptions {
+                secret: "p".repeat(32),
+                base_url: Some(BaseUrl::Static("https://example.com".into())),
+                has_database: true,
+                ..AuthOptions::default()
+            },
+            db,
+            Some(Arc::new(MemorySecondaryStorage::default())),
+            Vec::new(),
+        ).unwrap()
+    }
+
+    fn fixture_config(id: &str) -> OAuthProviderConfig {
+        OAuthProviderConfig::new(
+            id,
+            Url::parse("https://provider.example/authorize").unwrap(),
+            "client",
+        ).unwrap()
+    }
+
+    #[tokio::test]
+    async fn google_oauth_provisions_numeric_user_and_resolves_session() {
+        let db = Arc::new(MemoryDb::default());
+        let context = fixture_context(db.clone());
+        let service = OAuthService::new(context.clone(), OAuthStateStorage::Verification).unwrap();
+        let provisioner = LegacyProvisioner { db: db.clone() };
+        let provider = FixtureProvider {
+            name: "google", account: "google-123", email: "legacy@example.com", verified: true,
+        };
+        let begin = service.begin(&fixture_config("google"), "https://example.com/callback", true)
+            .await.unwrap();
+        let result = service.complete_with_provisioner(
+            &provider, "code", &begin.state, None, true, &provisioner
+        ).await.unwrap();
+        assert_eq!(result.user.id, "42");
+        assert_eq!(result.session.user_id, "42");
+        assert!(db.find_one("legacy_users", Query::new().eq("id", "42")).await.unwrap().is_some());
+        assert!(db.find_one("user", Query::new().eq("id", "42")).await.unwrap().is_some());
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            format!("Bearer {}", result.session_token).parse().unwrap(),
+        );
+        let resolved = SessionService::new(context)
+            .unwrap()
+            .resolve_with_transport(&headers, true, crate::session::SessionTransport::Bearer)
+            .await.unwrap().unwrap();
+        assert_eq!(resolved.user.id, "42");
+
+        // The linked provider account must bypass the provisioner on later logins.
+        let begin = service.begin(&fixture_config("google"), "https://example.com/callback", true)
+            .await.unwrap();
+        let again = service.complete(&provider, "code", &begin.state, None, true).await.unwrap();
+        assert_eq!(again.user.id, "42");
+        assert_eq!(db.find_many("legacy_users", Query::new()).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn github_verified_email_links_existing_user_without_new_legacy_row() {
+        let db = Arc::new(MemoryDb::default());
+        db.insert_record("user", json!({
+            "id": "77", "email": "existing@example.com", "name": "Existing",
+            "email_verified": true, "image": null
+        })).await.unwrap();
+        let context = fixture_context(db.clone());
+        let service = OAuthService::new(context, OAuthStateStorage::Verification).unwrap();
+        let provisioner = LegacyProvisioner { db: db.clone() };
+        let provider = FixtureProvider {
+            name: "github", account: "github-456", email: "existing@example.com", verified: true,
+        };
+        let begin = service.begin(&fixture_config("github"), "https://example.com/callback", true)
+            .await.unwrap();
+        let result = service.complete_with_provisioner(
+            &provider, "code", &begin.state, None, true, &provisioner
+        ).await.unwrap();
+        assert_eq!(result.user.id, "77");
+        assert!(db.find_many("legacy_users", Query::new()).await.unwrap().is_empty());
+        let account = db.find_one("account", Query::new().eq("id", "oauth:github:github-456"))
+            .await.unwrap().unwrap();
+        assert_eq!(account["user_id"], "77");
+    }
+
+    #[tokio::test]
+    async fn unverified_email_cannot_link_existing_user() {
+        let db = Arc::new(MemoryDb::default());
+        db.insert_record("user", json!({
+            "id": "77", "email": "existing@example.com", "name": "Existing",
+            "email_verified": true, "image": null
+        })).await.unwrap();
+        let service = OAuthService::new(fixture_context(db.clone()), OAuthStateStorage::Verification).unwrap();
+        let provider = FixtureProvider {
+            name: "github", account: "unverified-456",
+            email: "existing@example.com", verified: false,
+        };
+        let begin = service.begin(&fixture_config("github"), "https://example.com/callback", true)
+            .await.unwrap();
+        assert!(matches!(
+            service.complete(&provider, "code", &begin.state, None, true).await,
+            Err(AuthError::Unauthorized)
+        ));
+        assert!(db.find_many("account", Query::new()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_better_auth_insert_rolls_back_legacy_user() {
+        let db = Arc::new(MemoryDb::default());
+        db.insert_record("user", json!({
+            "id": "42", "email": "unrelated@example.com", "name": "Unrelated",
+            "email_verified": true, "image": null
+        })).await.unwrap();
+        let service = OAuthService::new(fixture_context(db.clone()), OAuthStateStorage::Verification).unwrap();
+        let provisioner = LegacyProvisioner { db: db.clone() };
+        let provider = FixtureProvider {
+            name: "google", account: "collision", email: "new@example.com", verified: true,
+        };
+        let begin = service.begin(&fixture_config("google"), "https://example.com/callback", true)
+            .await.unwrap();
+        assert!(service.complete_with_provisioner(
+            &provider, "code", &begin.state, None, true, &provisioner
+        ).await.is_err());
+        assert!(db.find_many("legacy_users", Query::new()).await.unwrap().is_empty());
+        assert!(db.find_many("account", Query::new()).await.unwrap().is_empty());
+    }
+
 }
