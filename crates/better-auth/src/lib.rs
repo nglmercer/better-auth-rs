@@ -51,7 +51,7 @@ pub use http_oauth::HttpOAuthProvider;
 pub use jwt::JwtService;
 pub use oauth::{
     OAuthAuthorization, OAuthProvider, OAuthProviderConfig, OAuthService, OAuthStateManager,
-    OAuthStateStorage, OAuthTokens, OAuthUserProfile, PkcePair, ProviderTokenVault,
+    OAuthStateStorage, OAuthTokens, OAuthUserProfile, OAuthUserProvisioner, PkcePair, ProviderTokenVault,
 };
 pub use oidc::{OidcClaims, OidcIdTokenValidator};
 pub use password::{

@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 const ACCOUNT_TABLE: &str = "account";
 const USER_TABLE: &str = "user";
+const SESSION_TABLE: &str = "session";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OAuthStateStorage {
@@ -286,6 +287,19 @@ pub trait OAuthProvider: Send + Sync {
     }
 }
 
+/// Creates the application-owned identity before a new Better Auth OAuth user is
+/// persisted. For legacy applications, insert the legacy user first and return a
+/// `User` whose ID is the decimal representation of the legacy primary key.
+///
+/// Implementations must make `rollback_user` idempotent. If the Better Auth
+/// transaction, lifecycle hooks, or session creation fails, this hook is called
+/// to compensate for an already-created application identity.
+#[async_trait]
+pub trait OAuthUserProvisioner: Send + Sync {
+    async fn create_user(&self, profile: &OAuthUserProfile) -> Result<User>;
+    async fn rollback_user(&self, user: &User) -> Result<()>;
+}
+
 #[derive(Clone)]
 pub struct OAuthService {
     context: AuthContext,
@@ -321,6 +335,9 @@ impl OAuthService {
             .await
     }
 
+    /// Default OAuth completion retains UUID-based Better Auth user IDs.
+    /// Applications with externally owned numeric IDs should call
+    /// `complete_with_provisioner` instead.
     pub async fn complete<P: OAuthProvider>(
         &self,
         provider: &P,
@@ -328,6 +345,42 @@ impl OAuthService {
         state: &str,
         signed_state_cookie: Option<&str>,
         secure_cookie: bool,
+    ) -> Result<AuthResult> {
+        self.complete_inner(provider, code, state, signed_state_cookie, secure_cookie, None)
+            .await
+    }
+
+    /// Completes OAuth with application-controlled creation of *new* users.
+    /// Existing linked accounts or verified-email matches never call the
+    /// provisioner. The provisioner may allocate a numeric legacy user ID.
+    pub async fn complete_with_provisioner<P: OAuthProvider>(
+        &self,
+        provider: &P,
+        code: &str,
+        state: &str,
+        signed_state_cookie: Option<&str>,
+        secure_cookie: bool,
+        provisioner: &dyn OAuthUserProvisioner,
+    ) -> Result<AuthResult> {
+        self.complete_inner(
+            provider,
+            code,
+            state,
+            signed_state_cookie,
+            secure_cookie,
+            Some(provisioner),
+        )
+        .await
+    }
+
+    async fn complete_inner<P: OAuthProvider>(
+        &self,
+        provider: &P,
+        code: &str,
+        state: &str,
+        signed_state_cookie: Option<&str>,
+        secure_cookie: bool,
+        provisioner: Option<&dyn OAuthUserProvisioner>,
     ) -> Result<AuthResult> {
         if !self.context.options.has_database {
             return Err(AuthError::InvalidConfiguration(
@@ -343,18 +396,47 @@ impl OAuthService {
             .await?;
         provider.validate_tokens(&tokens, &nonce)?;
         let profile = provider.profile(&tokens).await?;
-        let user = self
-            .find_or_create_user(provider.id(), &profile, &tokens)
+        if profile.provider_account_id.trim().is_empty() {
+            return Err(AuthError::InvalidRequest("OAuth provider returned an empty account ID".into()));
+        }
+        let (user, new_user, account_id) = self
+            .find_or_create_user(provider.id(), &profile, &tokens, provisioner)
             .await?;
         let result = SessionService::new(self.context.clone())?
-            .create(user, secure_cookie)
-            .await?;
-        self.context
+            .create(user.clone(), secure_cookie)
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if new_user {
+                    return Err(self.compensate(error, &user, &account_id, provisioner, true).await);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .context
             .after_sign_in(&AuthPrincipal {
                 user: result.user.clone(),
                 session: result.session.clone(),
             })
-            .await?;
+            .await
+        {
+            if new_user {
+                return Err(self.compensate(error, &user, &account_id, provisioner, true).await);
+            }
+            // A sign-in hook can reject an existing account after its session
+            // was inserted. Revoke that new session without touching the user.
+            if let Err(cleanup) = self.context.adapter.delete_where(
+                SESSION_TABLE,
+                Query::new().eq("id", result.session.id.clone()),
+            ).await {
+                return Err(AuthError::Adapter(format!(
+                    "{error}; OAuth session rollback failed: {cleanup}"
+                )));
+            }
+            return Err(error);
+        }
         Ok(result)
     }
 
@@ -363,7 +445,8 @@ impl OAuthService {
         provider_id: &str,
         profile: &OAuthUserProfile,
         tokens: &OAuthTokens,
-    ) -> Result<User> {
+        provisioner: Option<&dyn OAuthUserProvisioner>,
+    ) -> Result<(User, bool, String)> {
         let account_id = format!("oauth:{provider_id}:{}", profile.provider_account_id);
         if let Some(account) = self
             .context
@@ -381,37 +464,64 @@ impl OAuthService {
                 .find_one(USER_TABLE, Query::new().eq("id", user_id.to_owned()))
                 .await?
                 .ok_or(AuthError::Unauthorized)?;
-            return serde_json::from_value(value).map_err(serialize_error);
+            let user = serde_json::from_value(value).map_err(serialize_error)?;
+            return Ok((user, false, account_id));
         }
         let email = profile
             .email
-            .clone()
-            .ok_or_else(|| {
-                AuthError::InvalidRequest("OAuth provider did not return an email".into())
-            })?
+            .as_deref()
+            .ok_or_else(|| AuthError::InvalidRequest("OAuth provider did not return an email".into()))?
             .trim()
             .to_ascii_lowercase();
-        let (user, new_user) = if let Some(value) = self
+        if email.is_empty() {
+            return Err(AuthError::InvalidRequest("OAuth provider returned an empty email".into()));
+        }
+        // Encrypt tokens before allocating an external legacy row, so a
+        // vault/serialization failure cannot leave that row orphaned.
+        let token_envelope = self.token_vault.seal(provider_id, tokens)?;
+        let existing = self
             .context
             .adapter
             .find_one(USER_TABLE, Query::new().eq("email", email.clone()))
-            .await?
-        {
-            (
-                serde_json::from_value(value).map_err(serialize_error)?,
-                None,
-            )
+            .await?;
+        if existing.is_some() && !profile.email_verified {
+            return Err(AuthError::Unauthorized);
+        }
+
+        let mut new_user = None;
+        let user = if let Some(value) = existing {
+            serde_json::from_value(value).map_err(serialize_error)?
         } else {
-            let mut user = User {
-                id: Uuid::new_v4().to_string(),
-                email,
-                name: profile.name.clone().unwrap_or_else(|| "User".into()),
-                email_verified: profile.email_verified,
-                image: profile.image.clone(),
-                additional_fields: serde_json::Map::new(),
+            let mut user = if let Some(provisioner) = provisioner {
+                provisioner.create_user(profile).await?
+            } else {
+                User {
+                    id: Uuid::new_v4().to_string(),
+                    email: email.clone(),
+                    name: profile.name.clone().unwrap_or_else(|| "User".into()),
+                    email_verified: profile.email_verified,
+                    image: profile.image.clone(),
+                    additional_fields: serde_json::Map::new(),
+                }
             };
-            self.context.before_user_create(&mut user).await?;
-            (user.clone(), Some(user))
+            let original = user.clone();
+            if user.id.trim().is_empty() || user.email != email {
+                let error = AuthError::InvalidRequest(
+                    "OAuth provisioner must return a non-empty ID and the normalized provider email".into(),
+                );
+                return Err(self.rollback_provisioner(error, &original, provisioner).await);
+            }
+            if let Err(error) = self.context.before_user_create(&mut user).await {
+                return Err(self.rollback_provisioner(error, &original, provisioner).await);
+            }
+            if provisioner.is_some() && (user.id != original.id || user.email != original.email) {
+                let error = AuthError::InvalidRequest(
+                    "OAuth lifecycle hooks must not change provisioned identity".into(),
+                );
+                return Err(self.rollback_provisioner(error, &original, provisioner).await);
+            }
+            new_user = Some(user.clone());
+            user
         };
         let is_new_user = new_user.is_some();
         let mut operations = Vec::with_capacity(2);
@@ -428,14 +538,65 @@ impl OAuthService {
                 "user_id": user.id,
                 "provider_id": provider_id,
                 "account_id": profile.provider_account_id,
-                "token_envelope": self.token_vault.seal(provider_id, tokens)?,
+                "token_envelope": token_envelope,
             }),
         });
-        self.context.adapter.transaction(operations).await?;
-        if is_new_user {
-            self.context.after_user_create(&user).await?;
+        if let Err(error) = self.context.adapter.transaction(operations).await {
+            if is_new_user {
+                return Err(self.rollback_provisioner(error, &user, provisioner).await);
+            }
+            return Err(error);
         }
-        Ok(user)
+        if is_new_user {
+            if let Err(error) = self.context.after_user_create(&user).await {
+                return Err(self.compensate(error, &user, &account_id, provisioner, true).await);
+            }
+        }
+        Ok((user, is_new_user, account_id))
+    }
+
+    async fn rollback_provisioner(
+        &self,
+        error: AuthError,
+        user: &User,
+        provisioner: Option<&dyn OAuthUserProvisioner>,
+    ) -> AuthError {
+        if let Some(provisioner) = provisioner {
+            if let Err(cleanup) = provisioner.rollback_user(user).await {
+                return AuthError::Adapter(format!("{error}; legacy rollback failed: {cleanup}"));
+            }
+        }
+        error
+    }
+
+    async fn compensate(
+        &self,
+        error: AuthError,
+        user: &User,
+        account_id: &str,
+        provisioner: Option<&dyn OAuthUserProvisioner>,
+        persisted: bool,
+    ) -> AuthError {
+        if persisted {
+            let cleanup = self.context.adapter.transaction(vec![
+                DbOperation::DeleteWhere {
+                    table: SESSION_TABLE.into(),
+                    query: Query::new().eq("user_id", user.id.clone()),
+                },
+                DbOperation::DeleteWhere {
+                    table: ACCOUNT_TABLE.into(),
+                    query: Query::new().eq("id", account_id.to_owned()).eq("user_id", user.id.clone()),
+                },
+                DbOperation::DeleteWhere {
+                    table: USER_TABLE.into(),
+                    query: Query::new().eq("id", user.id.clone()),
+                },
+            ]).await;
+            if let Err(cleanup) = cleanup {
+                return AuthError::Adapter(format!("{error}; Better Auth rollback failed: {cleanup}"));
+            }
+        }
+        self.rollback_provisioner(error, user, provisioner).await
     }
 }
 
@@ -491,7 +652,7 @@ fn serialize_error(error: impl std::fmt::Display) -> AuthError {
 mod tests {
     use super::*;
     use better_auth_core::{
-        adapter::memory::{MemoryDb, MemorySecondaryStorage},
+        adapter::{memory::{MemoryDb, MemorySecondaryStorage}, DbAdapter},
         options::{AuthOptions, BaseUrl},
     };
 
@@ -622,4 +783,238 @@ mod tests {
         assert_eq!(result.user.email, "oauth@example.com");
         assert_eq!(result.session.user_id, result.user.id);
     }
+    struct FixtureProvider {
+        name: &'static str,
+        account: &'static str,
+        email: &'static str,
+        verified: bool,
+    }
+
+    #[async_trait]
+    impl OAuthProvider for FixtureProvider {
+        fn id(&self) -> &str {
+            self.name
+        }
+
+        async fn exchange_code(
+            &self,
+            _code: &str,
+            _redirect_uri: &str,
+            _code_verifier: &str,
+        ) -> Result<OAuthTokens> {
+            Ok(OAuthTokens {
+                access_token: "fixture-access".into(),
+                refresh_token: None,
+                expires_at: None,
+                token_type: "Bearer".into(),
+                id_token: None,
+            })
+        }
+
+        async fn profile(&self, _tokens: &OAuthTokens) -> Result<OAuthUserProfile> {
+            Ok(OAuthUserProfile {
+                provider_account_id: self.account.into(),
+                email: Some(self.email.into()),
+                name: Some("OAuth Fixture".into()),
+                image: None,
+                email_verified: self.verified,
+            })
+        }
+    }
+
+    struct LegacyProvisioner {
+        db: Arc<MemoryDb>,
+    }
+
+    #[async_trait]
+    impl OAuthUserProvisioner for LegacyProvisioner {
+        async fn create_user(&self, profile: &OAuthUserProfile) -> Result<User> {
+            self.db.insert_record(
+                "legacy_users",
+                json!({ "id": "42", "email": profile.email }),
+            ).await?;
+            Ok(User {
+                id: "42".into(),
+                email: profile.email.as_deref().unwrap().to_ascii_lowercase(),
+                name: profile.name.clone().unwrap_or_else(|| "User".into()),
+                email_verified: profile.email_verified,
+                image: profile.image.clone(),
+                additional_fields: serde_json::Map::new(),
+            })
+        }
+
+        async fn rollback_user(&self, user: &User) -> Result<()> {
+            self.db
+                .delete_where("legacy_users", Query::new().eq("id", user.id.clone()))
+                .await?;
+            Ok(())
+        }
+    }
+
+    fn fixture_context(db: Arc<MemoryDb>) -> AuthContext {
+        AuthContext::new(
+            AuthOptions {
+                secret: "p".repeat(32),
+                base_url: Some(BaseUrl::Static("https://example.com".into())),
+                has_database: true,
+                ..AuthOptions::default()
+            },
+            db,
+            Some(Arc::new(MemorySecondaryStorage::default())),
+            Vec::new(),
+        ).unwrap()
+    }
+
+    fn fixture_config(id: &str) -> OAuthProviderConfig {
+        OAuthProviderConfig::new(
+            id,
+            Url::parse("https://provider.example/authorize").unwrap(),
+            "client",
+        ).unwrap()
+    }
+
+    #[tokio::test]
+    async fn google_oauth_provisions_numeric_user_and_resolves_session() {
+        let db = Arc::new(MemoryDb::default());
+        let context = fixture_context(db.clone());
+        let service = OAuthService::new(context.clone(), OAuthStateStorage::Verification).unwrap();
+        let provisioner = LegacyProvisioner { db: db.clone() };
+        let provider = FixtureProvider {
+            name: "google", account: "google-123", email: "legacy@example.com", verified: true,
+        };
+        let begin = service.begin(&fixture_config("google"), "https://example.com/callback", true)
+            .await.unwrap();
+        let result = service.complete_with_provisioner(
+            &provider, "code", &begin.state, None, true, &provisioner
+        ).await.unwrap();
+        assert_eq!(result.user.id, "42");
+        assert_eq!(result.session.user_id, "42");
+        assert!(db.find_one("legacy_users", Query::new().eq("id", "42")).await.unwrap().is_some());
+        assert!(db.find_one("user", Query::new().eq("id", "42")).await.unwrap().is_some());
+
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            format!("Bearer {}", result.session_token).parse().unwrap(),
+        );
+        let resolved = SessionService::new(context)
+            .unwrap()
+            .resolve_with_transport(&headers, true, crate::session::SessionTransport::Bearer)
+            .await.unwrap().unwrap();
+        assert_eq!(resolved.user.id, "42");
+
+        // The linked provider account must bypass the provisioner on later logins.
+        let begin = service.begin(&fixture_config("google"), "https://example.com/callback", true)
+            .await.unwrap();
+        let again = service.complete(&provider, "code", &begin.state, None, true).await.unwrap();
+        assert_eq!(again.user.id, "42");
+        assert_eq!(db.find_many("legacy_users", Query::new()).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn github_verified_email_links_existing_user_without_new_legacy_row() {
+        let db = Arc::new(MemoryDb::default());
+        db.insert_record("user", json!({
+            "id": "77", "email": "existing@example.com", "name": "Existing",
+            "email_verified": true, "image": null
+        })).await.unwrap();
+        let context = fixture_context(db.clone());
+        let service = OAuthService::new(context, OAuthStateStorage::Verification).unwrap();
+        let provisioner = LegacyProvisioner { db: db.clone() };
+        let provider = FixtureProvider {
+            name: "github", account: "github-456", email: "existing@example.com", verified: true,
+        };
+        let begin = service.begin(&fixture_config("github"), "https://example.com/callback", true)
+            .await.unwrap();
+        let result = service.complete_with_provisioner(
+            &provider, "code", &begin.state, None, true, &provisioner
+        ).await.unwrap();
+        assert_eq!(result.user.id, "77");
+        assert!(db.find_many("legacy_users", Query::new()).await.unwrap().is_empty());
+        let account = db.find_one("account", Query::new().eq("id", "oauth:github:github-456"))
+            .await.unwrap().unwrap();
+        assert_eq!(account["user_id"], "77");
+    }
+
+    #[tokio::test]
+    async fn unverified_email_cannot_link_existing_user() {
+        let db = Arc::new(MemoryDb::default());
+        db.insert_record("user", json!({
+            "id": "77", "email": "existing@example.com", "name": "Existing",
+            "email_verified": true, "image": null
+        })).await.unwrap();
+        let service = OAuthService::new(fixture_context(db.clone()), OAuthStateStorage::Verification).unwrap();
+        let provider = FixtureProvider {
+            name: "github", account: "unverified-456",
+            email: "existing@example.com", verified: false,
+        };
+        let begin = service.begin(&fixture_config("github"), "https://example.com/callback", true)
+            .await.unwrap();
+        assert!(matches!(
+            service.complete(&provider, "code", &begin.state, None, true).await,
+            Err(AuthError::Unauthorized)
+        ));
+        assert!(db.find_many("account", Query::new()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_better_auth_insert_rolls_back_legacy_user() {
+        let db = Arc::new(MemoryDb::default());
+        db.insert_record("user", json!({
+            "id": "42", "email": "unrelated@example.com", "name": "Unrelated",
+            "email_verified": true, "image": null
+        })).await.unwrap();
+        let service = OAuthService::new(fixture_context(db.clone()), OAuthStateStorage::Verification).unwrap();
+        let provisioner = LegacyProvisioner { db: db.clone() };
+        let provider = FixtureProvider {
+            name: "google", account: "collision", email: "new@example.com", verified: true,
+        };
+        let begin = service.begin(&fixture_config("google"), "https://example.com/callback", true)
+            .await.unwrap();
+        assert!(service.complete_with_provisioner(
+            &provider, "code", &begin.state, None, true, &provisioner
+        ).await.is_err());
+        assert!(db.find_many("legacy_users", Query::new()).await.unwrap().is_empty());
+        assert!(db.find_many("account", Query::new()).await.unwrap().is_empty());
+    }
+
+    struct RejectSession;
+
+    #[async_trait]
+    impl crate::hooks::AuthHooks for RejectSession {
+        async fn before_session_create(&self, _user: &User) -> Result<()> {
+            Err(AuthError::Forbidden("test session rejection".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_session_creation_compensates_both_stores() {
+        let db = Arc::new(MemoryDb::default());
+        let context = AuthContext::new_with_hooks(
+            AuthOptions {
+                secret: "p".repeat(32),
+                base_url: Some(BaseUrl::Static("https://example.com".into())),
+                has_database: true,
+                ..AuthOptions::default()
+            },
+            db.clone(),
+            Some(Arc::new(MemorySecondaryStorage::default())),
+            Vec::new(),
+            vec![Arc::new(RejectSession)],
+        ).unwrap();
+        let service = OAuthService::new(context, OAuthStateStorage::Verification).unwrap();
+        let provisioner = LegacyProvisioner { db: db.clone() };
+        let provider = FixtureProvider {
+            name: "google", account: "session-reject", email: "new@example.com", verified: true,
+        };
+        let begin = service.begin(&fixture_config("google"), "https://example.com/callback", true)
+            .await.unwrap();
+        assert!(service.complete_with_provisioner(
+            &provider, "code", &begin.state, None, true, &provisioner
+        ).await.is_err());
+        for table in ["legacy_users", "user", "account", "session"] {
+            assert!(db.find_many(table, Query::new()).await.unwrap().is_empty(), "{table}");
+        }
+    }
+
 }
