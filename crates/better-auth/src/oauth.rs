@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 const ACCOUNT_TABLE: &str = "account";
 const USER_TABLE: &str = "user";
+const SESSION_TABLE: &str = "session";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OAuthStateStorage {
@@ -286,6 +287,19 @@ pub trait OAuthProvider: Send + Sync {
     }
 }
 
+/// Creates the application-owned identity before a new Better Auth OAuth user is
+/// persisted. For legacy applications, insert the legacy user first and return a
+/// `User` whose ID is the decimal representation of the legacy primary key.
+///
+/// Implementations must make `rollback_user` idempotent. If the Better Auth
+/// transaction, lifecycle hooks, or session creation fails, this hook is called
+/// to compensate for an already-created application identity.
+#[async_trait]
+pub trait OAuthUserProvisioner: Send + Sync {
+    async fn create_user(&self, profile: &OAuthUserProfile) -> Result<User>;
+    async fn rollback_user(&self, user: &User) -> Result<()>;
+}
+
 #[derive(Clone)]
 pub struct OAuthService {
     context: AuthContext,
@@ -321,6 +335,9 @@ impl OAuthService {
             .await
     }
 
+    /// Default OAuth completion retains UUID-based Better Auth user IDs.
+    /// Applications with externally owned numeric IDs should call
+    /// `complete_with_provisioner` instead.
     pub async fn complete<P: OAuthProvider>(
         &self,
         provider: &P,
@@ -328,6 +345,42 @@ impl OAuthService {
         state: &str,
         signed_state_cookie: Option<&str>,
         secure_cookie: bool,
+    ) -> Result<AuthResult> {
+        self.complete_inner(provider, code, state, signed_state_cookie, secure_cookie, None)
+            .await
+    }
+
+    /// Completes OAuth with application-controlled creation of *new* users.
+    /// Existing linked accounts or verified-email matches never call the
+    /// provisioner. The provisioner may allocate a numeric legacy user ID.
+    pub async fn complete_with_provisioner<P: OAuthProvider>(
+        &self,
+        provider: &P,
+        code: &str,
+        state: &str,
+        signed_state_cookie: Option<&str>,
+        secure_cookie: bool,
+        provisioner: &dyn OAuthUserProvisioner,
+    ) -> Result<AuthResult> {
+        self.complete_inner(
+            provider,
+            code,
+            state,
+            signed_state_cookie,
+            secure_cookie,
+            Some(provisioner),
+        )
+        .await
+    }
+
+    async fn complete_inner<P: OAuthProvider>(
+        &self,
+        provider: &P,
+        code: &str,
+        state: &str,
+        signed_state_cookie: Option<&str>,
+        secure_cookie: bool,
+        provisioner: Option<&dyn OAuthUserProvisioner>,
     ) -> Result<AuthResult> {
         if !self.context.options.has_database {
             return Err(AuthError::InvalidConfiguration(
@@ -343,18 +396,37 @@ impl OAuthService {
             .await?;
         provider.validate_tokens(&tokens, &nonce)?;
         let profile = provider.profile(&tokens).await?;
-        let user = self
-            .find_or_create_user(provider.id(), &profile, &tokens)
+        if profile.provider_account_id.trim().is_empty() {
+            return Err(AuthError::InvalidRequest("OAuth provider returned an empty account ID".into()));
+        }
+        let (user, new_user, account_id) = self
+            .find_or_create_user(provider.id(), &profile, &tokens, provisioner)
             .await?;
         let result = SessionService::new(self.context.clone())?
-            .create(user, secure_cookie)
-            .await?;
-        self.context
+            .create(user.clone(), secure_cookie)
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if new_user {
+                    return Err(self.compensate(error, &user, &account_id, provisioner, true).await);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .context
             .after_sign_in(&AuthPrincipal {
                 user: result.user.clone(),
                 session: result.session.clone(),
             })
-            .await?;
+            .await
+        {
+            if new_user {
+                return Err(self.compensate(error, &user, &account_id, provisioner, true).await);
+            }
+            return Err(error);
+        }
         Ok(result)
     }
 
@@ -363,7 +435,8 @@ impl OAuthService {
         provider_id: &str,
         profile: &OAuthUserProfile,
         tokens: &OAuthTokens,
-    ) -> Result<User> {
+        provisioner: Option<&dyn OAuthUserProvisioner>,
+    ) -> Result<(User, bool, String)> {
         let account_id = format!("oauth:{provider_id}:{}", profile.provider_account_id);
         if let Some(account) = self
             .context
@@ -381,37 +454,61 @@ impl OAuthService {
                 .find_one(USER_TABLE, Query::new().eq("id", user_id.to_owned()))
                 .await?
                 .ok_or(AuthError::Unauthorized)?;
-            return serde_json::from_value(value).map_err(serialize_error);
+            let user = serde_json::from_value(value).map_err(serialize_error)?;
+            return Ok((user, false, account_id));
         }
         let email = profile
             .email
-            .clone()
-            .ok_or_else(|| {
-                AuthError::InvalidRequest("OAuth provider did not return an email".into())
-            })?
+            .as_deref()
+            .ok_or_else(|| AuthError::InvalidRequest("OAuth provider did not return an email".into()))?
             .trim()
             .to_ascii_lowercase();
-        let (user, new_user) = if let Some(value) = self
+        if email.is_empty() {
+            return Err(AuthError::InvalidRequest("OAuth provider returned an empty email".into()));
+        }
+        let existing = self
             .context
             .adapter
             .find_one(USER_TABLE, Query::new().eq("email", email.clone()))
-            .await?
-        {
-            (
-                serde_json::from_value(value).map_err(serialize_error)?,
-                None,
-            )
+            .await?;
+        if existing.is_some() && !profile.email_verified {
+            return Err(AuthError::Unauthorized);
+        }
+
+        let mut new_user = None;
+        let user = if let Some(value) = existing {
+            serde_json::from_value(value).map_err(serialize_error)?
         } else {
-            let mut user = User {
-                id: Uuid::new_v4().to_string(),
-                email,
-                name: profile.name.clone().unwrap_or_else(|| "User".into()),
-                email_verified: profile.email_verified,
-                image: profile.image.clone(),
-                additional_fields: serde_json::Map::new(),
+            let mut user = if let Some(provisioner) = provisioner {
+                provisioner.create_user(profile).await?
+            } else {
+                User {
+                    id: Uuid::new_v4().to_string(),
+                    email: email.clone(),
+                    name: profile.name.clone().unwrap_or_else(|| "User".into()),
+                    email_verified: profile.email_verified,
+                    image: profile.image.clone(),
+                    additional_fields: serde_json::Map::new(),
+                }
             };
-            self.context.before_user_create(&mut user).await?;
-            (user.clone(), Some(user))
+            let original = user.clone();
+            if user.id.trim().is_empty() || user.email != email {
+                let error = AuthError::InvalidRequest(
+                    "OAuth provisioner must return a non-empty ID and the normalized provider email".into(),
+                );
+                return Err(self.rollback_provisioner(error, &original, provisioner).await);
+            }
+            if let Err(error) = self.context.before_user_create(&mut user).await {
+                return Err(self.rollback_provisioner(error, &original, provisioner).await);
+            }
+            if provisioner.is_some() && (user.id != original.id || user.email != original.email) {
+                let error = AuthError::InvalidRequest(
+                    "OAuth lifecycle hooks must not change provisioned identity".into(),
+                );
+                return Err(self.rollback_provisioner(error, &original, provisioner).await);
+            }
+            new_user = Some(user.clone());
+            user
         };
         let is_new_user = new_user.is_some();
         let mut operations = Vec::with_capacity(2);
@@ -431,11 +528,62 @@ impl OAuthService {
                 "token_envelope": self.token_vault.seal(provider_id, tokens)?,
             }),
         });
-        self.context.adapter.transaction(operations).await?;
-        if is_new_user {
-            self.context.after_user_create(&user).await?;
+        if let Err(error) = self.context.adapter.transaction(operations).await {
+            if is_new_user {
+                return Err(self.rollback_provisioner(error, &user, provisioner).await);
+            }
+            return Err(error);
         }
-        Ok(user)
+        if is_new_user {
+            if let Err(error) = self.context.after_user_create(&user).await {
+                return Err(self.compensate(error, &user, &account_id, provisioner, true).await);
+            }
+        }
+        Ok((user, is_new_user, account_id))
+    }
+
+    async fn rollback_provisioner(
+        &self,
+        error: AuthError,
+        user: &User,
+        provisioner: Option<&dyn OAuthUserProvisioner>,
+    ) -> AuthError {
+        if let Some(provisioner) = provisioner {
+            if let Err(cleanup) = provisioner.rollback_user(user).await {
+                return AuthError::Adapter(format!("{error}; legacy rollback failed: {cleanup}"));
+            }
+        }
+        error
+    }
+
+    async fn compensate(
+        &self,
+        error: AuthError,
+        user: &User,
+        account_id: &str,
+        provisioner: Option<&dyn OAuthUserProvisioner>,
+        persisted: bool,
+    ) -> AuthError {
+        if persisted {
+            let cleanup = self.context.adapter.transaction(vec![
+                DbOperation::DeleteWhere {
+                    table: SESSION_TABLE.into(),
+                    query: Query::new().eq("user_id", user.id.clone()),
+                },
+                DbOperation::DeleteWhere {
+                    table: ACCOUNT_TABLE.into(),
+                    query: Query::new().eq("id", account_id.to_owned()).eq("user_id", user.id.clone()),
+                },
+                DbOperation::DeleteWhere {
+                    table: USER_TABLE.into(),
+                    query: Query::new().eq("id", user.id.clone()),
+                },
+            ]).await;
+            if let Err(cleanup) = cleanup {
+                return AuthError::Adapter(format!("{error}; Better Auth rollback failed: {cleanup}"));
+            }
+        }
+        self.rollback_provisioner(error, user, provisioner).await
     }
 }
 
