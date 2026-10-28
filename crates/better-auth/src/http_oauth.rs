@@ -199,9 +199,34 @@ impl OAuthProvider for HttpOAuthProvider {
                 "OAuth profile has no provider account id".into(),
             ));
         };
+        // GitHub's /user response does not attest email ownership. Fetch the
+        // verified primary email from /user/emails when available; otherwise
+        // treat the profile email as unverified (never silently link accounts).
+        let mut email = body.get("email").and_then(Value::as_str).map(str::to_owned);
+        let mut email_verified = body
+            .get("email_verified")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if self.id == "github" {
+            email_verified = false;
+            let emails = self.client
+                .get("https://api.github.com/user/emails")
+                .bearer_auth(&tokens.access_token)
+                .header("User-Agent", "better-auth-rust")
+                .send()
+                .await
+                .map_err(network_error)?;
+            if emails.status().is_success() {
+                let emails: Value = emails.json().await.map_err(network_error)?;
+                if let Some(verified_email) = github_verified_email(&emails) {
+                    email = Some(verified_email);
+                    email_verified = true;
+                }
+            }
+        }
         Ok(OAuthUserProfile {
             provider_account_id: account_id,
-            email: body.get("email").and_then(Value::as_str).map(str::to_owned),
+            email,
             name: body
                 .get("name")
                 .and_then(Value::as_str)
@@ -212,10 +237,7 @@ impl OAuthProvider for HttpOAuthProvider {
                 .or_else(|| body.get("avatar_url"))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            email_verified: body
-                .get("email_verified")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
+            email_verified,
         })
     }
 
@@ -225,6 +247,52 @@ impl OAuthProvider for HttpOAuthProvider {
             validator.validate(id_token, Some(expected_nonce))?;
         }
         Ok(())
+    }
+}
+
+/// Pick a *verified* GitHub email, preferring its primary address.
+fn github_verified_email(emails: &Value) -> Option<String> {
+    let entries = emails.as_array()?;
+    entries
+        .iter()
+        .filter(|entry| entry.get("verified").and_then(Value::as_bool) == Some(true))
+        .filter_map(|entry| {
+            let email = entry.get("email").and_then(Value::as_str)?.trim();
+            if email.is_empty() {
+                return None;
+            }
+            let primary = entry.get("primary").and_then(Value::as_bool).unwrap_or(false);
+            Some((primary, email.to_owned()))
+        })
+        .max_by_key(|(primary, _)| *primary)
+        .map(|(_, email)| email)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn github_email_selection_requires_verification() {
+        let addresses = json!([
+            {"email":"spoof@example.com", "primary":true, "verified":false},
+            {"email":"verified@example.com", "primary":false, "verified":true}
+        ]);
+        assert_eq!(github_verified_email(&addresses).as_deref(), Some("verified@example.com"));
+        assert_eq!(github_verified_email(&json!([
+            {"email":"spoof@example.com", "primary":true, "verified":false}
+        ])), None);
+        assert_eq!(github_verified_email(&json!([])), None);
+    }
+
+    #[test]
+    fn github_email_selection_prefers_verified_primary() {
+        let addresses = json!([
+            {"email":"other@example.com", "verified":true, "primary":false},
+            {"email":"primary@example.com", "verified":true, "primary":true}
+        ]);
+        assert_eq!(github_verified_email(&addresses).as_deref(), Some("primary@example.com"));
     }
 }
 
