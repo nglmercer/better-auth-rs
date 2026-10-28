@@ -425,6 +425,16 @@ impl OAuthService {
             if new_user {
                 return Err(self.compensate(error, &user, &account_id, provisioner, true).await);
             }
+            // A sign-in hook can reject an existing account after its session
+            // was inserted. Revoke that new session without touching the user.
+            if let Err(cleanup) = self.context.adapter.delete_where(
+                SESSION_TABLE,
+                Query::new().eq("id", result.session.id.clone()),
+            ).await {
+                return Err(AuthError::Adapter(format!(
+                    "{error}; OAuth session rollback failed: {cleanup}"
+                )));
+            }
             return Err(error);
         }
         Ok(result)
