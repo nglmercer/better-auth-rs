@@ -968,4 +968,43 @@ mod tests {
         assert!(db.find_many("account", Query::new()).await.unwrap().is_empty());
     }
 
+    struct RejectSession;
+
+    #[async_trait]
+    impl crate::hooks::AuthHooks for RejectSession {
+        async fn before_session_create(&self, _user: &User) -> Result<()> {
+            Err(AuthError::Forbidden("test session rejection".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_session_creation_compensates_both_stores() {
+        let db = Arc::new(MemoryDb::default());
+        let context = AuthContext::new_with_hooks(
+            AuthOptions {
+                secret: "p".repeat(32),
+                base_url: Some(BaseUrl::Static("https://example.com".into())),
+                has_database: true,
+                ..AuthOptions::default()
+            },
+            db.clone(),
+            Some(Arc::new(MemorySecondaryStorage::default())),
+            Vec::new(),
+            vec![Arc::new(RejectSession)],
+        ).unwrap();
+        let service = OAuthService::new(context, OAuthStateStorage::Verification).unwrap();
+        let provisioner = LegacyProvisioner { db: db.clone() };
+        let provider = FixtureProvider {
+            name: "google", account: "session-reject", email: "new@example.com", verified: true,
+        };
+        let begin = service.begin(&fixture_config("google"), "https://example.com/callback", true)
+            .await.unwrap();
+        assert!(service.complete_with_provisioner(
+            &provider, "code", &begin.state, None, true, &provisioner
+        ).await.is_err());
+        for table in ["legacy_users", "user", "account", "session"] {
+            assert!(db.find_many(table, Query::new()).await.unwrap().is_empty(), "{table}");
+        }
+    }
+
 }
