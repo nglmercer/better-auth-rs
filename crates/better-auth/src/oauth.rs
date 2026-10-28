@@ -466,6 +466,9 @@ impl OAuthService {
         if email.is_empty() {
             return Err(AuthError::InvalidRequest("OAuth provider returned an empty email".into()));
         }
+        // Encrypt tokens before allocating an external legacy row, so a
+        // vault/serialization failure cannot leave that row orphaned.
+        let token_envelope = self.token_vault.seal(provider_id, tokens)?;
         let existing = self
             .context
             .adapter
@@ -525,7 +528,7 @@ impl OAuthService {
                 "user_id": user.id,
                 "provider_id": provider_id,
                 "account_id": profile.provider_account_id,
-                "token_envelope": self.token_vault.seal(provider_id, tokens)?,
+                "token_envelope": token_envelope,
             }),
         });
         if let Err(error) = self.context.adapter.transaction(operations).await {
