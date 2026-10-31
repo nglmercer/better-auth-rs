@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { AuthClient, AuthClientError } from "../src/index";
+import {
+  AuthClient,
+  AuthClientError,
+  isTwoFactorChallenge,
+} from "../src/index";
 
 function jsonResponse(
   value: unknown,
@@ -219,6 +223,132 @@ describe("AuthClient", () => {
 
     await expect(client.request("/broken", { method: "GET" })).rejects.toBeInstanceOf(
       AuthClientError,
+    );
+  });
+});
+
+describe("AuthClient account and second-factor routes", () => {
+  function clientWith(...responses: Response[]) {
+    const fetchMock = makeFetch(...responses);
+    const client = new AuthClient({
+      baseURL: "https://example.test/api/auth",
+      fetch: fetchMock,
+    });
+    return { client, fetchMock };
+  }
+
+  function sentRequest(fetchMock: ReturnType<typeof makeFetch>, index = 0) {
+    const [url, init] = fetchMock.mock.calls[index] as [string, RequestInit];
+    return { url, method: init.method, body: init.body ? JSON.parse(String(init.body)) : undefined };
+  }
+
+  it("sends snake_case bodies for account changes", async () => {
+    const { client, fetchMock } = clientWith(
+      jsonResponse({ changed: true, revoked_sessions: 2 }),
+      jsonResponse({ user: { id: "u", email: "a@b.c", name: "New", email_verified: false, image: null } }),
+    );
+    await client.changePassword({ currentPassword: "old-password-1", newPassword: "new-password-2" });
+    expect(sentRequest(fetchMock, 0)).toEqual({
+      url: "https://example.test/api/auth/change-password",
+      method: "POST",
+      body: { current_password: "old-password-1", new_password: "new-password-2" },
+    });
+    await client.updateUser({ name: "New" });
+    expect(sentRequest(fetchMock, 1).url).toBe("https://example.test/api/auth/update-user");
+  });
+
+  it("lists and revokes sessions by id", async () => {
+    const { client, fetchMock } = clientWith(
+      jsonResponse({ sessions: [{ id: "s1", expires_at: 1, current: true }] }),
+      jsonResponse({ revoked: 1 }),
+    );
+    await expect(client.listSessions()).resolves.toEqual({
+      sessions: [{ id: "s1", expires_at: 1, current: true }],
+    });
+    await client.revokeSession("s2");
+    expect(sentRequest(fetchMock, 0).method).toBe("GET");
+    expect(sentRequest(fetchMock, 1).body).toEqual({ id: "s2" });
+  });
+
+  it("returns a challenge instead of a session when two-factor is enabled", async () => {
+    const { client } = clientWith(
+      jsonResponse({ two_factor_required: true, challenge_token: "challenge" }),
+    );
+    const response = await client.signIn.email({ email: "a@b.c", password: "password-1" });
+    expect(isTwoFactorChallenge(response)).toBe(true);
+    if (isTwoFactorChallenge(response)) {
+      expect(response.challenge_token).toBe("challenge");
+    }
+  });
+
+  it("verifies a second factor with the challenge token", async () => {
+    const { client, fetchMock } = clientWith(
+      jsonResponse({
+        user: { id: "u", email: "a@b.c", name: "A", email_verified: true, image: null },
+        session: { id: "s", user_id: "u", expires_at: 1 },
+      }),
+    );
+    await client.twoFactor.verify({ challengeToken: "challenge", code: "123456" });
+    expect(sentRequest(fetchMock).body).toEqual({
+      challenge_token: "challenge",
+      code: "123456",
+    });
+  });
+
+  it("sends passwordless and admin requests with the server's field names", async () => {
+    const { client, fetchMock } = clientWith(
+      jsonResponse({ sent: true }),
+      jsonResponse({ sent: true }),
+      jsonResponse({ users: [] }),
+      jsonResponse({ updated: true }),
+    );
+    await client.magicLink.send({ email: "a@b.c" });
+    await client.emailOtp.send({ email: "a@b.c" });
+    await client.admin.listUsers({ limit: 10, offset: 20 });
+    await client.admin.setRole({ userId: "u1", role: "admin" });
+    expect(sentRequest(fetchMock, 0).url).toBe("https://example.test/api/auth/sign-in/magic-link");
+    expect(sentRequest(fetchMock, 1).url).toBe("https://example.test/api/auth/email-otp/send");
+    expect(sentRequest(fetchMock, 2).url).toBe(
+      "https://example.test/api/auth/admin/list-users?limit=10&offset=20",
+    );
+    expect(sentRequest(fetchMock, 3).body).toEqual({ user_id: "u1", role: "admin" });
+  });
+
+  it("sends passkey ceremonies and management with the server's field names", async () => {
+    const { client, fetchMock } = clientWith(
+      jsonResponse({ transaction_id: "tx", options: { publicKey: {} } }),
+      jsonResponse({ passkey: { id: "p", name: "Laptop", credential_id: "c" } }),
+      jsonResponse({ transaction_id: "tx2", options: { publicKey: {} } }),
+      jsonResponse({ user: { id: "u", email: "a@b.c", name: "A", email_verified: true, image: null }, session: { id: "s", user_id: "u", expires_at: 1 } }),
+      jsonResponse({ passkeys: [] }),
+      jsonResponse({ updated: true }),
+      jsonResponse({ deleted: true }),
+    );
+    await client.passkey.registerOptions();
+    await client.passkey.register({ transactionId: "tx", response: { id: "c" }, name: "Laptop" });
+    await client.passkey.signInOptions();
+    await client.passkey.signIn({ transactionId: "tx2", response: { id: "c" } });
+    await client.passkey.list();
+    await client.passkey.rename({ id: "p", name: "Work" });
+    await client.passkey.delete({ id: "p" });
+    expect(sentRequest(fetchMock, 0).url).toBe(
+      "https://example.test/api/auth/passkey/generate-register-options",
+    );
+    expect(sentRequest(fetchMock, 1).body).toEqual({
+      transaction_id: "tx",
+      response: { id: "c" },
+      name: "Laptop",
+    });
+    expect(sentRequest(fetchMock, 3).body).toEqual({
+      transaction_id: "tx2",
+      response: { id: "c" },
+    });
+    expect(sentRequest(fetchMock, 4).url).toBe(
+      "https://example.test/api/auth/passkey/list-user-passkeys",
+    );
+    expect(sentRequest(fetchMock, 5).body).toEqual({ id: "p", name: "Work" });
+    expect(sentRequest(fetchMock, 6).url).toBe(
+      "https://example.test/api/auth/passkey/delete-passkey",
     );
   });
 });

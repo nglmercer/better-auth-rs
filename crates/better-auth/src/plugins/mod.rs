@@ -1,24 +1,37 @@
 mod admin;
+mod api_key;
 mod jwt;
 mod organization;
 mod passkey;
+mod passwordless;
 mod scim;
 mod shared;
 mod sso;
 mod two_factor;
+mod username;
 
+pub(crate) use admin::account_is_banned;
+pub(crate) use admin::admin_grants;
 pub use admin::{AdminGuard, AdminPlugin, AdminService};
+pub use api_key::{ApiKeyPlugin, API_KEY_PLUGIN};
 pub use jwt::JwtPlugin;
 pub use organization::{Organization, OrganizationMember, OrganizationPlugin, OrganizationService};
 pub use passkey::{PasskeyChallenge, PasskeyPlugin, PasskeyService};
+pub use passwordless::{
+    AnonymousPlugin, DeviceAuthorizationPlugin, EmailOtpPlugin, LastLoginMethodPlugin,
+    MagicLinkPlugin, MultiSessionPlugin, OneTapPlugin, OneTimeTokenPlugin, PhoneNumberPlugin,
+    SiwePlugin,
+};
 pub use scim::{
     generate_scim_token, verify_scim_token, ScimBulkOperation, ScimBulkResponse, ScimGroup,
     ScimGroupMember, ScimPatchOperation, ScimPlugin, ScimService, ScimTokenRecord,
 };
 pub use sso::{SsoConnectionConfig, SsoConnectionService, SsoPlugin};
+pub(crate) use two_factor::build_otpauth_url;
 pub use two_factor::{
     generate_totp_secret, totp_code, verify_totp, BackupCodeSet, TotpSecret, TwoFactorPlugin,
 };
+pub use username::{UsernamePlugin, USERNAME_PLUGIN};
 
 #[cfg(test)]
 mod tests {

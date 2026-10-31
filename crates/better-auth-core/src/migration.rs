@@ -114,9 +114,11 @@ impl MigrationPlan {
                             } else {
                                 ""
                             };
-                            let primary_key = (schema.primary_key.as_deref() == Some(field))
-                                .then_some(" PRIMARY KEY")
-                                .unwrap_or_default();
+                            let primary_key = if schema.primary_key.as_deref() == Some(field) {
+                                " PRIMARY KEY"
+                            } else {
+                                ""
+                            };
                             format!(
                                 "{} {}{}{}",
                                 quote(field, dialect),
@@ -147,12 +149,22 @@ impl MigrationPlan {
                         ""
                     }
                 ),
-                MigrationStep::CreateUniqueIndex { table, field } => format!(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
-                    quote(&format!("{table}_{field}_unique"), dialect),
-                    quote(table, dialect),
-                    quote(field, dialect)
-                ),
+                MigrationStep::CreateUniqueIndex { table, field } => match dialect {
+                    // MySQL has no `CREATE INDEX IF NOT EXISTS`; `apply` checks
+                    // for the index first instead.
+                    SqlDialect::MySql => format!(
+                        "CREATE UNIQUE INDEX {} ON {} ({});",
+                        quote(&unique_index_name(table, field), dialect),
+                        quote(table, dialect),
+                        quote(field, dialect)
+                    ),
+                    SqlDialect::Postgres | SqlDialect::Sqlite => format!(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({});",
+                        quote(&unique_index_name(table, field), dialect),
+                        quote(table, dialect),
+                        quote(field, dialect)
+                    ),
+                },
             })
             .collect()
     }
@@ -163,6 +175,16 @@ impl MigrationPlan {
         dialect: SqlDialect,
     ) -> Result<()> {
         for (step, statement) in self.steps.iter().zip(self.sql(dialect)) {
+            if let MigrationStep::CreateUniqueIndex { table, field } = step {
+                if dialect == SqlDialect::MySql
+                    && executor
+                        .index_exists(table, &unique_index_name(table, field))
+                        .await?
+                        .is_some_and(|exists| exists)
+                {
+                    continue;
+                }
+            }
             if let MigrationStep::AddField { table, name, .. } = step {
                 if executor
                     .column_exists(table, name)
@@ -188,6 +210,16 @@ pub trait MigrationExecutor: Send + Sync {
     async fn column_exists(&self, _table: &str, _column: &str) -> Result<Option<bool>> {
         Ok(None)
     }
+
+    /// Returns `Some(true/false)` when the executor can inspect indexes. Used
+    /// only where the dialect cannot create an index conditionally.
+    async fn index_exists(&self, _table: &str, _index: &str) -> Result<Option<bool>> {
+        Ok(None)
+    }
+}
+
+fn unique_index_name(table: &str, field: &str) -> String {
+    format!("{table}_{field}_unique")
 }
 
 pub fn migration_error(message: impl Into<String>) -> AuthError {
@@ -212,10 +244,18 @@ fn quote(value: &str, dialect: SqlDialect) -> String {
 
 fn sql_type(field_type: &crate::schema::FieldType, dialect: SqlDialect) -> &'static str {
     match field_type {
-        crate::schema::FieldType::String => "TEXT",
+        // MySQL cannot index TEXT without a prefix length. A bounded VARCHAR
+        // keeps primary and unique string keys valid; 512 covers the longest
+        // indexed value, an email address of up to 320 characters.
+        crate::schema::FieldType::String => match dialect {
+            SqlDialect::MySql => "VARCHAR(512)",
+            SqlDialect::Postgres | SqlDialect::Sqlite => "TEXT",
+        },
         crate::schema::FieldType::Integer => "BIGINT",
+        // MySQL booleans are stored as BIGINT: the sqlx `Any` driver cannot
+        // decode TINYINT(1), and the adapter maps 0/1 back to booleans.
         crate::schema::FieldType::Boolean => match dialect {
-            SqlDialect::MySql => "TINYINT(1)",
+            SqlDialect::MySql => "BIGINT",
             SqlDialect::Postgres | SqlDialect::Sqlite => "BOOLEAN",
         },
         // Better Auth currently serializes timestamps as Unix seconds. A

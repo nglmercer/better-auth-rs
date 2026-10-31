@@ -265,9 +265,9 @@ pub fn record_id(record: &Value) -> Result<String> {
         .ok_or_else(|| AuthError::Adapter("adapter result is missing string id".into()))
 }
 
-/// Small in-memory implementations are useful for tests and examples. They
-/// are intentionally kept here as explicit opt-in test infrastructure rather
-/// than being a default persistence layer.
+// Small in-memory implementations are useful for tests and examples. They
+// are intentionally kept here as explicit opt-in test infrastructure rather
+// than being a default persistence layer.
 
 /// KV storage for sessions, verification records, OAuth state, and rate-limit
 /// counters. `increment` must be atomic in production adapters.

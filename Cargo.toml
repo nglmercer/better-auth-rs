@@ -8,7 +8,7 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "MIT"
-rust-version = "1.88"
+rust-version = "1.89"
 
 [workspace.dependencies]
 aes-gcm = "0.10"
@@ -24,6 +24,9 @@ tokio = { version = "1", features = ["rt", "time"] }
 hmac = "0.12"
 http = "1"
 jsonwebtoken = "9"
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic", "std"] }
+sha3 = "0.10"
+rsa = { version = "0.9", features = ["pem"] }
 libsql = "0.9"
 password-hash = "0.5"
 secrecy = "0.10"
@@ -33,10 +36,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 subtle = "2"
+getrandom = "0.2"
 thiserror = "2"
+tracing = "0.1"
 url = "2"
-webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
-uuid = { version = "1", features = ["v4", "serde"] }
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation", "conditional-ui"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+# SMTP over TLS. Defaults are off so the ring provider is the only one compiled in.
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+webpki-roots = "1"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

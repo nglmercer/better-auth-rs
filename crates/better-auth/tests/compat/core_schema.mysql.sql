@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS `account` (`account_id` VARCHAR(512) NOT NULL, `id` VARCHAR(512) NOT NULL PRIMARY KEY, `password_hash` VARCHAR(512), `provider_id` VARCHAR(512) NOT NULL, `user_id` VARCHAR(512) NOT NULL);
+CREATE UNIQUE INDEX `account_id_unique` ON `account` (`id`);
+CREATE TABLE IF NOT EXISTS `session` (`expires_at` BIGINT NOT NULL, `id` VARCHAR(512) NOT NULL PRIMARY KEY, `token_hash` VARCHAR(512) NOT NULL, `user_id` VARCHAR(512) NOT NULL);
+CREATE UNIQUE INDEX `session_id_unique` ON `session` (`id`);
+CREATE UNIQUE INDEX `session_token_hash_unique` ON `session` (`token_hash`);
+CREATE TABLE IF NOT EXISTS `user` (`additional_fields` TEXT, `email` VARCHAR(512) NOT NULL, `email_verified` BIGINT NOT NULL, `id` VARCHAR(512) NOT NULL PRIMARY KEY, `image` VARCHAR(512), `name` VARCHAR(512) NOT NULL, `role` VARCHAR(512));
+CREATE UNIQUE INDEX `user_email_unique` ON `user` (`email`);
+CREATE UNIQUE INDEX `user_id_unique` ON `user` (`id`);
+CREATE TABLE IF NOT EXISTS `verification` (`expires_at` BIGINT NOT NULL, `id` VARCHAR(512) NOT NULL PRIMARY KEY, `identifier` VARCHAR(512) NOT NULL, `value` VARCHAR(512) NOT NULL);
+CREATE UNIQUE INDEX `verification_id_unique` ON `verification` (`id`);

@@ -206,4 +206,55 @@ class AuthClientTest {
             ContentType.Application.Json.toString(),
         )
     }
+
+    @Test
+    fun twoFactorChallengeIsReportedInsteadOfDecodedAsASession() = runTest {
+        var request: HttpRequestData? = null
+        val httpClient = HttpClient(MockEngine) {
+            engine {
+                addHandler {
+                    request = it
+                    respond(
+                        content = """{"two_factor_required":true,"challenge_token":"challenge-1"}""",
+                        status = HttpStatusCode.OK,
+                        headers = JSON_HEADERS,
+                    )
+                }
+            }
+        }
+        val client = AuthClient("http://localhost/api/auth", httpClient)
+
+        val result = client.signInEmailOrChallenge(SignInEmailInput("user@example.com", "password"))
+
+        assertEquals(SignInResult.TwoFactorRequired("challenge-1"), result)
+        assertEquals("/api/auth/sign-in/email", request?.url?.encodedPath)
+    }
+
+    @Test
+    fun accountRoutesUseServerFieldNames() = runTest {
+        val bodies = mutableListOf<Pair<String, String>>()
+        val httpClient = HttpClient(MockEngine) {
+            engine {
+                addHandler { request ->
+                    val body = (request.body as? TextContent)?.text.orEmpty()
+                    bodies += request.url.encodedPath to body
+                    respond(
+                        content = """{"changed":true,"revoked_sessions":2}""",
+                        status = HttpStatusCode.OK,
+                        headers = JSON_HEADERS,
+                    )
+                }
+            }
+        }
+        val client = AuthClient("http://localhost/api/auth", httpClient)
+
+        val result = client.changePassword("old-password-1", "new-password-2")
+
+        assertEquals(2, result.revokedSessions)
+        assertEquals("/api/auth/change-password", bodies.single().first)
+        assertEquals(
+            """{"current_password":"old-password-1","new_password":"new-password-2"}""",
+            bodies.single().second,
+        )
+    }
 }

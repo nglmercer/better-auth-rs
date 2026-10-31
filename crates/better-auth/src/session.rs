@@ -77,12 +77,8 @@ impl SessionService {
             "expires_at": session.expires_at,
             "token_hash": hash_session_token(&token),
         });
-        if self.context.options.has_database {
-            self.context
-                .adapter
-                .insert_record(SESSION_TABLE, record)
-                .await?;
-        }
+        // Build everything that can fail before writing, so a failure here
+        // cannot leave a persisted session the client never receives.
         let cookie = self.build_cookie(&user, &session, &token, secure_cookie)?;
         let result = AuthResult {
             user,
@@ -90,10 +86,34 @@ impl SessionService {
             cookie,
             session_token: token,
         };
-        self.context
+        if self.context.options.has_database {
+            self.context
+                .adapter
+                .insert_record(SESSION_TABLE, record)
+                .await?;
+        }
+        if let Err(error) = self
+            .context
             .after_session_create(&result.user, &result.session)
-            .await?;
+            .await
+        {
+            // Best effort: the original hook error is what the caller needs.
+            let _ = self.discard(&result.session.id).await;
+            return Err(error);
+        }
         Ok(result)
+    }
+
+    /// Deletes a session that was persisted but will not be delivered to the
+    /// client, so it cannot remain valid as an orphan.
+    pub async fn discard(&self, session_id: &str) -> Result<u64> {
+        if !self.context.options.has_database {
+            return Ok(0);
+        }
+        self.context
+            .adapter
+            .delete_where(SESSION_TABLE, Query::new().eq("id", session_id.to_owned()))
+            .await
     }
 
     /// Resolves the current session from request metadata. This is suitable

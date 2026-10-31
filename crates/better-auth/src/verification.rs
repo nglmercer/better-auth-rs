@@ -50,6 +50,27 @@ impl VerificationService {
         Ok(token)
     }
 
+    /// Deletes a token only when it belongs to `subject` and `purpose`. Other
+    /// callers learn nothing: the result is the same as for an unknown token.
+    pub async fn revoke_for_subject(
+        &self,
+        purpose: &str,
+        token: &str,
+        subject: &str,
+    ) -> Result<bool> {
+        let key = verification_key(purpose, token);
+        let Some(value) = self.storage.get(&key).await? else {
+            return Ok(false);
+        };
+        let record: StoredVerification =
+            serde_json::from_value(value.value).map_err(serialize_error)?;
+        if record.purpose != purpose || record.subject != subject {
+            return Ok(false);
+        }
+        self.storage.delete(&key).await?;
+        Ok(true)
+    }
+
     pub async fn consume(&self, purpose: &str, token: &str) -> Result<Option<String>> {
         let Some(value) = self
             .storage
@@ -157,12 +178,18 @@ impl PasswordResetService {
     }
 
     pub async fn reset(&self, token: &str, new_password: &str) -> Result<bool> {
-        if new_password.is_empty() {
-            return Err(AuthError::InvalidRequest("password cannot be empty".into()));
-        }
+        crate::email_password::validate_password(new_password)?;
         let Some(user_id) = self.verification.consume("password-reset", token).await? else {
             return Ok(false);
         };
+        self.reset_for_user(&user_id, new_password).await?;
+        Ok(true)
+    }
+
+    /// Sets a new password and ends the user's sessions. Callers must already have
+    /// proven control of the account, for example with a single-use code.
+    pub async fn reset_for_user(&self, user_id: &str, new_password: &str) -> Result<()> {
+        crate::email_password::validate_password(new_password)?;
         let account_id = format!("{user_id}:credential");
         let Some(mut account) = self
             .context
@@ -182,9 +209,9 @@ impl PasswordResetService {
             .adapter
             .update_where("account", Query::new().eq("id", account_id), account)
             .await?;
-        self.sessions.revoke_all_for_user(&user_id).await?;
-        self.context.after_password_change(&user_id).await?;
-        Ok(true)
+        self.sessions.revoke_all_for_user(user_id).await?;
+        self.context.after_password_change(user_id).await?;
+        Ok(())
     }
 }
 

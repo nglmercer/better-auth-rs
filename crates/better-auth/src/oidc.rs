@@ -70,8 +70,10 @@ impl OidcIdTokenValidator {
         Ok(count)
     }
 
-    #[cfg(test)]
-    fn add_test_hs_key(mut self, key_id: impl Into<String>, secret: &[u8]) -> Self {
+    /// Adds an HS256 key. Test builds and the `test-utils` feature only, because a
+    /// shared secret must never be used as an ID-token signing key in production.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn add_test_hs_key(mut self, key_id: impl Into<String>, secret: &[u8]) -> Self {
         self.keys.insert(
             key_id.into(),
             (DecodingKey::from_secret(secret), Algorithm::HS256),
@@ -96,6 +98,14 @@ impl OidcIdTokenValidator {
         if token.iss != self.issuer || !audience_contains(&token.aud, &self.audience) {
             return Err(AuthError::Unauthorized);
         }
+        // OIDC Core: with several audiences the authorized party must be this
+        // client. Requiring it here fails closed when `azp` is missing.
+        if is_multi_audience(&token.aud) && token.azp.as_deref() != Some(self.audience.as_str()) {
+            return Err(AuthError::Unauthorized);
+        }
+        if token.azp.as_deref().is_some_and(|azp| azp != self.audience) {
+            return Err(AuthError::Unauthorized);
+        }
         if let Some(expected_nonce) = expected_nonce {
             if token.nonce.as_deref() != Some(expected_nonce) {
                 return Err(AuthError::Unauthorized);
@@ -116,6 +126,16 @@ pub struct OidcClaims {
     pub nonce: Option<String>,
     #[serde(default)]
     pub azp: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub email_verified: Option<bool>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+fn is_multi_audience(audience: &Value) -> bool {
+    matches!(audience, Value::Array(values) if values.len() > 1)
 }
 
 fn audience_contains(audience: &Value, expected: &str) -> bool {
@@ -143,6 +163,7 @@ mod tests {
             "iss": "https://issuer.example",
             "sub": "subject-1",
             "aud": ["client-1", "other-client"],
+            "azp": "client-1",
             "exp": (now_seconds() + 60) as usize,
             "iat": now_seconds() as usize,
             "nonce": "nonce-1"
@@ -153,6 +174,36 @@ mod tests {
             "subject-1"
         );
         assert!(validator.validate(&token, Some("wrong")).is_err());
+    }
+
+    #[test]
+    fn multi_audience_tokens_require_matching_authorized_party() {
+        let secret = b"oidc-test-secret";
+        let validator = OidcIdTokenValidator::new("https://issuer.example", "client-1")
+            .add_test_hs_key("test", secret);
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("test".into());
+        let base = |azp: Option<&str>| {
+            let mut claims = json!({
+                "iss": "https://issuer.example",
+                "sub": "subject-1",
+                "aud": ["client-1", "other-client"],
+                "exp": (now_seconds() + 60) as usize,
+                "iat": now_seconds() as usize,
+                "nonce": "nonce-1"
+            });
+            if let Some(azp) = azp {
+                claims["azp"] = json!(azp);
+            }
+            encode(&header, &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        assert!(validator.validate(&base(None), Some("nonce-1")).is_err());
+        assert!(validator
+            .validate(&base(Some("other-client")), Some("nonce-1"))
+            .is_err());
+        assert!(validator
+            .validate(&base(Some("client-1")), Some("nonce-1"))
+            .is_ok());
     }
 
     #[test]

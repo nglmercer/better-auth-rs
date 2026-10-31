@@ -1,7 +1,7 @@
 use axum::{
     http::header,
     response::{Html, IntoResponse},
-    routing::{get, post},
+    routing::{any, get},
     Router,
 };
 use better_auth::{
@@ -61,13 +61,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/", get(index))
         .route("/styles.css", get(styles))
         .route("/app.js", get(app_js))
-        .route("/api/auth/sign-up/email", post(axum_adapter::handler))
-        .route("/api/auth/sign-in/email", post(axum_adapter::handler))
-        .route(
-            "/api/auth/request-password-reset",
-            post(axum_adapter::handler),
-        )
-        .route("/api/auth/reset-password", post(axum_adapter::handler))
+        // Every auth route goes through the router, so the router decides what
+        // exists. Mounting paths one by one silently 404s any route added later.
+        .route("/api/auth/{*path}", any(axum_adapter::handler))
         .with_state(router);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address: SocketAddr = listener.local_addr()?;
