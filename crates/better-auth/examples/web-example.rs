@@ -2,16 +2,18 @@ use axum::{
     http::header,
     response::{Html, IntoResponse},
     routing::{any, get},
-    Router,
+    Json, Router,
 };
 use better_auth::{
     core::{
         adapter::memory::{MemoryDb, MemorySecondaryStorage},
-        options::{AuthOptions, PasswordHashOptions},
+        options::{AuthOptions, BaseUrl, PasswordHashOptions},
     },
+    email::CapturingEmailSender,
     router::axum_adapter,
     AuthContext, AuthRouter,
 };
+use serde_json::json;
 use std::{io::Write, net::SocketAddr, sync::Arc};
 use tokio::net::TcpListener;
 
@@ -36,8 +38,26 @@ async fn app_js() -> impl IntoResponse {
     )
 }
 
+/// Set to run the example for browser tests. Test mode fixes the port, sets the
+/// static base URL that reset links point at, sends email to an in-memory
+/// mailbox, and serves that mailbox at `/__test/emails`. Off by default, so the
+/// demo behaves as before.
+const TEST_MODE_VAR: &str = "BETTER_AUTH_EXAMPLE_TEST_MODE";
+/// The port to bind. Test mode requires it, because links are built from it.
+const PORT_VAR: &str = "BETTER_AUTH_EXAMPLE_PORT";
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let test_mode = std::env::var_os(TEST_MODE_VAR).is_some();
+    let port: u16 = std::env::var(PORT_VAR)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    if test_mode && port == 0 {
+        return Err(format!("{PORT_VAR} must be set in test mode").into());
+    }
+    let mailbox = Arc::new(CapturingEmailSender::default());
+    let base_url = test_mode.then(|| BaseUrl::Static(format!("http://127.0.0.1:{port}")));
     let context = AuthContext::new(
         AuthOptions {
             // Resolve the origin from each request so browser Origin headers
@@ -49,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 scrypt_log_n: 13,
                 ..PasswordHashOptions::default()
             },
+            base_url,
             has_database: true,
             ..AuthOptions::default()
         },
@@ -56,16 +77,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Arc::new(MemorySecondaryStorage::default())),
         Vec::new(),
     )?;
-    let router = Arc::new(AuthRouter::new(context)?.with_verification_services()?);
-    let app = Router::new()
+    let mut router = AuthRouter::new(context)?.with_verification_services()?;
+    if test_mode {
+        router = router.with_email_sender(mailbox.clone())?;
+    }
+    let router = Arc::new(router);
+    let mut app = Router::new()
         .route("/", get(index))
         .route("/styles.css", get(styles))
         .route("/app.js", get(app_js))
         // Every auth route goes through the router, so the router decides what
         // exists. Mounting paths one by one silently 404s any route added later.
-        .route("/api/auth/{*path}", any(axum_adapter::handler))
-        .with_state(router);
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+        .route("/api/auth/{*path}", any(axum_adapter::handler));
+    if test_mode {
+        let mailbox = mailbox.clone();
+        app = app.route(
+            "/__test/emails",
+            get(move || {
+                let mailbox = mailbox.clone();
+                async move {
+                    let messages: Vec<_> = mailbox
+                        .messages()
+                        .into_iter()
+                        .map(|message| {
+                            json!({"to": message.to, "subject": message.subject, "text": message.text})
+                        })
+                        .collect();
+                    Json(messages)
+                }
+            }),
+        );
+    }
+    let app = app.with_state(router);
+    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     let address: SocketAddr = listener.local_addr()?;
 
     println!("READY http://{address}/api/auth");

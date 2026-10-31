@@ -7,6 +7,26 @@ data (password hashes, signed envelopes, database schema) are marked **Compatibi
 ## Unreleased
 
 ### Security
+- OAuth provider endpoints (token, userinfo, authorization, verified emails, JWKS) must be
+  public HTTPS hosts. Credentials in the URL, `localhost`, and private, loopback, link-local
+  (including cloud metadata), shared and unspecified addresses are refused.
+- Passkey registration and SCIM requests count against the per-client rate limit.
+- Two-factor secrets record the key version that sealed them. A secret read under an old version
+  is re-sealed under the current one.
+- JWT signing keys can be rotated. The old key stays published until it is retired.
+- SCIM groups are scoped to one organization, the same as SCIM users. A group's members must
+  belong to that organization, and removing a user removes them from its groups.
+- The sign-in path refuses a session planted before sign-in, and a password registered before the
+  mailbox was proven stops working when the mailbox is proven.
+- A central access table states what each route requires (`route_access`). Anonymous
+  callers are refused on every route that needs a session, and non-administrators on every
+  admin route except the permission check. The gate runs before routing.
+- The origin policy is explicit. `Origin: null` is refused. `Sec-Fetch-Site` must be
+  `same-origin`, `same-site` or `none`, and any other value is refused. When the two
+  disagree, the request is refused.
+- SCIM Users are scoped to one organization. A create never takes over an existing account,
+  a user shared with another organization cannot be renamed, deactivated or re-addressed from
+  that organization, and PATCH cannot set a role.
 - OAuth state is single use in every mode. The signed-cookie mode requires
   secondary storage.
 - Provider email is never trusted by default. Linking an existing account needs a
@@ -24,6 +44,15 @@ data (password hashes, signed envelopes, database schema) are marked **Compatibi
 - Cookie encryption uses a random nonce per envelope. Previously it used UUID bytes.
 
 ### Added
+- SCIM Groups routes at `/scim/v2/Groups`, scoped to the token's organization.
+- `JwtSigner::rotate` and `JwtSigner::retire`, and `JwtSigner::current_kid`.
+- `docs/operations/ABUSE_TESTS.md`, an index of the abuse tests by attack.
+- SCIM Users routes under `/scim/v2/Users`, and `POST /scim/generate-token` for organization admins.
+  Groups and bulk are not mounted.
+- A Playwright browser suite in `e2e/`, seven tests, run against the example in test mode.
+- `POST /magic-link/verify` consumes a magic link and signs in. `GET /magic-link/verify` shows
+  a confirmation page and changes nothing. Sign-in links accept a `callbackURL` that must be a
+  path on this site.
 - Account and session management routes, password change with session revocation.
 - Email delivery for reset and verification links through `EmailSender`.
 - Magic-link and email one-time-code sign-in.
@@ -78,6 +107,15 @@ data (password hashes, signed envelopes, database schema) are marked **Compatibi
 - A failed `after_user_create` hook no longer leaves an account behind.
 
 ### Compatibility
+- OAuth provider endpoints on private or loopback addresses are no longer accepted. An identity
+  provider on an internal network needs a public HTTPS name in front of it.
+- Two-factor records gain a `secret_version` field. Records without it are opened under the current
+  key, as before. Rotate the secret only after upgrading.
+- SCIM PATCH refuses `role`. A client that sent it now gets 400.
+- Magic links no longer sign in on GET. A client that followed the old GET redirect must POST the
+  token to `/magic-link/verify`. The confirmation page is a form that does that.
+- Anonymous requests to routes that need a session now get 401 before routing, so a probe cannot
+  tell a missing route from a protected one.
 - Minimum supported Rust version is now 1.89, raised from 1.88. The optional `saml` feature
   needs `aes` 0.9.3, which requires rustc 1.89.
 - The admin plugin adds `banned`, `ban_reason` and `ban_expires` to the `user` table.

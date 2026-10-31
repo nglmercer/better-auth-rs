@@ -20,7 +20,16 @@ impl Plugin for MagicLinkPlugin {
                 "/sign-in/magic-link",
                 "Email a single-use sign-in link",
             ),
-            endpoint(Method::GET, "/magic-link/verify", "Consume a sign-in link"),
+            endpoint(
+                Method::GET,
+                "/magic-link/verify",
+                "Show the sign-in confirmation page",
+            ),
+            endpoint(
+                Method::POST,
+                "/magic-link/verify",
+                "Consume a sign-in link and sign in",
+            ),
         ]
     }
 }

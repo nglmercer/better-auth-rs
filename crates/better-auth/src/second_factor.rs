@@ -52,7 +52,25 @@ pub struct EnrollmentStart {
 pub struct SecondFactorService {
     context: AuthContext,
     storage: Arc<dyn SecondaryStorage>,
-    key: [u8; 32],
+    keys: SecretKeySet,
+}
+
+/// A sealed TOTP secret, with the secret version whose key sealed it.
+struct SealedSecret {
+    version: String,
+    envelope: String,
+}
+
+/// The encryption key for one secret version. Each version's key is derived from that
+/// version's secret material, so a rotated secret does not orphan existing factors.
+fn secret_key(keys: &SecretKeySet, version: &str) -> Result<[u8; 32]> {
+    let material = keys
+        .key_for_version(version)
+        .ok_or_else(|| AuthError::Crypto(format!("secret version {version} is not configured")))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"better-auth:two-factor-secret\0");
+    hasher.update(material);
+    Ok(hasher.finalize().into())
 }
 
 impl SecondFactorService {
@@ -61,17 +79,12 @@ impl SecondFactorService {
             AuthError::InvalidConfiguration("two-factor requires secondary storage".into())
         })?;
         let keys = SecretKeySet::from_options(&context.options)?;
-        let material = keys
-            .key_for_version(keys.current_version())
-            .ok_or_else(|| AuthError::Crypto("current secret version is missing".into()))?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"better-auth:two-factor-secret\0");
-        hasher.update(material);
-        let key: [u8; 32] = hasher.finalize().into();
+        // Fails at startup, not on the first enrollment, if the current key is missing.
+        secret_key(&keys, keys.current_version())?;
         Ok(Self {
             context,
             storage,
-            key,
+            keys,
         })
     }
 
@@ -84,6 +97,7 @@ impl SecondFactorService {
             ));
         }
         let totp = generate_totp_secret(&user.email, ISSUER);
+        let sealed = self.seal(&totp.secret)?;
         let backup_codes = new_backup_codes();
         let hashes: Vec<String> = backup_codes.iter().map(|code| hash_code(code)).collect();
         let adapter = &self.context.adapter;
@@ -99,7 +113,8 @@ impl SecondFactorService {
                 json!({
                     "id": Uuid::new_v4().to_string(),
                     "user_id": user.id,
-                    "secret": self.seal(&totp.secret)?,
+                    "secret": sealed.envelope,
+                    "secret_version": sealed.version,
                     "enabled": false,
                     "backup_codes": hashes,
                 }),
@@ -119,7 +134,7 @@ impl SecondFactorService {
             .pending_record(user_id)
             .await?
             .ok_or(AuthError::NotFound)?;
-        let secret = self.open(&record)?;
+        let secret = self.open_and_refresh(&record).await?;
         if !self.accept_totp(user_id, &secret, code).await? {
             return Err(AuthError::Unauthorized);
         }
@@ -141,7 +156,7 @@ impl SecondFactorService {
             .enabled_record(&user.id)
             .await?
             .ok_or(AuthError::NotFound)?;
-        let secret = self.open(&record)?;
+        let secret = self.open_and_refresh(&record).await?;
         Ok(build_otpauth_url(&user.email, ISSUER, &secret))
     }
 
@@ -237,7 +252,7 @@ impl SecondFactorService {
         let Some(record) = self.enabled_record(user_id).await? else {
             return Ok(false);
         };
-        let secret = self.open(&record)?;
+        let secret = self.open_and_refresh(&record).await?;
         if self.accept_totp(user_id, &secret, code).await? {
             return Ok(true);
         }
@@ -299,25 +314,37 @@ impl SecondFactorService {
             .filter(|record| record.get("enabled").and_then(Value::as_bool) != Some(true)))
     }
 
-    fn seal(&self, secret: &str) -> Result<String> {
+    fn seal(&self, secret: &str) -> Result<SealedSecret> {
+        let version = self.keys.current_version().to_owned();
+        let key = secret_key(&self.keys, &version)?;
         let mut nonce = [0u8; 12];
         getrandom::getrandom(&mut nonce)
             .map_err(|error| AuthError::Crypto(format!("random source failed: {error}")))?;
-        let cipher = Aes256Gcm::new_from_slice(&self.key)
+        let cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|_| AuthError::Crypto("invalid encryption key".into()))?;
         let ciphertext = cipher
             .encrypt(Nonce::from_slice(&nonce), secret.as_bytes())
             .map_err(|_| AuthError::Crypto("secret encryption failed".into()))?;
         let mut envelope = nonce.to_vec();
         envelope.extend_from_slice(&ciphertext);
-        Ok(URL_SAFE_NO_PAD.encode(envelope))
+        Ok(SealedSecret {
+            version,
+            envelope: URL_SAFE_NO_PAD.encode(envelope),
+        })
     }
 
+    /// Opens a record's secret with the key of the version it was sealed under. Records from
+    /// before versions were stored were sealed under the current key.
     fn open(&self, record: &Value) -> Result<String> {
         let envelope = record
             .get("secret")
             .and_then(Value::as_str)
             .ok_or_else(|| AuthError::Crypto("two-factor record has no secret".into()))?;
+        let version = record
+            .get("secret_version")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| self.keys.current_version());
+        let key = secret_key(&self.keys, version)?;
         let bytes = URL_SAFE_NO_PAD
             .decode(envelope)
             .map_err(|_| AuthError::Crypto("two-factor secret is malformed".into()))?;
@@ -325,13 +352,36 @@ impl SecondFactorService {
             return Err(AuthError::Crypto("two-factor secret is malformed".into()));
         }
         let (nonce, ciphertext) = bytes.split_at(12);
-        let cipher = Aes256Gcm::new_from_slice(&self.key)
+        let cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|_| AuthError::Crypto("invalid encryption key".into()))?;
         let plaintext = cipher
             .decrypt(Nonce::from_slice(nonce), ciphertext)
             .map_err(|_| AuthError::Crypto("two-factor secret failed authentication".into()))?;
         String::from_utf8(plaintext)
             .map_err(|_| AuthError::Crypto("two-factor secret is not text".into()))
+    }
+
+    /// Opens a record's secret and, when it was sealed under an older version, seals it again
+    /// under the current one. A rotated secret is therefore migrated the next time it is used.
+    async fn open_and_refresh(&self, record: &Value) -> Result<String> {
+        let secret = self.open(record)?;
+        let stored = record.get("secret_version").and_then(Value::as_str);
+        if stored == Some(self.keys.current_version()) {
+            return Ok(secret);
+        }
+        let Some(id) = record.get("id").and_then(Value::as_str) else {
+            return Ok(secret);
+        };
+        let sealed = self.seal(&secret)?;
+        self.context
+            .adapter
+            .update_where(
+                TWO_FACTOR_TABLE,
+                Query::new().eq("id", id.to_owned()),
+                json!({"secret": sealed.envelope, "secret_version": sealed.version}),
+            )
+            .await?;
+        Ok(secret)
     }
 }
 

@@ -2,8 +2,8 @@ use super::super::shared::{hash_secret, serialize_error};
 use super::generate_scim_token;
 use super::{
     filter::ScimFilter,
-    helpers::{normalize_scim_path, scim_group_member_id, ScimErrorStatus},
-    patch::{apply_scim_user_patch, merge_scim_patch},
+    helpers::scim_group_member_id,
+    patch::apply_scim_user_patch,
     resources::{
         normalize_scim_attribute, scim_sort_value, scim_user_from_resource, scim_user_resource,
     },
@@ -14,7 +14,7 @@ use better_auth_core::{
     error::{AuthError, Result},
 };
 use serde_json::json;
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -24,6 +24,66 @@ pub struct ScimService {
 impl ScimService {
     pub fn new(adapter: Arc<dyn DbAdapter>) -> Self {
         Self { adapter }
+    }
+
+    /// Fails with `NotFound` unless `user_id` belongs to `organization_id`. A user outside
+    /// the organization gets the same answer as a user who does not exist.
+    async fn require_member(&self, organization_id: &str, user_id: &str) -> Result<()> {
+        if self
+            .adapter
+            .find_one(
+                "organization_member",
+                Query::new().eq("id", membership_id(organization_id, user_id)),
+            )
+            .await?
+            .is_some()
+        {
+            Ok(())
+        } else {
+            Err(AuthError::NotFound)
+        }
+    }
+
+    async fn user_row(&self, user_id: &str) -> Result<serde_json::Value> {
+        self.adapter
+            .find_one("user", Query::new().eq("id", user_id.to_owned()))
+            .await?
+            .ok_or(AuthError::NotFound)
+    }
+
+    /// The IDs of the users who belong to `organization_id`.
+    async fn member_ids(&self, organization_id: &str) -> Result<HashSet<String>> {
+        Ok(self
+            .adapter
+            .find_many(
+                "organization_member",
+                Query::new().eq("organization_id", organization_id.to_owned()),
+            )
+            .await?
+            .iter()
+            .filter_map(|row| {
+                row.get("user_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect())
+    }
+
+    /// Whether the user belongs to an organization other than `organization_id`.
+    async fn in_other_organization(&self, organization_id: &str, user_id: &str) -> Result<bool> {
+        Ok(self
+            .adapter
+            .find_many(
+                "organization_member",
+                Query::new().eq("user_id", user_id.to_owned()),
+            )
+            .await?
+            .iter()
+            .any(|row| {
+                row.get("organization_id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(organization_id)
+            }))
     }
 
     pub async fn issue_token(
@@ -77,63 +137,142 @@ impl ScimService {
         Ok(record)
     }
 
-    pub async fn create_user(&self, email: &str, name: &str) -> Result<serde_json::Value> {
+    /// Creates a user who is a member of `organization_id`. An email that already has an
+    /// account is refused rather than linked, so a SCIM token cannot take over an existing
+    /// account.
+    pub async fn create_user(
+        &self,
+        organization_id: &str,
+        email: &str,
+        name: &str,
+    ) -> Result<serde_json::Value> {
+        let email = email.trim().to_ascii_lowercase();
+        if self
+            .adapter
+            .find_one("user", Query::new().eq("email", email.clone()))
+            .await?
+            .is_some()
+        {
+            return Err(AuthError::InvalidRequest(
+                "a user with this email already exists".into(),
+            ));
+        }
+        let id = Uuid::new_v4().to_string();
         let user = json!({
-            "id": Uuid::new_v4().to_string(),
-            "email": email.trim().to_ascii_lowercase(),
+            "id": id,
+            "email": email,
             "name": name.trim(),
             "email_verified": true,
             "role": "user",
         });
-        self.adapter.insert_record("user", user.clone()).await?;
-        Ok(user)
-    }
-
-    pub async fn update_user(
-        &self,
-        user_id: &str,
-        patch: serde_json::Value,
-    ) -> Result<serde_json::Value> {
-        let mut user = self
-            .adapter
-            .find_one("user", Query::new().eq("id", user_id.to_owned()))
-            .await?
-            .ok_or(AuthError::NotFound)?;
-        user = apply_scim_user_patch(user, &patch)?;
         self.adapter
-            .update_where(
-                "user",
-                Query::new().eq("id", user_id.to_owned()),
-                user.clone(),
-            )
+            .transaction(vec![
+                DbOperation::InsertRecord {
+                    table: "user".into(),
+                    record: user.clone(),
+                },
+                DbOperation::InsertRecord {
+                    table: "organization_member".into(),
+                    record: membership_record(organization_id, &id),
+                },
+            ])
             .await?;
         Ok(user)
     }
 
-    pub async fn list_users(&self, start_index: usize, count: usize) -> Result<serde_json::Value> {
-        self.list_users_filtered(start_index, count, None).await
+    /// Creates a user from a SCIM resource body, as a member of `organization_id`.
+    pub async fn create_from_resource(
+        &self,
+        organization_id: &str,
+        resource: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let parsed = scim_user_from_resource(resource)?;
+        let email = parsed["email"].as_str().unwrap_or_default();
+        let name = parsed["name"].as_str().unwrap_or_default();
+        let user = self.create_user(organization_id, email, name).await?;
+        Ok(scim_user_resource(
+            user["id"].as_str().unwrap_or_default(),
+            &user,
+        ))
     }
 
-    pub async fn get_user(&self, user_id: &str) -> Result<serde_json::Value> {
-        let user = self
-            .adapter
-            .find_one("user", Query::new().eq("id", user_id.to_owned()))
-            .await?
-            .ok_or(AuthError::NotFound)?;
+    /// Changes a member of `organization_id`. Role changes are refused by the PATCH
+    /// parser, and a profile shared with another organization cannot be changed here.
+    pub async fn update_user(
+        &self,
+        organization_id: &str,
+        user_id: &str,
+        patch: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.require_member(organization_id, user_id).await?;
+        let existing = self.user_row(user_id).await?;
+        let updated = apply_scim_user_patch(existing.clone(), &patch)?;
+        let changed = ["email", "name", "active"]
+            .iter()
+            .any(|key| existing.get(*key) != updated.get(*key));
+        if changed && self.in_other_organization(organization_id, user_id).await? {
+            return Err(AuthError::Forbidden(
+                "this user also belongs to another organization and cannot be changed here".into(),
+            ));
+        }
+        self.adapter
+            .update_where(
+                "user",
+                Query::new().eq("id", user_id.to_owned()),
+                updated.clone(),
+            )
+            .await?;
+        Ok(updated)
+    }
+
+    pub async fn list_users(
+        &self,
+        organization_id: &str,
+        start_index: usize,
+        count: usize,
+    ) -> Result<serde_json::Value> {
+        self.list_users_filtered(organization_id, start_index, count, None)
+            .await
+    }
+
+    pub async fn get_user(
+        &self,
+        organization_id: &str,
+        user_id: &str,
+    ) -> Result<serde_json::Value> {
+        self.require_member(organization_id, user_id).await?;
+        let user = self.user_row(user_id).await?;
         Ok(scim_user_resource(user_id, &user))
     }
 
-    pub async fn delete_user(&self, user_id: &str) -> Result<()> {
-        if self
+    /// Removes the user from `organization_id` only. The account stays, because other
+    /// organizations, or the user's own sign-in, may still need it.
+    pub async fn delete_user(&self, organization_id: &str, user_id: &str) -> Result<()> {
+        self.require_member(organization_id, user_id).await?;
+        // The user leaves this organization's groups with the membership. Groups of other
+        // organizations are not touched.
+        let groups = self
             .adapter
-            .find_one("user", Query::new().eq("id", user_id.to_owned()))
-            .await?
-            .is_none()
-        {
-            return Err(AuthError::NotFound);
+            .find_many(
+                "scim_group",
+                Query::new().eq("organization_id", organization_id.to_owned()),
+            )
+            .await?;
+        for group in groups {
+            if let Some(group_id) = group.get("id").and_then(serde_json::Value::as_str) {
+                self.adapter
+                    .delete_where(
+                        "scim_group_member",
+                        Query::new().eq("id", scim_group_member_id(group_id, user_id)),
+                    )
+                    .await?;
+            }
         }
         self.adapter
-            .delete_where("user", Query::new().eq("id", user_id.to_owned()))
+            .delete_where(
+                "organization_member",
+                Query::new().eq("id", membership_id(organization_id, user_id)),
+            )
             .await?;
         Ok(())
     }
@@ -160,12 +299,16 @@ impl ScimService {
                 serde_json::to_value(&group).map_err(serialize_error)?,
             )
             .await?;
-        self.group_resource(&group).await
+        self.group_resource(organization_id, &group).await
     }
 
-    pub async fn get_group(&self, group_id: &str) -> Result<serde_json::Value> {
-        let group = self.load_group(group_id).await?;
-        self.group_resource(&group).await
+    pub async fn get_group(
+        &self,
+        organization_id: &str,
+        group_id: &str,
+    ) -> Result<serde_json::Value> {
+        let group = self.load_group(organization_id, group_id).await?;
+        self.group_resource(organization_id, &group).await
     }
 
     pub async fn list_groups(
@@ -192,7 +335,7 @@ impl ScimService {
         let end = start.saturating_add(count).min(total);
         let mut resources = Vec::new();
         for group in &groups[start..end] {
-            resources.push(self.group_resource(group).await?);
+            resources.push(self.group_resource(organization_id, group).await?);
         }
         Ok(json!({
             "schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
@@ -203,12 +346,14 @@ impl ScimService {
         }))
     }
 
+    /// Changes a group's name or members. Members must belong to `organization_id`.
     pub async fn update_group(
         &self,
+        organization_id: &str,
         group_id: &str,
         patch: &serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let mut group = self.load_group(group_id).await?;
+        let mut group = self.load_group(organization_id, group_id).await?;
         let Some(object) = patch.as_object() else {
             return Err(AuthError::InvalidRequest(
                 "SCIM group patch must be an object".into(),
@@ -234,13 +379,14 @@ impl ScimService {
             )
             .await?;
         if let Some(members) = object.get("members") {
-            self.replace_group_members(group_id, members).await?;
+            self.replace_group_members(organization_id, group_id, members)
+                .await?;
         }
-        self.group_resource(&group).await
+        self.group_resource(organization_id, &group).await
     }
 
-    pub async fn delete_group(&self, group_id: &str) -> Result<()> {
-        self.load_group(group_id).await?;
+    pub async fn delete_group(&self, organization_id: &str, group_id: &str) -> Result<()> {
+        self.load_group(organization_id, group_id).await?;
         let operations = vec![
             DbOperation::DeleteWhere {
                 table: "scim_group_member".into(),
@@ -254,16 +400,15 @@ impl ScimService {
         self.adapter.transaction(operations).await
     }
 
-    pub async fn add_group_member(&self, group_id: &str, user_id: &str) -> Result<()> {
-        self.load_group(group_id).await?;
-        if self
-            .adapter
-            .find_one("user", Query::new().eq("id", user_id.to_owned()))
-            .await?
-            .is_none()
-        {
-            return Err(AuthError::NotFound);
-        }
+    /// Adds a member of `organization_id` to one of its groups.
+    pub async fn add_group_member(
+        &self,
+        organization_id: &str,
+        group_id: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        self.load_group(organization_id, group_id).await?;
+        self.require_member(organization_id, user_id).await?;
         let member = ScimGroupMember {
             group_id: group_id.into(),
             user_id: user_id.into(),
@@ -280,8 +425,13 @@ impl ScimService {
         Ok(())
     }
 
-    pub async fn remove_group_member(&self, group_id: &str, user_id: &str) -> Result<()> {
-        self.load_group(group_id).await?;
+    pub async fn remove_group_member(
+        &self,
+        organization_id: &str,
+        group_id: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        self.load_group(organization_id, group_id).await?;
         self.adapter
             .delete_where(
                 "scim_group_member",
@@ -293,16 +443,18 @@ impl ScimService {
 
     pub async fn list_users_filtered(
         &self,
+        organization_id: &str,
         start_index: usize,
         count: usize,
         filter: Option<&str>,
     ) -> Result<serde_json::Value> {
-        self.list_users_query(start_index, count, filter, None, None)
+        self.list_users_query(organization_id, start_index, count, filter, None, None)
             .await
     }
 
     pub async fn list_users_query(
         &self,
+        organization_id: &str,
         start_index: usize,
         count: usize,
         filter: Option<&str>,
@@ -315,6 +467,7 @@ impl ScimService {
             ));
         }
         let predicate = ScimFilter::parse(filter)?;
+        let members = self.member_ids(organization_id).await?;
         let mut records = self
             .adapter
             .find_many("user", Query::new())
@@ -323,6 +476,7 @@ impl ScimService {
             .filter(|user| predicate.matches(user))
             .map(|user| Ok((record_id(&user)?, user)))
             .collect::<Result<Vec<_>>>()?;
+        records.retain(|(id, _)| members.contains(id));
         if let Some(sort_by) = sort_by {
             let sort_by = normalize_scim_attribute(sort_by)?;
             records.sort_by(|left, right| {
@@ -353,128 +507,43 @@ impl ScimService {
         }))
     }
 
+    /// SCIM bulk requests are not available yet. They act on users without the
+    /// organization scope the other user operations enforce, so they are refused
+    /// rather than run unscoped.
     pub async fn apply_bulk(
         &self,
-        operations: &[ScimBulkOperation],
-        fail_on_errors: usize,
+        _organization_id: &str,
+        _operations: &[ScimBulkOperation],
+        _fail_on_errors: usize,
     ) -> Result<Vec<ScimBulkResponse>> {
-        if operations.len() > 1_000 {
-            return Err(AuthError::InvalidRequest(
-                "SCIM bulk request exceeds the 1000 operation limit".into(),
-            ));
-        }
-        let mut planned = Vec::new();
-        let mut responses = Vec::with_capacity(operations.len());
-        let mut errors = 0;
-        for operation in operations {
-            let method = operation.method.to_ascii_uppercase();
-            let path = normalize_scim_path(&operation.path)?;
-            let id = path.strip_prefix("/Users/").unwrap_or_default();
-            let result = match (method.as_str(), id.is_empty()) {
-                ("POST", true) => {
-                    let data = operation.data.clone().ok_or_else(|| {
-                        AuthError::InvalidRequest("SCIM POST operation requires data".into())
-                    })?;
-                    let user = scim_user_from_resource(&data)?;
-                    let id = Uuid::new_v4().to_string();
-                    let mut user = user;
-                    user["id"] = id.clone().into();
-                    planned.push(DbOperation::InsertRecord {
-                        table: "user".into(),
-                        record: user.clone(),
-                    });
-                    Ok((201, Some(scim_user_resource(&id, &user))))
-                }
-                ("PUT", false) | ("PATCH", false) => {
-                    let existing = self
-                        .adapter
-                        .find_one("user", Query::new().eq("id", id.to_owned()))
-                        .await?
-                        .ok_or(AuthError::NotFound)?;
-                    let data = operation.data.clone().ok_or_else(|| {
-                        AuthError::InvalidRequest("SCIM update operation requires data".into())
-                    })?;
-                    let updated = if method == "PUT" {
-                        scim_user_from_resource(&data)?
-                    } else {
-                        merge_scim_patch(existing, &data)?
-                    };
-                    let mut updated = updated;
-                    updated["id"] = id.into();
-                    planned.push(DbOperation::UpdateWhere {
-                        table: "user".into(),
-                        query: Query::new().eq("id", id.to_owned()),
-                        changes: updated.clone(),
-                    });
-                    Ok((200, Some(scim_user_resource(id, &updated))))
-                }
-                ("DELETE", false) => {
-                    if self
-                        .adapter
-                        .find_one("user", Query::new().eq("id", id.to_owned()))
-                        .await?
-                        .is_none()
-                    {
-                        Err(AuthError::NotFound)
-                    } else {
-                        planned.push(DbOperation::DeleteWhere {
-                            table: "user".into(),
-                            query: Query::new().eq("id", id.to_owned()),
-                        });
-                        Ok((204, None))
-                    }
-                }
-                ("POST", false) | ("PUT", true) | ("PATCH", true) | ("DELETE", true) => {
-                    Err(AuthError::InvalidRequest("invalid SCIM bulk path".into()))
-                }
-                _ => Err(AuthError::InvalidRequest(format!(
-                    "unsupported SCIM bulk method: {}",
-                    operation.method
-                ))),
-            };
-            match result {
-                Ok((status, response)) => responses.push(ScimBulkResponse {
-                    method,
-                    path: operation.path.clone(),
-                    status,
-                    response,
-                }),
-                Err(error) => {
-                    errors += 1;
-                    responses.push(ScimBulkResponse {
-                        method,
-                        path: operation.path.clone(),
-                        status: error.status_code(),
-                        response: Some(json!({"detail": error.to_string()})),
-                    });
-                    if fail_on_errors != 0 && errors >= fail_on_errors {
-                        break;
-                    }
-                }
-            }
-        }
-        if fail_on_errors != 0 && errors >= fail_on_errors {
-            return Err(AuthError::InvalidRequest(
-                "SCIM bulk request exceeded failOnErrors".into(),
-            ));
-        } else {
-            if !planned.is_empty() {
-                self.adapter.transaction(planned).await?;
-            }
-        }
-        Ok(responses)
+        Err(AuthError::Forbidden(
+            "SCIM bulk requests are not available until they are organization-scoped".into(),
+        ))
     }
 
-    async fn load_group(&self, group_id: &str) -> Result<ScimGroup> {
+    /// The group, if it belongs to `organization_id`. Any other group is `NotFound`, so a
+    /// token cannot learn that another organization's group exists.
+    async fn load_group(&self, organization_id: &str, group_id: &str) -> Result<ScimGroup> {
         let value = self
             .adapter
             .find_one("scim_group", Query::new().eq("id", group_id.to_owned()))
             .await?
             .ok_or(AuthError::NotFound)?;
-        serde_json::from_value(value).map_err(serialize_error)
+        let group: ScimGroup = serde_json::from_value(value).map_err(serialize_error)?;
+        if group.organization_id != organization_id {
+            return Err(AuthError::NotFound);
+        }
+        Ok(group)
     }
 
-    async fn group_resource(&self, group: &ScimGroup) -> Result<serde_json::Value> {
+    /// The group as SCIM shows it. Only current members of `organization_id` are listed, so a
+    /// membership left over from a removed user never appears.
+    async fn group_resource(
+        &self,
+        organization_id: &str,
+        group: &ScimGroup,
+    ) -> Result<serde_json::Value> {
+        let current = self.member_ids(organization_id).await?;
         let members = self
             .adapter
             .find_many(
@@ -484,6 +553,7 @@ impl ScimService {
             .await?
             .into_iter()
             .filter_map(|value| serde_json::from_value::<ScimGroupMember>(value).ok())
+            .filter(|member| current.contains(&member.user_id))
             .map(|member| json!({"value": member.user_id}))
             .collect::<Vec<_>>();
         Ok(json!({
@@ -495,8 +565,11 @@ impl ScimService {
         }))
     }
 
+    /// Replaces a group's members. Each one must belong to `organization_id`, and the request
+    /// is refused as a whole if any does not.
     async fn replace_group_members(
         &self,
+        organization_id: &str,
         group_id: &str,
         members: &serde_json::Value,
     ) -> Result<()> {
@@ -517,14 +590,7 @@ impl ScimService {
                 .ok_or_else(|| {
                     AuthError::InvalidRequest("SCIM group member requires value".into())
                 })?;
-            if self
-                .adapter
-                .find_one("user", Query::new().eq("id", user_id.to_owned()))
-                .await?
-                .is_none()
-            {
-                return Err(AuthError::NotFound);
-            }
+            self.require_member(organization_id, user_id).await?;
             let member = ScimGroupMember {
                 group_id: group_id.into(),
                 user_id: user_id.into(),
@@ -547,4 +613,18 @@ fn with_id(mut record: serde_json::Value, id: String) -> Result<serde_json::Valu
         .ok_or_else(|| AuthError::Adapter("SCIM record is not an object".into()))?
         .insert("id".into(), id.into());
     Ok(record)
+}
+
+/// The organization-membership record ID. It matches the organization plugin's member IDs.
+fn membership_id(organization_id: &str, user_id: &str) -> String {
+    format!("{organization_id}:{user_id}")
+}
+
+fn membership_record(organization_id: &str, user_id: &str) -> serde_json::Value {
+    json!({
+        "id": membership_id(organization_id, user_id),
+        "organization_id": organization_id,
+        "user_id": user_id,
+        "role": "member",
+    })
 }

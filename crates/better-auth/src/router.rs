@@ -25,6 +25,7 @@ use crate::{
     one_tap::OneTapService,
     one_time_token::OneTimeTokenService,
     passwordless::{EmailOtpPurpose, PasswordlessService},
+    plugins::ScimService,
     plugins::USERNAME_PLUGIN,
     plugins::{AdminGuard, AdminService, OrganizationService, API_KEY_PLUGIN},
     rate_limit::{RateLimitPolicy, RateLimiter},
@@ -464,6 +465,34 @@ impl AuthRouter {
         };
         deliver(sender.as_ref(), message).await;
         Ok(())
+    }
+
+    fn scim(&self) -> ScimService {
+        ScimService::new(self.context.adapter.clone())
+    }
+
+    /// The organization a SCIM bearer token belongs to. Unknown, expired and missing
+    /// tokens get the same answer. Each request counts against the per-client rate limit.
+    async fn scim_organization(
+        &self,
+        request: &HttpRequest,
+        request_context: &crate::context::RequestContext,
+    ) -> Result<String> {
+        // Every SCIM request counts against the per-client budget, so token guessing and
+        // hammering the routes are both limited.
+        self.enforce_action_limit(request_context, "scim-request", None)
+            .await?;
+        let token = request
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .ok_or(AuthError::Unauthorized)?;
+        let record = self
+            .scim()
+            .authorize_token(token, None, now_unix_seconds())
+            .await?;
+        Ok(record.organization_id)
     }
 
     /// Whether a user holds `email`. Callers that act on the answer must be authenticated.
@@ -956,6 +985,19 @@ impl AuthRouter {
             });
         }
 
+        // The central access gate. Every built-in route's requirement comes from `route_access`.
+        match route_access(&request.method, endpoint_path_name) {
+            RouteAccess::Session => {
+                self.current_user(&request.headers, secure_cookie).await?;
+            }
+            RouteAccess::Admin => {
+                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                if !self.is_admin(&user.id).await? {
+                    return Err(AuthError::Forbidden("administrator role required".into()));
+                }
+            }
+            RouteAccess::Public | RouteAccess::Bearer => {}
+        }
         match (request.method.clone(), endpoint_path_name) {
             (Method::POST, "/sign-up/email") => {
                 check_csrf(&request_context, &request.metadata())?;
@@ -1664,34 +1706,71 @@ impl AuthRouter {
             (Method::POST, "/sign-in/magic-link") => {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, MAGIC_LINK_PLUGIN)?;
-                let input: EmailInput = parse_json(&request.body)?;
+                let input: MagicLinkSendInput = parse_json(&request.body)?;
                 self.enforce_action_limit(&request_context, "magic-link", Some(&input.email))
                     .await?;
+                let callback = match input.callback_url.as_deref() {
+                    None => None,
+                    Some(value) => Some(safe_callback_path(value).ok_or_else(|| {
+                        AuthError::InvalidRequest("callbackURL must be a path on this site".into())
+                    })?),
+                };
                 let sender = self.sender()?;
                 let to = input.email.trim().to_ascii_lowercase();
                 let token = self.passwordless()?.issue_magic_link(&to).await?;
-                let link = self.api_url("/magic-link/verify", &token)?;
+                let mut link = url::Url::parse(&self.api_url("/magic-link/verify", &token)?)
+                    .map_err(|_| AuthError::InvalidConfiguration("base URL is invalid".into()))?;
+                if let Some(callback) = &callback {
+                    link.query_pairs_mut().append_pair("callbackURL", callback);
+                }
+                let link = link.to_string();
                 deliver(sender.as_ref(), magic_link_message(&to, &link)).await;
                 Ok(HttpResponse::json(StatusCode::OK, json!({"sent": true})))
             }
             (Method::GET, "/magic-link/verify") => {
+                // A GET only shows the confirmation form. It changes nothing, so an
+                // email scanner that opens the link cannot use up the token.
                 require_plugin(&self.context, MAGIC_LINK_PLUGIN)?;
-                let token = query_params(&request.uri)
+                let params = query_params(&request.uri);
+                let token = params
                     .get("token")
                     .cloned()
                     .ok_or_else(|| AuthError::InvalidRequest("token is required".into()))?;
+                let callback = params
+                    .get("callbackURL")
+                    .and_then(|value| safe_callback_path(value))
+                    .unwrap_or_else(|| "/".into());
+                Ok(magic_link_confirmation_page(
+                    request.uri.path(),
+                    &token,
+                    &callback,
+                ))
+            }
+            (Method::POST, "/magic-link/verify") => {
+                check_csrf(&request_context, &request.metadata())?;
+                require_plugin(&self.context, MAGIC_LINK_PLUGIN)?;
+                let (token, callback) = parse_magic_link_verify(&request)?;
+                self.enforce_action_limit(&request_context, "magic-link-verify", None)
+                    .await?;
                 let user = self.passwordless()?.consume_magic_link(&token).await?;
                 let result = self
                     .complete_session(user, secure_cookie, "magic-link")
                     .await?;
+                let location = callback
+                    .as_deref()
+                    .and_then(safe_callback_path)
+                    .unwrap_or_else(|| "/".into());
                 let mut response = HttpResponse {
-                    status: StatusCode::FOUND,
+                    status: StatusCode::SEE_OTHER,
                     headers: HeaderMap::new(),
                     body: Vec::new(),
                 };
-                response
-                    .headers
-                    .insert(header::LOCATION, "/".parse().expect("static location"));
+                response.headers.insert(
+                    header::LOCATION,
+                    location
+                        .parse()
+                        .map_err(|_| AuthError::InvalidRequest("callback is invalid".into()))?,
+                );
                 Ok(response.with_cookie(result.cookie.to_set_cookie_header()))
             }
             (Method::POST, "/email-otp/send") => {
@@ -2165,6 +2244,8 @@ impl AuthRouter {
             (Method::POST, "/passkey/generate-register-options") => {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, PASSKEY_PLUGIN)?;
+                self.enforce_action_limit(&request_context, "passkey-register", None)
+                    .await?;
                 let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
                 let existing = self.passkey_store().list_for_user(&user.id).await?;
                 let (transaction_id, options) = self
@@ -2187,6 +2268,8 @@ impl AuthRouter {
             (Method::POST, "/passkey/verify-registration") => {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, PASSKEY_PLUGIN)?;
+                self.enforce_action_limit(&request_context, "passkey-register", None)
+                    .await?;
                 let input: PasskeyRegisterInput = parse_json(&request.body)?;
                 let name = input.name.as_deref().map(passkey_name).transpose()?;
                 let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
@@ -2295,6 +2378,171 @@ impl AuthRouter {
                     StatusCode::OK,
                     json!({ "deleted": deleted }),
                 ))
+            }
+            (Method::POST, "/scim/generate-token") => {
+                // Issues the bearer token an identity provider uses for this organization.
+                // The token is shown once, and only its hash is stored.
+                check_csrf(&request_context, &request.metadata())?;
+                require_plugin(&self.context, SCIM_PLUGIN)?;
+                let input: ScimTokenInput = parse_json(&request.body)?;
+                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let allowed = self
+                    .organizations()
+                    .has_permission(
+                        &input.organization_id,
+                        &user.id,
+                        &std::iter::once(("invitation".to_owned(), vec!["create".to_owned()]))
+                            .collect(),
+                    )
+                    .await?;
+                if !allowed {
+                    return Err(AuthError::Forbidden(
+                        "organization admin role required".into(),
+                    ));
+                }
+                let expires_at = input
+                    .expires_in
+                    .map(|seconds| now_unix_seconds().saturating_add(seconds));
+                let token = self
+                    .scim()
+                    .issue_token(&input.organization_id, expires_at)
+                    .await?;
+                tracing::info!(actor_id = %user.id, organization_id = %input.organization_id, "SCIM token issued");
+                Ok(HttpResponse::json(
+                    StatusCode::OK,
+                    json!({ "token": token }),
+                ))
+            }
+            (Method::GET, "/scim/v2/Groups") => {
+                require_plugin(&self.context, SCIM_PLUGIN)?;
+                let organization_id = self.scim_organization(&request, &request_context).await?;
+                let params = query_params(&request.uri);
+                let start_index = params
+                    .get("startIndex")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(1);
+                let count = params
+                    .get("count")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(100)
+                    .min(100);
+                let page = self
+                    .scim()
+                    .list_groups(&organization_id, start_index, count)
+                    .await?;
+                Ok(HttpResponse::json(StatusCode::OK, page))
+            }
+            (Method::POST, "/scim/v2/Groups") => {
+                require_plugin(&self.context, SCIM_PLUGIN)?;
+                let organization_id = self.scim_organization(&request, &request_context).await?;
+                let resource: Value = parse_json(&request.body)?;
+                let display_name = resource
+                    .get("displayName")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| AuthError::InvalidRequest("displayName is required".into()))?;
+                let scim = self.scim();
+                let mut group = scim.create_group(&organization_id, display_name).await?;
+                if let Some(members) = resource.get("members") {
+                    let id = group["id"].as_str().unwrap_or_default().to_owned();
+                    group = scim
+                        .update_group(&organization_id, &id, &json!({"members": members}))
+                        .await?;
+                }
+                Ok(HttpResponse::json(StatusCode::CREATED, group))
+            }
+            (Method::GET, path) if path.starts_with("/scim/v2/Groups/") => {
+                require_plugin(&self.context, SCIM_PLUGIN)?;
+                let organization_id = self.scim_organization(&request, &request_context).await?;
+                let group_id = &path["/scim/v2/Groups/".len()..];
+                let group = self.scim().get_group(&organization_id, group_id).await?;
+                Ok(HttpResponse::json(StatusCode::OK, group))
+            }
+            (Method::PATCH, path) if path.starts_with("/scim/v2/Groups/") => {
+                require_plugin(&self.context, SCIM_PLUGIN)?;
+                let organization_id = self.scim_organization(&request, &request_context).await?;
+                let group_id = &path["/scim/v2/Groups/".len()..];
+                let patch: Value = parse_json(&request.body)?;
+                let group = self
+                    .scim()
+                    .update_group(&organization_id, group_id, &patch)
+                    .await?;
+                Ok(HttpResponse::json(StatusCode::OK, group))
+            }
+            (Method::DELETE, path) if path.starts_with("/scim/v2/Groups/") => {
+                require_plugin(&self.context, SCIM_PLUGIN)?;
+                let organization_id = self.scim_organization(&request, &request_context).await?;
+                let group_id = &path["/scim/v2/Groups/".len()..];
+                self.scim().delete_group(&organization_id, group_id).await?;
+                Ok(HttpResponse {
+                    status: StatusCode::NO_CONTENT,
+                    headers: HeaderMap::new(),
+                    body: Vec::new(),
+                })
+            }
+            (Method::GET, "/scim/v2/Users") => {
+                require_plugin(&self.context, SCIM_PLUGIN)?;
+                let organization_id = self.scim_organization(&request, &request_context).await?;
+                let params = query_params(&request.uri);
+                let start_index = params
+                    .get("startIndex")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(1);
+                let count = params
+                    .get("count")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(100)
+                    .min(100);
+                let page = self
+                    .scim()
+                    .list_users_query(
+                        &organization_id,
+                        start_index,
+                        count,
+                        params.get("filter").map(String::as_str),
+                        params.get("sortBy").map(String::as_str),
+                        params.get("sortOrder").map(String::as_str),
+                    )
+                    .await?;
+                Ok(HttpResponse::json(StatusCode::OK, page))
+            }
+            (Method::POST, "/scim/v2/Users") => {
+                require_plugin(&self.context, SCIM_PLUGIN)?;
+                let organization_id = self.scim_organization(&request, &request_context).await?;
+                let resource: Value = parse_json(&request.body)?;
+                let created = self
+                    .scim()
+                    .create_from_resource(&organization_id, &resource)
+                    .await?;
+                Ok(HttpResponse::json(StatusCode::CREATED, created))
+            }
+            (Method::GET, path) if path.starts_with("/scim/v2/Users/") => {
+                require_plugin(&self.context, SCIM_PLUGIN)?;
+                let organization_id = self.scim_organization(&request, &request_context).await?;
+                let user_id = &path["/scim/v2/Users/".len()..];
+                let user = self.scim().get_user(&organization_id, user_id).await?;
+                Ok(HttpResponse::json(StatusCode::OK, user))
+            }
+            (Method::PATCH, path) if path.starts_with("/scim/v2/Users/") => {
+                require_plugin(&self.context, SCIM_PLUGIN)?;
+                let organization_id = self.scim_organization(&request, &request_context).await?;
+                let user_id = &path["/scim/v2/Users/".len()..];
+                let patch: Value = parse_json(&request.body)?;
+                let updated = self
+                    .scim()
+                    .update_user(&organization_id, user_id, patch)
+                    .await?;
+                Ok(HttpResponse::json(StatusCode::OK, updated))
+            }
+            (Method::DELETE, path) if path.starts_with("/scim/v2/Users/") => {
+                require_plugin(&self.context, SCIM_PLUGIN)?;
+                let organization_id = self.scim_organization(&request, &request_context).await?;
+                let user_id = &path["/scim/v2/Users/".len()..];
+                self.scim().delete_user(&organization_id, user_id).await?;
+                Ok(HttpResponse {
+                    status: StatusCode::NO_CONTENT,
+                    headers: HeaderMap::new(),
+                    body: Vec::new(),
+                })
             }
             (Method::POST, "/device/code") => {
                 check_csrf(&request_context, &request.metadata())?;
@@ -3160,6 +3408,7 @@ struct BanUserInput {
 
 const ADMIN_PLUGIN: &str = "admin";
 const PASSKEY_PLUGIN: &str = "passkey";
+const SCIM_PLUGIN: &str = "scim";
 const PASSKEY_RP_NAME: &str = "Better Auth";
 const PASSKEY_NAME_MAX_CHARS: usize = 64;
 /// Namespace for passkey user handles. Changing it would orphan every passkey,
@@ -3430,6 +3679,106 @@ fn html_escape(text: &str) -> String {
 }
 
 #[derive(serde::Deserialize)]
+struct ScimTokenInput {
+    organization_id: String,
+    expires_in: Option<u64>,
+}
+
+fn now_unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+#[derive(serde::Deserialize)]
+struct MagicLinkSendInput {
+    email: String,
+    #[serde(rename = "callbackURL", default)]
+    callback_url: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct MagicLinkVerifyJson {
+    token: String,
+    #[serde(rename = "callbackURL", default)]
+    callback_url: Option<String>,
+}
+
+/// The token and the callback from a verify POST. Browsers send the form as
+/// `application/x-www-form-urlencoded`, and API clients may send JSON.
+fn parse_magic_link_verify(request: &HttpRequest) -> Result<(String, Option<String>)> {
+    let is_form = request
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/x-www-form-urlencoded"));
+    if is_form {
+        let fields: HashMap<String, String> = url::form_urlencoded::parse(&request.body)
+            .into_owned()
+            .collect();
+        let token = fields
+            .get("token")
+            .cloned()
+            .ok_or_else(|| AuthError::InvalidRequest("token is required".into()))?;
+        return Ok((token, fields.get("callbackURL").cloned()));
+    }
+    let input: MagicLinkVerifyJson = parse_json(&request.body)?;
+    Ok((input.token, input.callback_url))
+}
+
+/// A callback is accepted only as a path on this site: one leading slash, no
+/// backslash, no control characters, and a bounded length. Anything else would send
+/// the browser to another site.
+fn safe_callback_path(value: &str) -> Option<String> {
+    let valid = value.len() <= 512
+        && value.starts_with('/')
+        && !value.starts_with("//")
+        && !value.contains('\\')
+        && value.chars().all(|character| !character.is_control());
+    valid.then(|| value.to_owned())
+}
+
+/// The page a magic link opens. It holds one form that posts the token, so the
+/// sign-in happens only when the person presses the button.
+fn magic_link_confirmation_page(action: &str, token: &str, callback: &str) -> HttpResponse {
+    let page = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Confirm sign-in</title></head>\
+         <body><main><h1>Confirm sign-in</h1><p>This link works once. Press the button to finish signing in.</p>\
+         <form method=\"post\" action=\"{}\"><input type=\"hidden\" name=\"token\" value=\"{}\">\
+         <input type=\"hidden\" name=\"callbackURL\" value=\"{}\"><button type=\"submit\">Sign in</button></form>\
+         </main></body></html>",
+        html_escape(action),
+        html_escape(token),
+        html_escape(callback)
+    );
+    let mut response = HttpResponse {
+        status: StatusCode::OK,
+        headers: HeaderMap::new(),
+        body: page.into_bytes(),
+    };
+    response.headers.insert(
+        header::CONTENT_TYPE,
+        "text/html; charset=utf-8".parse().expect("static header"),
+    );
+    response.headers.insert(
+        header::CACHE_CONTROL,
+        "no-store".parse().expect("static header"),
+    );
+    response.headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'none'; form-action 'self'; style-src 'unsafe-inline'"
+            .parse()
+            .expect("static header"),
+    );
+    response.headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        "nosniff".parse().expect("static header"),
+    );
+    response
+}
+
+#[derive(serde::Deserialize)]
 struct SocialSignInInput {
     provider: String,
 }
@@ -3529,6 +3878,95 @@ fn passkey_name(name: &str) -> Result<String> {
         )));
     }
     Ok(trimmed.to_owned())
+}
+
+/// What a route requires before its handler runs. The handler still checks its own rules,
+/// so this gate is a second, independent check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteAccess {
+    /// Anyone. The route checks its own credential, or has none to check.
+    Public,
+    /// A signed-in user.
+    Session,
+    /// A signed-in user with an administrator role.
+    Admin,
+    /// A bearer token issued for a SCIM organization.
+    Bearer,
+}
+
+/// The access a route requires. Routes that are not listed as public require a session, so a
+/// route added without an entry here fails closed.
+pub fn route_access(method: &Method, path: &str) -> RouteAccess {
+    if path.starts_with("/scim/v2/") {
+        return RouteAccess::Bearer;
+    }
+    // OAuth begin and callback routes carry their own state and provider checks.
+    if path.starts_with("/sign-in/social/") || path.starts_with("/callback/") {
+        return RouteAccess::Public;
+    }
+    if path.starts_with("/admin/") {
+        return if path == "/admin/has-permission" {
+            // Answers `success: false` for non-administrators, so it needs only a session.
+            RouteAccess::Session
+        } else {
+            RouteAccess::Admin
+        };
+    }
+    let public = matches!(
+        (method.as_str(), path),
+        (
+            "GET",
+            "/" | "/ok" | "/ready" | "/health" | "/metrics" | "/error" | "/get-session"
+        ) | ("GET", "/openapi.json" | "/jwks" | "/.well-known/jwks.json")
+            | ("GET", "/magic-link/verify" | "/api-key/verify" | "/device")
+            | (
+                "POST",
+                "/sign-up/email" | "/sign-in/email" | "/sign-in/username"
+            )
+            | (
+                "POST",
+                "/sign-in/anonymous" | "/sign-in/email-otp" | "/sign-in/magic-link"
+            )
+            | ("POST", "/sign-in/social" | "/sign-out" | "/get-session")
+            | ("POST", "/request-password-reset" | "/reset-password")
+            | (
+                "POST",
+                "/verify-email" | "/magic-link/verify" | "/is-username-available"
+            )
+            | (
+                "POST",
+                "/email-otp/send" | "/email-otp/send-verification-otp" | "/email-otp/verify"
+            )
+            | (
+                "POST",
+                "/email-otp/verify-email" | "/email-otp/reset-password"
+            )
+            | (
+                "POST",
+                "/email-otp/request-password-reset" | "/email-otp/check-verification-otp"
+            )
+            | (
+                "POST",
+                "/forget-password/email-otp" | "/phone-number/send-otp" | "/phone-number/verify"
+            )
+            | (
+                "POST",
+                "/two-factor/verify" | "/one-tap/callback" | "/siwe/nonce" | "/siwe/verify"
+            )
+            | (
+                "POST",
+                "/one-time-token/verify" | "/device/code" | "/device/token"
+            )
+            | (
+                "POST",
+                "/passkey/generate-authenticate-options" | "/passkey/verify-authentication"
+            )
+    );
+    if public {
+        RouteAccess::Public
+    } else {
+        RouteAccess::Session
+    }
 }
 
 fn require_plugin(context: &AuthContext, name: &str) -> Result<()> {
@@ -4894,9 +5332,29 @@ mod tests {
     #[tokio::test]
     async fn admin_routes_are_absent_without_the_admin_plugin() {
         let router = account_router();
+        // The access gate answers before routing: anonymous callers get 401, and signed-in
+        // users who are not administrators get 403, whether or not the plugin is installed.
+        let (_, _, set) = send(
+            &router,
+            Method::POST,
+            "/sign-up/email",
+            None,
+            json!({"email":"plain@example.com","name":"Plain","password":"correct horse battery staple"}),
+        )
+        .await;
+        let cookie = session_cookie(set);
+        let (status, _, _) = send(
+            &router,
+            Method::GET,
+            "/admin/list-users",
+            Some(&cookie),
+            Value::Null,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
         let (status, _, _) =
             send(&router, Method::GET, "/admin/list-users", None, Value::Null).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -4944,10 +5402,30 @@ mod tests {
             .contains("https://example.com/api/auth/magic-link/verify?token="));
         let link_token = token_from_message(&message.text);
         let verify_uri = format!("/magic-link/verify?token={link_token}");
-        let (status, _, set) = send(&router, Method::GET, &verify_uri, None, Value::Null).await;
-        assert_eq!(status, StatusCode::FOUND);
-        assert!(set.is_some(), "a valid link issues a session");
         let (status, _, _) = send(&router, Method::GET, &verify_uri, None, Value::Null).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the confirmation page opens without spending the link"
+        );
+        let (status, _, set) = send(
+            &router,
+            Method::POST,
+            "/magic-link/verify",
+            None,
+            json!({"token": link_token}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(set.is_some(), "a valid link issues a session");
+        let (status, _, _) = send(
+            &router,
+            Method::POST,
+            "/magic-link/verify",
+            None,
+            json!({"token": link_token}),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "a link is single use");
 
         // Email code: wrong guesses use up the budget, so even the right code
@@ -6013,13 +6491,13 @@ mod tests {
         let link = token_from_message(&sender.last().unwrap().text);
         let (status, _, _) = send(
             &router,
-            Method::GET,
-            &format!("/magic-link/verify?token={link}"),
+            Method::POST,
+            "/magic-link/verify",
             None,
-            Value::Null,
+            json!({"token": link}),
         )
         .await;
-        assert_eq!(status, StatusCode::FOUND);
+        assert_eq!(status, StatusCode::SEE_OTHER);
 
         // The password chosen before the proof no longer works, and its session is gone.
         let (status, _, _) = send(

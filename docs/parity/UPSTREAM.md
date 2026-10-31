@@ -51,6 +51,14 @@ providers. Request and response shapes for these routes are Rust-owned and are
 **not yet** proven byte-compatible with the pinned TypeScript server. A
 compatibility suite against this pin is roadmap item Phase 8.
 
+## Schema at the pin
+
+The table definitions upstream creates are not in the `better-auth` tarball at `v1.7.14`.
+That package reads them from `@better-auth/core`, which is a separate package. The schema
+this crate creates is in `crates/better-auth-core/src/schema.rs`, and the plugin tables are
+declared by each plugin's `schema()`. A field-by-field comparison with upstream's schema
+needs the pinned `@better-auth/core` package, and it is not done yet.
+
 ## Deliberate deviations
 
 These differ from upstream on purpose. They are security decisions, not gaps:

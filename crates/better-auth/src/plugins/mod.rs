@@ -108,17 +108,31 @@ mod tests {
             .unwrap();
         let admin = AdminService::new(adapter.clone(), AdminGuard::new(["admin"]));
         admin.set_role("admin", "user", "manager").await.unwrap();
-        let scim = ScimService::new(adapter);
+        let scim = ScimService::new(adapter.clone());
+        // Only "user" belongs to org-1. "admin" is an account outside it.
+        adapter
+            .insert_record(
+                "organization_member",
+                json!({"id":"org-1:user","organization_id":"org-1","user_id":"user","role":"member"}),
+            )
+            .await
+            .unwrap();
         let updated = scim
-            .update_user("user", json!({"name":"Updated"}))
+            .update_user("org-1", "user", json!({"name":"Updated"}))
             .await
             .unwrap();
         assert_eq!(updated["name"], "Updated");
-        let page = scim.list_users(1, 1).await.unwrap();
-        assert_eq!(page["totalResults"], 2);
+        // Listing shows members only, and a user outside the organization is not found.
+        let page = scim.list_users("org-1", 1, 1).await.unwrap();
+        assert_eq!(page["totalResults"], 1);
         assert_eq!(page["itemsPerPage"], 1);
+        assert!(matches!(
+            scim.get_user("org-1", "admin").await,
+            Err(better_auth_core::error::AuthError::NotFound)
+        ));
         let filtered = scim
             .list_users_filtered(
+                "org-1",
                 1,
                 10,
                 Some(r#"(userName eq "user@example.com") and active eq true"#),
@@ -128,6 +142,7 @@ mod tests {
         assert_eq!(filtered["totalResults"], 1);
         let value_path = scim
             .list_users_filtered(
+                "org-1",
                 1,
                 10,
                 Some(r#"emails[type eq "work"].value eq "user@example.com""#),
@@ -135,27 +150,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value_path["totalResults"], 1);
+        // Bulk requests are refused until they are scoped to an organization.
         let operations = vec![ScimBulkOperation {
             method: "PATCH".into(),
             path: "/Users/user".into(),
             data: Some(json!({"displayName":"Bulk Updated"})),
         }];
-        let result = scim.apply_bulk(&operations, 1).await.unwrap();
-        assert_eq!(result[0].status, 200);
-        assert_eq!(
-            scim.get_user("user").await.unwrap()["displayName"],
-            "Bulk Updated"
-        );
+        assert!(scim.apply_bulk("org-1", &operations, 1).await.is_err());
         scim.update_user(
+            "org-1",
             "user",
             json!([{"op":"replace","path":"displayName","value":"Patched Again"}]),
         )
         .await
         .unwrap();
         assert_eq!(
-            scim.get_user("user").await.unwrap()["displayName"],
+            scim.get_user("org-1", "user").await.unwrap()["displayName"],
             "Patched Again"
         );
+        // A SCIM request cannot set a role, whatever its shape.
+        assert!(scim
+            .update_user("org-1", "user", json!({"role":"admin"}))
+            .await
+            .is_err());
+        assert!(scim
+            .update_user(
+                "org-1",
+                "user",
+                json!([{"op":"replace","path":"role","value":"admin"}])
+            )
+            .await
+            .is_err());
         let token = scim
             .issue_token("org-1", Some(now_seconds() + 60))
             .await
@@ -170,15 +195,33 @@ mod tests {
             .is_err());
         let group = scim.create_group("org-1", "Operators").await.unwrap();
         let group_id = group["id"].as_str().unwrap();
-        scim.add_group_member(group_id, "user").await.unwrap();
+        scim.add_group_member("org-1", group_id, "user")
+            .await
+            .unwrap();
         assert_eq!(
-            scim.get_group(group_id).await.unwrap()["members"][0]["value"],
+            scim.get_group("org-1", group_id).await.unwrap()["members"][0]["value"],
             "user"
         );
         let groups = scim.list_groups("org-1", 1, 10).await.unwrap();
         assert_eq!(groups["totalResults"], 1);
-        scim.remove_group_member(group_id, "user").await.unwrap();
-        scim.delete_group(group_id).await.unwrap();
-        assert!(scim.get_group(group_id).await.is_err());
+        // A group of another organization is invisible here, and cannot take members from here.
+        let other = scim.create_group("org-2", "Elsewhere").await.unwrap();
+        let other_id = other["id"].as_str().unwrap();
+        assert!(scim.get_group("org-1", other_id).await.is_err());
+        assert!(scim
+            .add_group_member("org-1", other_id, "user")
+            .await
+            .is_err());
+        assert!(scim.delete_group("org-1", other_id).await.is_err());
+        // Only organization members can join a group.
+        assert!(scim
+            .add_group_member("org-1", group_id, "admin")
+            .await
+            .is_err());
+        scim.remove_group_member("org-1", group_id, "user")
+            .await
+            .unwrap();
+        scim.delete_group("org-1", group_id).await.unwrap();
+        assert!(scim.get_group("org-1", group_id).await.is_err());
     }
 }

@@ -101,8 +101,6 @@ fn apply_scim_patch_operation(
             ));
         }
         user["active"] = value;
-    } else if attribute == "role" {
-        user["role"] = value;
     }
     Ok(())
 }
@@ -113,7 +111,13 @@ fn normalize_scim_patch_attribute(path: &str) -> Result<String> {
         "username" | "email" | "emails.value" => "email",
         "displayname" | "name" => "name",
         "active" => "active",
-        "role" => "role",
+        // Roles are not a SCIM attribute. A token that could set one could make anyone an
+        // administrator, so the request is refused outright.
+        "role" => {
+            return Err(AuthError::InvalidRequest(
+                "role cannot be changed through SCIM".into(),
+            ))
+        }
         _ => {
             if path.to_ascii_lowercase().starts_with("emails[")
                 && path.to_ascii_lowercase().ends_with("].value")
@@ -127,11 +131,4 @@ fn normalize_scim_patch_attribute(path: &str) -> Result<String> {
         }
     };
     Ok(normalized.into())
-}
-
-pub(super) fn merge_scim_patch(
-    user: serde_json::Value,
-    patch: &serde_json::Value,
-) -> Result<serde_json::Value> {
-    apply_scim_user_patch(user, patch)
 }

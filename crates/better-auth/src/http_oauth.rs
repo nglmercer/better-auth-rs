@@ -41,11 +41,11 @@ impl HttpOAuthProvider {
         token_endpoint: Url,
         userinfo_endpoint: Url,
     ) -> Result<Self> {
-        if token_endpoint.scheme() != "https" || userinfo_endpoint.scheme() != "https" {
-            return Err(AuthError::InvalidConfiguration(
-                "OAuth token and userinfo endpoints must use HTTPS".into(),
-            ));
-        }
+        crate::security::validate_public_https_endpoint(&token_endpoint, "OAuth token endpoint")?;
+        crate::security::validate_public_https_endpoint(
+            &userinfo_endpoint,
+            "OAuth userinfo endpoint",
+        )?;
         Ok(Self {
             id: id.into(),
             client_id: client_id.into(),
@@ -86,11 +86,7 @@ impl HttpOAuthProvider {
 
     /// Sets the authorization endpoint. HTTPS is required.
     pub fn with_authorization_endpoint(mut self, endpoint: Url) -> Result<Self> {
-        if endpoint.scheme() != "https" {
-            return Err(AuthError::InvalidConfiguration(
-                "OAuth authorization endpoint must use HTTPS".into(),
-            ));
-        }
+        crate::security::validate_public_https_endpoint(&endpoint, "OAuth authorization endpoint")?;
         self.authorization_endpoint = Some(endpoint);
         Ok(self)
     }
@@ -106,11 +102,10 @@ impl HttpOAuthProvider {
     }
 
     pub fn with_verified_emails_endpoint(mut self, endpoint: Url) -> Result<Self> {
-        if endpoint.scheme() != "https" {
-            return Err(AuthError::InvalidConfiguration(
-                "OAuth verified-emails endpoint must use HTTPS".into(),
-            ));
-        }
+        crate::security::validate_public_https_endpoint(
+            &endpoint,
+            "OAuth verified-emails endpoint",
+        )?;
         self.verified_emails_endpoint = Some(endpoint);
         Ok(self)
     }
@@ -148,11 +143,7 @@ impl HttpOAuthProvider {
     }
 
     pub async fn refresh_oidc_jwks(&mut self, jwks_url: Url) -> Result<usize> {
-        if jwks_url.scheme() != "https" {
-            return Err(AuthError::InvalidConfiguration(
-                "OIDC JWKS endpoint must use HTTPS".into(),
-            ));
-        }
+        crate::security::validate_public_https_endpoint(&jwks_url, "OIDC JWKS endpoint")?;
         let body: Value = self
             .client
             .get(jwks_url)

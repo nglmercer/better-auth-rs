@@ -152,7 +152,7 @@ pub const ROUTES: &[Route] = &[
         method: "POST",
         path: "/device/token",
         tag: "device",
-        session: true,
+        session: false,
     },
     Route {
         method: "POST",
@@ -662,7 +662,7 @@ pub const ROUTES: &[Route] = &[
         method: "POST",
         path: "/sign-out",
         tag: "sign-out",
-        session: true,
+        session: false,
     },
     Route {
         method: "POST",

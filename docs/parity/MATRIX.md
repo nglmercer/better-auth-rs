@@ -26,12 +26,12 @@ Evidence paths are relative to `crates/better-auth/src/` unless stated.
 | core email/password | Service implemented | `email_password.rs`, `router.rs` (sign-up, sign-in, session, sign-out, verify, reset); `packages/better-auth-client` e2e | No Kotlin or Rust SDK coverage for every route; wire shapes not compared to upstream |
 | account management (core, not an upstream plugin) | Service implemented | `account.rs`: list, revoke, change password, update name, delete, unlink (last sign-in method kept); `tests/account_parity.rs` | No email change, no provider link |
 | two-factor | Service implemented | `second_factor.rs`, `router.rs`: `two_factor_challenge_gates_sessions_and_codes_are_single_use` | No trusted devices, no recovery flow, no Kotlin or Rust SDK |
-| magic-link | Service implemented | `passwordless.rs`, `router.rs`: `magic_link_and_email_otp_sign_in_are_single_use_and_bounded` | Delivery needs an application transport |
+| magic-link | Service implemented | `passwordless.rs`, `router.rs`: `magic_link_and_email_otp_sign_in_are_single_use_and_bounded`; `tests/magic_link.rs` covers the confirmation page, the POST that signs in, same-site callbacks and cross-site refusal | No live mail transport in the example; the callback must be a path on this site |
 | email-otp | Service implemented | `passwordless.rs`; `tests/email_otp_purposes.rs`, `tests/email_change_and_reads.rs` cover sign-in, verification, reset and email-change codes, each single use and purpose-bound, with five guesses; the check route does not spend a code | No link-based change-email, no phone-number reset |
 | username | Service implemented | `username.rs`, `router.rs`: `usernames_are_unique_case_insensitively_and_sign_in`; `POST /is-username-available` (`tests/account_parity.rs`) | Availability is rate-limited per IP only, and it reveals whether a name is taken, as upstream does |
 | organization | Service implemented | `plugins/organization.rs`; routes in `router.rs`; `tests/organization_routes.rs` covers slugs, update and delete by role, invitations (list, cancel, reject, accept), leave and the last-owner rule | No custom roles, no active organization, no custom roles; the permission check uses a fixed role matrix |
 | admin | Service implemented | `router.rs`, `plugins/admin.rs`; `tests/admin_moderation.rs`, `tests/admin_accounts.rs` cover bans, expiry, session revocation, removal, user creation and updates, passwords, and permission checks | No impersonation, no persistent audit log |
-| jwt | Service implemented | `plugins/jwt.rs` | No discovery, key rotation or routes |
+| jwt | Service implemented | `jwt_signing.rs`: rotation, retirement and kid checks; `router.rs`: `jwt_tokens_verify_against_the_published_jwks` | No discovery, no client-credentials tokens, no rotation schedule |
 | bearer | Service implemented | `session.rs`: opt-in bearer transport | Opt-in only |
 | generic-oauth | Primitive only | `http_oauth.rs` presets for Google, GitHub and Facebook; `oauth.rs` state and linking tests | No provider registry or configurable profile mapping |
 | access | Not started | — | — |
@@ -59,7 +59,7 @@ Evidence paths are relative to `crates/better-auth/src/` unless stated.
 | passkey | Service implemented | `webauthn.rs` and `router.rs` routes under `/passkey/*`; `tests/passkey_flow.rs` runs registration and sign-in with a software authenticator, including replay, cloned counters, wrong origin, cross-account and deleted credentials | Route names are not verified against the pinned upstream, because passkey ships outside the core package; no browser authenticator E2E; no SDK methods; no attestation trust policy; the two-factor gate on passkey sign-in is not tested |
 | sso (OIDC) | Service implemented | `oidc.rs`: `multi_audience_tokens_require_matching_authorized_party`, signature and nonce tests; `plugins/sso.rs` | No discovery or routes; JWKS refresh is not scheduled |
 | sso (SAML) | Primitive only | `saml_rs_integration.rs` (optional `saml` feature) | No signed fixtures, no enterprise IdP E2E |
-| scim | Service implemented | `plugins/scim/` (filter, PATCH, groups, bulk, hashed tokens) | No HTTP routes; no live interoperability tests |
+| scim | Service implemented | `plugins/scim/`; routes in `router.rs`; `tests/scim_routes.rs`, `tests/scim_groups.rs` cover tokens, bearer auth, organization scope for users and groups, shared users, role refusal and group membership rules | No bulk, no ServiceProviderConfig, no live identity-provider interoperability |
 
 ## Security items that affect these claims
 
