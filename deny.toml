@@ -1,0 +1,54 @@
+# Supply-chain policy checked by `cargo deny check` (see .github/workflows/ci.yml).
+
+[graph]
+all-features = true
+
+[advisories]
+# Any advisory against a dependency in the graph fails the check.
+unmaintained = "workspace"
+yanked = "deny"
+# Accepted for now. Each entry names the parent that pins the vulnerable crate
+# and the upstream change that would remove it. Every entry blocks the
+# `core-stable` milestone in the roadmap and must be removed when fixed.
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa 0.9 Marvin timing attack. No fixed release exists. Reached only through sqlx-mysql's caching_sha2 authentication. Blocks core-stable." },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint timing variability. Reached through rsa (sqlx-mysql) and elliptic-curve (saml-rs / bergshamra). Needs a saml-rs and sqlx update." },
+    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki CRL distribution point matching. Reached through libsql's rustls 0.22 stack (hyper-rustls 0.25). Needs a libsql release on rustls 0.23." },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki URI name constraints. Reached through libsql's rustls 0.22 stack. Needs a libsql release on rustls 0.23." },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki wildcard name constraints. Reached through libsql's rustls 0.22 stack. Needs a libsql release on rustls 0.23." },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL parsing panic. Reached through libsql's rustls 0.22 stack. Needs a libsql release on rustls 0.23." },
+    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki accepts distrusted intermediates. Reached through libsql's rustls 0.22 stack. Needs a libsql release on rustls 0.23." },
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3 unbounded empty DATA frames. Reached through hyper 0.14 under libsql and tonic 0.11. Needs a libsql release on hyper 1." },
+    { id = "RUSTSEC-2026-0346", reason = "rustls 0.22 Debug output exposes session secrets. Reached through libsql. Needs a libsql release on rustls 0.23." },
+    { id = "RUSTSEC-2026-0349", reason = "rustls 0.22 downgrade via unauthenticated ServerHello. Reached through libsql. Needs a libsql release on rustls 0.23." },
+]
+
+[licenses]
+# Only permissive licenses are allowed. Copyleft requires an explicit decision here.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # Permissive license for the Mozilla root-certificate data in webpki-roots.
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Multiple versions are reported, not failed, because the dependency tree
+# (for example libsql and reqwest) legitimately duplicates some crates.
+multiple-versions = "warn"
+wildcards = "deny"
+# The workspace's own path dependencies carry no version requirement.
+allow-wildcard-paths = true
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

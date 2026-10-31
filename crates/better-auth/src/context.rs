@@ -173,6 +173,19 @@ impl AuthContext {
         })
     }
 
+    /// Checks an origin against the configured trusted origins and the static
+    /// base origin, without a request. Used by flows that run outside a request,
+    /// such as redirect validation during OAuth begin.
+    pub(crate) fn is_configured_origin(&self, origin: &str) -> bool {
+        self.options
+            .trusted_origins
+            .iter()
+            .any(|pattern| origin_matches(origin, pattern))
+            || self
+                .base_origin()
+                .is_some_and(|base| origin_matches(origin, &base))
+    }
+
     pub fn base_origin(&self) -> Option<String> {
         self.base_url.as_ref().map(|url| {
             let mut origin = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());

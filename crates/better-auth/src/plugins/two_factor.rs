@@ -67,23 +67,27 @@ pub struct TotpSecret {
 }
 
 pub fn generate_totp_secret(account_name: &str, issuer: &str) -> TotpSecret {
-    let first = Uuid::new_v4();
-    let second = Uuid::new_v4();
-    let mut bytes = Vec::with_capacity(20);
-    bytes.extend_from_slice(first.as_bytes());
-    bytes.extend_from_slice(&second.as_bytes()[..4]);
+    // 160 bits from the operating system RNG, as RFC 4226 recommends.
+    let mut bytes = [0u8; 20];
+    getrandom::getrandom(&mut bytes).expect("operating system random source is unavailable");
     let secret = BASE32_NOPAD.encode(&bytes);
-    let otpauth_url = format!(
+    let otpauth_url = build_otpauth_url(account_name, issuer, &secret);
+    TotpSecret {
+        secret,
+        otpauth_url,
+    }
+}
+
+/// The `otpauth://` URI an authenticator app imports. Built from the stored secret
+/// too, so a user can fetch it again after enrollment.
+pub(crate) fn build_otpauth_url(account_name: &str, issuer: &str, secret: &str) -> String {
+    format!(
         "otpauth://totp/{}:{}?secret={}&issuer={}",
         urlencoding(account_name),
         urlencoding(issuer),
         secret,
         urlencoding(issuer)
-    );
-    TotpSecret {
-        secret,
-        otpauth_url,
-    }
+    )
 }
 
 pub fn totp_code(

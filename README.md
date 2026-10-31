@@ -15,7 +15,14 @@ use the same auth context and security behavior.
 
 ## Current implementation
 
-The workspace now covers all roadmap phases at a framework-neutral baseline:
+The workspace has a framework-neutral baseline for the areas below. Each area
+is a building block, not a supported production feature. Per-feature status
+against the pinned upstream release is in
+[docs/parity/MATRIX.md](docs/parity/MATRIX.md), and the pin itself is in
+[docs/parity/UPSTREAM.md](docs/parity/UPSTREAM.md). Progress against the
+implementation roadmap, item by item, is in
+[docs/roadmap-status.md](docs/roadmap-status.md). Tests that need a live
+PostgreSQL or MySQL server are described in [docs/live-tests.md](docs/live-tests.md):
 
 - configuration validation and the no-durable-store cookie-cache defaults;
 - static, request-derived, and allowed-host dynamic base URLs;
@@ -36,9 +43,9 @@ The workspace now covers all roadmap phases at a framework-neutral baseline:
 - OAuth authorization state, PKCE, generic HTTPS provider exchange, and
   Google/GitHub provider presets, configurable OIDC ID-token validation, and
   encrypted provider-token envelopes.
-- TOTP and one-time backup codes, organization membership, passkey challenge
-  replay protection, durable WebAuthn registration/assertion verification
-  through webauthn-rs, admin role guards, OIDC/SAML SSO, concrete optional
+- TOTP and one-time backup codes, organization membership, passkey routes
+  (registration and sign-in verified by webauthn-rs, replay-protected; browser
+  E2E and SDK methods still missing, see docs/roadmap-status.md), admin role guards, OIDC/SAML SSO, concrete optional
   `saml-rs` validation, SCIM filtering/PATCH/groups/bulk operations and token
   hashing, and JWT issuance.
 - framework-neutral HTTP endpoints, an optional Axum adapter, and a client
@@ -68,6 +75,66 @@ depend on one database or web framework.
 For TypeScript consumers, use the fetch-native client package first. WASM is
 best reserved for optional Rust-owned pure computation or cryptography in the
 browser; NAPI should be introduced later only for Node.js backend bindings.
+
+
+### OAuth with application-owned numeric user IDs
+
+`OAuthService::complete()` creates UUID-based users by default. If your
+application already has numeric user IDs and the session resolver expects
+`better_auth.user.id == legacy_users.id.to_string()`, use
+`OAuthService::complete_with_provisioner()` instead:
+
+```rust,ignore
+use better_auth::{OAuthUserProfile, OAuthUserProvisioner, User};
+use better_auth::core::Result;
+use async_trait::async_trait;
+
+struct LegacyUsers { /* application database */ }
+
+#[async_trait]
+impl OAuthUserProvisioner for LegacyUsers {
+    async fn create_user(&self, profile: &OAuthUserProfile) -> Result<User> {
+        // In your application: atomically create the legacy users row,
+        // retrieve its integer ID, and construct a Better Auth User with
+        // id: legacy_id.to_string() and the normalized provider email.
+        todo!()
+    }
+
+    async fn rollback_user(&self, user: &User) -> Result<()> {
+        // Delete only the legacy row created by this attempt; make this
+        // idempotent. Never delete a previously existing linked user.
+        todo!()
+    }
+}
+
+// Your application's OAuth callback invokes:
+// let auth = oauth_service.complete_with_provisioner(
+//     &provider, code, state, signed_state_cookie, secure_cookie, &legacy_users
+// ).await?;
+```
+
+The service consumes OAuth state and PKCE, exchanges the code, validates tokens
+using the configured provider validator, fetches the profile, and encrypts
+provider tokens before linking the account and creating the session. It links
+to an existing Better Auth user by email **only when the provider confirms
+email ownership**. Existing provider-account links take precedence over email
+matching. The provisioner is called only for a new identity, and cleanup is
+attempted after errors in Better Auth persistence, hooks, or session creation.
+
+Google: use `HttpOAuthProvider::google` with an OIDC validator and refresh the
+Google JWKS at startup. GitHub: use `HttpOAuthProvider::github`, which consults
+the verified-email API rather than trusting the unaudited email in `/user`.
+Facebook/Meta: construct `HttpOAuthProvider::new` with the provider's token
+and userinfo endpoints, and define your authorization URL/scopes separately
+using `OAuthProviderConfig::new`. Without a trustworthy verified-email claim,
+Facebook logins must not automatically link to existing email accounts.
+
+**Integration boundary:** This crate cannot create an application's own
+`legacy_users` table or mount its HTTP routes. The application must wire OAuth
+begin/callback handlers, implement the provisioner and validate its legacy
+resolver. For separate databases, compensation is best-effort; a shared
+transaction or a durable reconciliation mechanism is needed to guarantee
+atomicity across storage systems.
 
 ### LibSQL/Turso
 

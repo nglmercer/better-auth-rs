@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { AuthClient } from "../src/index";
+import { AuthClient, isTwoFactorChallenge } from "../src/index";
 
 const packageDirectory = dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = resolve(packageDirectory, "../../..");
@@ -111,6 +111,8 @@ describe("AuthClient against the Rust web example", () => {
     expect(signedUp.session.user_id).toBe(signedUp.user.id);
 
     const signedIn = await client.signIn.email({ email, password });
+    // The account has no second factor, so sign-in returns a session.
+    if (isTwoFactorChallenge(signedIn)) throw new Error("unexpected challenge");
     expect(signedIn.user.id).toBe(signedUp.user.id);
     expect(signedIn.session.user_id).toBe(signedUp.user.id);
   });

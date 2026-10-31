@@ -13,22 +13,31 @@ sqlite = ["dep:rusqlite"]
 sqlx = ["dep:sqlx"]
 libsql = ["dep:libsql", "dep:secrecy"]
 saml = ["dep:saml-rs"]
+siwe = ["dep:k256", "dep:sha3"]
+# Test-only fixtures, such as HTTP OAuth providers on localhost. Never enable in production.
+test-utils = []
 
 [dependencies]
 aes-gcm.workspace = true
 axum = { workspace = true, optional = true }
 async-trait.workspace = true
 base64.workspace = true
-better-auth-core = { path = "../better-auth-core" }
+better-auth-core = { path = "../better-auth-core", version = "0.1.0" }
 data-encoding.workspace = true
+getrandom.workspace = true
 reqwest.workspace = true
 rusqlite = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 saml-rs = { workspace = true, optional = true }
-tokio.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
 hmac.workspace = true
 http.workspace = true
 jsonwebtoken.workspace = true
+rsa.workspace = true
+k256 = { workspace = true, optional = true }
+sha3 = { workspace = true, optional = true }
 libsql = { workspace = true, optional = true }
 password-hash.workspace = true
 secrecy = { workspace = true, optional = true }
@@ -39,12 +48,16 @@ serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 url.workspace = true
 webauthn-rs.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+# Software authenticator for passkey tests: P-256 signing and CBOR encoding.
+p256 = { version = "0.13", features = ["ecdsa"] }
+serde_cbor_2 = "0.13"
 
 [[example]]
 name = "client-test-server"

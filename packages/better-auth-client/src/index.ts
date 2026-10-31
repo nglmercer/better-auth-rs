@@ -53,6 +53,58 @@ export interface ResetPasswordResponse {
   reset: boolean;
 }
 
+export interface TwoFactorChallengeResponse {
+  two_factor_required: true;
+  challenge_token: string;
+}
+
+/** Password sign-in succeeds with a session, or with a second-factor challenge. */
+export type SignInEmailResponse = AuthSessionResponse | TwoFactorChallengeResponse;
+
+export function isTwoFactorChallenge(
+  response: SignInEmailResponse,
+): response is TwoFactorChallengeResponse {
+  return "two_factor_required" in response && response.two_factor_required === true;
+}
+
+export interface AdminUser {
+  id: string;
+  email: string;
+  name: string;
+  role: string | null;
+  email_verified: boolean;
+}
+
+export interface SessionSummary {
+  id: string;
+  expires_at: number;
+  current: boolean;
+}
+
+export interface LinkedAccount {
+  provider_id: string;
+  account_id: string;
+}
+
+/** A passkey as the signed-in user sees it. The credential itself never leaves the server. */
+export interface PasskeyView {
+  id: string;
+  name: string | null;
+  credential_id: string;
+}
+
+/**
+ * WebAuthn options as the server sends them (base64url fields). Browsers need
+ * binary buffers, so convert them before calling `navigator.credentials`.
+ */
+export type PasskeyOptions = Record<string, unknown>;
+
+export interface TwoFactorEnrollment {
+  secret: string;
+  totp_uri: string;
+  backup_codes: string[];
+}
+
 export interface RetryOptions {
   maxRetries?: number;
   baseDelayMs?: number;
@@ -104,9 +156,117 @@ export class AuthClient {
 
   readonly signIn = {
     email: (input: SignInEmailInput) =>
-      this.request<AuthSessionResponse>("/sign-in/email", {
+      this.request<SignInEmailResponse>("/sign-in/email", {
         method: "POST",
         body: input,
+      }),
+  };
+
+  readonly magicLink = {
+    send: (input: { email: string }) =>
+      this.request<{ sent: true }>("/sign-in/magic-link", {
+        method: "POST",
+        body: input,
+      }),
+  };
+
+  readonly emailOtp = {
+    send: (input: { email: string }) =>
+      this.request<{ sent: true }>("/email-otp/send", {
+        method: "POST",
+        body: input,
+      }),
+    verify: (input: { email: string; code: string }) =>
+      this.request<AuthSessionResponse>("/email-otp/verify", {
+        method: "POST",
+        body: input,
+      }),
+  };
+
+  readonly admin = {
+    listUsers: (options: { limit?: number; offset?: number } = {}) => {
+      const query = new URLSearchParams();
+      if (options.limit !== undefined) query.set("limit", String(options.limit));
+      if (options.offset !== undefined) query.set("offset", String(options.offset));
+      const suffix = query.size > 0 ? `?${query.toString()}` : "";
+      return this.request<{ users: AdminUser[] }>(`/admin/list-users${suffix}`, {
+        method: "GET",
+      });
+    },
+    setRole: (input: { userId: string; role: string }) =>
+      this.request<{ updated: true }>("/admin/set-role", {
+        method: "POST",
+        body: { user_id: input.userId, role: input.role },
+      }),
+    revokeSessions: (input: { userId: string }) =>
+      this.request<{ revoked: number }>("/admin/revoke-sessions", {
+        method: "POST",
+        body: { user_id: input.userId },
+      }),
+  };
+
+  /** Passkey ceremonies. The browser runs WebAuthn between the two steps of each pair. */
+  readonly passkey = {
+    registerOptions: () =>
+      this.request<{ transaction_id: string; options: PasskeyOptions }>(
+        "/passkey/generate-register-options",
+        { method: "POST", body: {} },
+      ),
+    register: (input: { transactionId: string; response: unknown; name?: string }) =>
+      this.request<{ passkey: PasskeyView }>("/passkey/verify-registration", {
+        method: "POST",
+        body: {
+          transaction_id: input.transactionId,
+          response: input.response,
+          name: input.name,
+        },
+      }),
+    signInOptions: () =>
+      this.request<{ transaction_id: string; options: PasskeyOptions }>(
+        "/passkey/generate-authenticate-options",
+        { method: "POST", body: {} },
+      ),
+    signIn: (input: { transactionId: string; response: unknown }) =>
+      this.request<SignInEmailResponse>("/passkey/verify-authentication", {
+        method: "POST",
+        body: { transaction_id: input.transactionId, response: input.response },
+      }),
+    list: () =>
+      this.request<{ passkeys: PasskeyView[] }>("/passkey/list-user-passkeys", {
+        method: "GET",
+      }),
+    rename: (input: { id: string; name: string }) =>
+      this.request<{ updated: boolean }>("/passkey/update-passkey", {
+        method: "POST",
+        body: input,
+      }),
+    delete: (input: { id: string }) =>
+      this.request<{ deleted: boolean }>("/passkey/delete-passkey", {
+        method: "POST",
+        body: input,
+      }),
+  };
+
+  readonly twoFactor = {
+    enable: (input: { password: string }) =>
+      this.request<TwoFactorEnrollment>("/two-factor/enable", {
+        method: "POST",
+        body: input,
+      }),
+    confirm: (input: { code: string }) =>
+      this.request<{ enabled: true }>("/two-factor/confirm", {
+        method: "POST",
+        body: input,
+      }),
+    disable: (input: { password: string }) =>
+      this.request<{ enabled: false }>("/two-factor/disable", {
+        method: "POST",
+        body: input,
+      }),
+    verify: (input: { challengeToken: string; code: string }) =>
+      this.request<AuthSessionResponse>("/two-factor/verify", {
+        method: "POST",
+        body: { challenge_token: input.challengeToken, code: input.code },
       }),
   };
 
@@ -157,6 +317,62 @@ export class AuthClient {
 
   async signOut(): Promise<void> {
     await this.request<unknown>("/sign-out", { method: "POST" });
+  }
+
+  listSessions(): Promise<{ sessions: SessionSummary[] }> {
+    return this.request<{ sessions: SessionSummary[] }>("/list-sessions", {
+      method: "GET",
+    });
+  }
+
+  revokeSession(id: string): Promise<{ revoked: number }> {
+    return this.request<{ revoked: number }>("/revoke-session", {
+      method: "POST",
+      body: { id },
+    });
+  }
+
+  revokeOtherSessions(): Promise<{ revoked: number }> {
+    return this.request<{ revoked: number }>("/revoke-other-sessions", {
+      method: "POST",
+    });
+  }
+
+  async revokeSessions(): Promise<void> {
+    await this.request<unknown>("/revoke-sessions", { method: "POST" });
+  }
+
+  listAccounts(): Promise<{ accounts: LinkedAccount[] }> {
+    return this.request<{ accounts: LinkedAccount[] }>("/list-accounts", {
+      method: "GET",
+    });
+  }
+
+  changePassword(input: {
+    currentPassword: string;
+    newPassword: string;
+  }): Promise<{ changed: true; revoked_sessions: number }> {
+    return this.request<{ changed: true; revoked_sessions: number }>("/change-password", {
+      method: "POST",
+      body: { current_password: input.currentPassword, new_password: input.newPassword },
+    });
+  }
+
+  updateUser(input: { name: string }): Promise<{ user: AuthUser }> {
+    return this.request<{ user: AuthUser }>("/update-user", {
+      method: "POST",
+      body: input,
+    });
+  }
+
+  async deleteUser(input: { password: string }): Promise<void> {
+    await this.request<unknown>("/delete-user", { method: "POST", body: input });
+  }
+
+  sendVerificationEmail(): Promise<{ sent: true }> {
+    return this.request<{ sent: true }>("/send-verification-email", {
+      method: "POST",
+    });
   }
 
   verifyEmail(input: VerifyEmailInput): Promise<VerifyEmailResponse> {

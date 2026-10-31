@@ -4,11 +4,24 @@ use http::{HeaderMap, Method, StatusCode};
 use serde_json::Value;
 use std::{collections::BTreeMap, sync::Arc};
 
+/// Who may call an endpoint. The default is fail-closed: a session is required.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EndpointAccess {
+    /// No authentication. Use only for endpoints that are safe for anonymous callers.
+    Public,
+    /// Any authenticated user with a valid session.
+    #[default]
+    Session,
+    /// Authenticated users whose stored role is an administrator role.
+    Admin,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint {
     pub method: Method,
     pub path: String,
     pub description: String,
+    pub access: EndpointAccess,
 }
 
 impl Endpoint {
@@ -17,7 +30,13 @@ impl Endpoint {
             method,
             path: path.into(),
             description: description.into(),
+            access: EndpointAccess::default(),
         }
+    }
+
+    pub fn with_access(mut self, access: EndpointAccess) -> Self {
+        self.access = access;
+        self
     }
 
     pub fn with_handler(self, handler: Arc<dyn EndpointHandler>) -> ExecutableEndpoint {
@@ -34,6 +53,9 @@ pub struct EndpointRequest {
     pub path: String,
     pub headers: HeaderMap,
     pub body: Vec<u8>,
+    /// Authenticated user id, set by the router for `Session` and `Admin`
+    /// endpoints. Always `None` for `Public` endpoints.
+    pub user_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]

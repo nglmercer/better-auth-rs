@@ -32,18 +32,13 @@ pub enum CookieCacheStrategy {
 }
 
 /// The SameSite policy used when Better Auth emits a cookie.
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CookieSameSite {
+    #[default]
     Lax,
     Strict,
     None,
-}
-
-impl Default for CookieSameSite {
-    fn default() -> Self {
-        Self::Lax
-    }
 }
 
 /// Cookie attributes are deliberately independent from `AuthOptions::base_path`.

@@ -418,6 +418,30 @@ mod tests {
         secondary_storage_conformance(Arc::new(storage)).await;
     }
 
+    /// The same shared contract the remote test runs, against an embedded
+    /// database file, so it needs no server and runs in every CI job.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn libsql_local_file_conformance() {
+        let directory =
+            std::env::temp_dir().join(format!("better-auth-libsql-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let adapter = LibSqlDbAdapter::local(directory.join("conformance.db"))
+            .await
+            .unwrap();
+        adapter
+            .apply_migrations(&MigrationPlan::from_schema(
+                &better_auth_core::schema::core_schema(),
+            ))
+            .await
+            .unwrap();
+        adapter_conformance(&adapter).await;
+        let storage = adapter.secondary_storage();
+        storage.migrate().await.unwrap();
+        secondary_storage_conformance(Arc::new(storage)).await;
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn libsql_remote_conformance_when_configured() {

@@ -95,6 +95,25 @@ impl MigrationExecutor for SqlxDbAdapter {
             .map_err(sqlx_error)?;
         Ok(Some(row.is_some()))
     }
+
+    async fn index_exists(&self, table: &str, index: &str) -> Result<Option<bool>> {
+        let statement = match self.backend {
+            SqlxBackend::Postgres => {
+                "SELECT 1 FROM pg_indexes WHERE schemaname = current_schema() AND tablename = ? AND indexname = ? LIMIT 1"
+            }
+            SqlxBackend::MySql => {
+                "SELECT 1 FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1"
+            }
+        };
+        let statement = sqlx_bind_sql(self.backend, statement);
+        let row = sqlx::query(&statement)
+            .bind(table)
+            .bind(index)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(sqlx_error)?;
+        Ok(Some(row.is_some()))
+    }
 }
 
 #[cfg(feature = "sqlx")]
@@ -313,45 +332,20 @@ impl SecondaryStorage for SqlxSecondaryStorage {
     }
 
     async fn increment(&self, key: &str, amount: i64, expires_in: Duration) -> Result<i64> {
-        let mut transaction = self.pool.begin().await.map_err(sqlx_error)?;
-        let existing = read_sqlx_kv(&mut transaction, self.backend, key, true).await?;
-        let current = existing
-            .as_ref()
-            .and_then(|value| value.value.as_i64())
-            .unwrap_or(0);
-        let next = current
-            .checked_add(amount)
-            .ok_or_else(|| AuthError::Adapter("counter overflow".into()))?;
-        let expires_at = existing
-            .and_then(|value| value.expires_in)
-            .map(|ttl| now_seconds() as i64 + ttl.as_secs() as i64)
-            .unwrap_or(now_seconds() as i64 + expires_in.as_secs() as i64);
-        bind_values(
-            sqlx::query(&sqlx_bind_sql(
-                self.backend,
-                "DELETE FROM _better_auth_kv WHERE storage_key = ?",
-            )),
-            vec![Value::String(key.to_owned())],
-        )
-        .execute(&mut *transaction)
-        .await
-        .map_err(sqlx_error)?;
-        bind_values(
-            sqlx::query(&sqlx_bind_sql(
-                self.backend,
-                "INSERT INTO _better_auth_kv(storage_key, value_json, expires_at) VALUES (?, ?, ?)",
-            )),
-            vec![
-                Value::String(key.to_owned()),
-                Value::from(next).to_string().into(),
-                Value::from(expires_at),
-            ],
-        )
-        .execute(&mut *transaction)
-        .await
-        .map_err(sqlx_error)?;
-        transaction.commit().await.map_err(sqlx_error)?;
-        Ok(next)
+        // Deadlocks between concurrent first increments are normal in InnoDB and
+        // PostgreSQL. The whole transaction is self-contained, so retrying it is
+        // safe. Anything else is returned at once.
+        const ATTEMPTS: u32 = 10;
+        for attempt in 1..=ATTEMPTS {
+            match self.increment_once(key, amount, expires_in).await {
+                Ok(outcome) => return outcome,
+                Err(error) if attempt < ATTEMPTS && is_retryable(&error) => {
+                    tokio::time::sleep(Duration::from_millis(2 * u64::from(attempt))).await;
+                }
+                Err(error) => return Err(sqlx_error(error)),
+            }
+        }
+        unreachable!("the final attempt returns")
     }
 
     async fn get_and_delete(&self, key: &str) -> Result<Option<StorageValue>> {
@@ -373,6 +367,124 @@ impl SecondaryStorage for SqlxSecondaryStorage {
 }
 
 #[cfg(feature = "sqlx")]
+impl SqlxSecondaryStorage {
+    /// One increment transaction. Returns the driver error separately so the
+    /// caller can decide whether to retry it.
+    async fn increment_once(
+        &self,
+        key: &str,
+        amount: i64,
+        expires_in: Duration,
+    ) -> std::result::Result<Result<i64>, sqlx::Error> {
+        use sqlx::Acquire as _;
+        let mut connection = self.pool.acquire().await?;
+        if self.backend == SqlxBackend::MySql {
+            // REPEATABLE READ takes gap locks on the insert below, which
+            // deadlock under concurrent first increments. READ COMMITTED takes
+            // only row locks. The level must be set before the transaction starts.
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                .execute(&mut *connection)
+                .await?;
+        }
+        let mut transaction = connection.begin().await?;
+        let now = now_seconds() as i64;
+        let fresh_expiry = now + expires_in.as_secs() as i64;
+        // Create the row if it is missing. The conflict-safe insert makes
+        // concurrent first increments wait on one row. A plain read-then-insert
+        // lets both transactions insert and one fails on the primary key.
+        bind_values(
+            sqlx::query(&sqlx_bind_sql(
+                self.backend,
+                kv_insert_if_absent_sql(self.backend),
+            )),
+            vec![
+                Value::String(key.to_owned()),
+                Value::String("0".into()),
+                Value::from(fresh_expiry),
+            ],
+        )
+        .execute(&mut *transaction)
+        .await?;
+        let row = bind_values(
+            sqlx::query(&sqlx_bind_sql(
+                self.backend,
+                "SELECT value_json, expires_at FROM _better_auth_kv WHERE storage_key = ? FOR UPDATE",
+            )),
+            vec![Value::String(key.to_owned())],
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        let raw = match text_column(&row, "value_json") {
+            Ok(raw) => raw,
+            Err(error) => return Ok(Err(error)),
+        };
+        let expires_at = row.try_get::<Option<i64>, _>("expires_at")?;
+        // An expired counter starts again from zero with a fresh window.
+        // A missing expiry means the value never expires. The column stays
+        // non-null, so it is stored as the far future rather than as NULL.
+        let (current, expires_at) = match expires_at {
+            Some(expires_at) if expires_at <= now => (Ok(0), fresh_expiry),
+            Some(expires_at) => (parse_counter(&raw), expires_at),
+            None => (parse_counter(&raw), NEVER_EXPIRES),
+        };
+        let next = match current.and_then(|current| {
+            current
+                .checked_add(amount)
+                .ok_or_else(|| AuthError::Adapter("counter overflow".into()))
+        }) {
+            Ok(next) => next,
+            Err(error) => return Ok(Err(error)),
+        };
+        bind_values(
+            sqlx::query(&sqlx_bind_sql(
+                self.backend,
+                "UPDATE _better_auth_kv SET value_json = ?, expires_at = ? WHERE storage_key = ?",
+            )),
+            vec![
+                Value::from(next).to_string().into(),
+                Value::from(expires_at),
+                Value::String(key.to_owned()),
+            ],
+        )
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(Ok(next))
+    }
+}
+
+/// Deadlocks and serialization failures, by SQLSTATE (`40001`, `40P01`) and by
+/// MySQL's error number (`1213`).
+fn is_retryable(error: &sqlx::Error) -> bool {
+    error.as_database_error().is_some_and(|database| {
+        database
+            .code()
+            .is_some_and(|code| matches!(code.as_ref(), "40001" | "40P01" | "1213"))
+    })
+}
+
+/// Conflict-safe insert of a zero counter. An existing row is left untouched.
+fn kv_insert_if_absent_sql(backend: SqlxBackend) -> &'static str {
+    match backend {
+        SqlxBackend::Postgres => {
+            "INSERT INTO _better_auth_kv(storage_key, value_json, expires_at) VALUES (?, ?, ?) ON CONFLICT (storage_key) DO NOTHING"
+        }
+        SqlxBackend::MySql => {
+            "INSERT IGNORE INTO _better_auth_kv(storage_key, value_json, expires_at) VALUES (?, ?, ?)"
+        }
+    }
+}
+
+/// Unix seconds for 9999-12-31T23:59:59Z, used where "never" must be stored.
+const NEVER_EXPIRES: i64 = 253_402_300_799;
+
+fn parse_counter(raw: &str) -> Result<i64> {
+    serde_json::from_str::<Value>(raw)
+        .map_err(json_error)?
+        .as_i64()
+        .ok_or_else(|| AuthError::Adapter("stored counter is not an integer".into()))
+}
+
 async fn read_sqlx_kv(
     transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
     backend: SqlxBackend,
@@ -394,7 +506,7 @@ async fn read_sqlx_kv(
     let Some(row) = row else {
         return Ok(None);
     };
-    let raw = row.try_get::<String, _>("value_json").map_err(sqlx_error)?;
+    let raw = text_column(&row, "value_json")?;
     let expires_at = row
         .try_get::<Option<i64>, _>("expires_at")
         .map_err(sqlx_error)?;
@@ -704,6 +816,20 @@ fn row_to_json(row: &sqlx::any::AnyRow, table: &str, schema: &SchemaExtension) -
     Ok(Value::Object(object))
 }
 
+/// Reads a text column. MySQL reports TEXT with a binary protocol type, so the
+/// driver may hand it out only as bytes. The UTF-8 bytes are the same text.
+#[cfg(feature = "sqlx")]
+fn text_column(row: &sqlx::any::AnyRow, column: &str) -> Result<String> {
+    match row.try_get::<String, _>(column) {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            let bytes = row.try_get::<Vec<u8>, _>(column).map_err(sqlx_error)?;
+            String::from_utf8(bytes)
+                .map_err(|_| AuthError::Adapter(format!("column {column} is not UTF-8")))
+        }
+    }
+}
+
 #[cfg(feature = "sqlx")]
 fn any_value_to_json(
     row: &sqlx::any::AnyRow,
@@ -731,7 +857,9 @@ fn any_value_to_json(
                 .collect(),
         ));
     }
-    if let Ok(value) = row.try_get::<String, _>(index) {
+    // MySQL reports TEXT columns with a binary protocol type, so the driver may
+    // only hand them out as bytes. The UTF-8 bytes are the same text.
+    if let Ok(value) = text_column(row, index) {
         if matches!(field_type, Some(FieldType::Json)) {
             return serde_json::from_str(&value).map_err(json_error);
         }

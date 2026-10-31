@@ -653,12 +653,9 @@ fn update_statement(
     values.extend(where_values);
     Ok((
         format!(
-            "UPDATE {} SET {}",
+            "UPDATE {} SET {assignments}{}",
             quote_identifier(table)?,
-            format!(
-                "{assignments}{}",
-                renumber_placeholders(&where_sql, fields.len())
-            )
+            renumber_placeholders(&where_sql, fields.len())
         ),
         values,
     ))

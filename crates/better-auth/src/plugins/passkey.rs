@@ -2,7 +2,7 @@ use super::shared::{endpoint, now_seconds, optional, random_challenge, required,
 use better_auth_core::{
     adapter::{SecondaryStorage, StorageValue},
     error::{AuthError, Result},
-    plugin::{Endpoint, Plugin},
+    plugin::{Endpoint, EndpointAccess, Plugin},
     schema::{FieldType, SchemaExtension, TableSchema},
 };
 use http::Method;
@@ -20,18 +20,40 @@ impl Plugin for PasskeyPlugin {
         vec![
             endpoint(
                 Method::POST,
-                "/passkey/generate-challenge",
-                "Generate a WebAuthn challenge",
+                "/passkey/generate-register-options",
+                "Start passkey registration for the signed-in user",
             ),
             endpoint(
                 Method::POST,
-                "/passkey/register",
-                "Register a passkey credential",
+                "/passkey/verify-registration",
+                "Finish passkey registration",
             ),
             endpoint(
                 Method::POST,
-                "/passkey/authenticate",
-                "Authenticate with a passkey",
+                "/passkey/generate-authenticate-options",
+                "Start a passkey sign-in",
+            )
+            .with_access(EndpointAccess::Public),
+            endpoint(
+                Method::POST,
+                "/passkey/verify-authentication",
+                "Finish a passkey sign-in and create a session",
+            )
+            .with_access(EndpointAccess::Public),
+            endpoint(
+                Method::GET,
+                "/passkey/list-user-passkeys",
+                "List the signed-in user's passkeys",
+            ),
+            endpoint(
+                Method::POST,
+                "/passkey/update-passkey",
+                "Rename one of the signed-in user's passkeys",
+            ),
+            endpoint(
+                Method::POST,
+                "/passkey/delete-passkey",
+                "Delete one of the signed-in user's passkeys",
             ),
         ]
     }
@@ -41,11 +63,11 @@ impl Plugin for PasskeyPlugin {
             TableSchema::default()
                 .field("id", required(FieldType::String).unique())
                 .field("user_id", required(FieldType::String))
+                .field("name", optional(FieldType::String))
                 .field("credential_id", required(FieldType::String).unique())
-                .field("public_key", required(FieldType::Bytes))
-                .field("counter", required(FieldType::Integer))
-                .field("credential", required(FieldType::Json))
-                .field("transports", optional(FieldType::Json)),
+                // The whole webauthn-rs credential, including the public key and
+                // signature counter that verification depends on.
+                .field("credential", required(FieldType::Json)),
         )
     }
 }

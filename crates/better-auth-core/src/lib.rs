@@ -4,6 +4,11 @@
 //! plugins can depend on these types without pulling in Axum, Actix, or a
 //! particular database client.
 
+// `async-trait` 0.1.91+ adds `#[must_use]` to every async trait method. Those
+// methods already return `Result`, so clippy's `double_must_use` reports each
+// generated trait method. The attribute is macro-generated, not authored here.
+#![allow(clippy::double_must_use)]
+
 pub mod adapter;
 pub mod error;
 pub mod migration;

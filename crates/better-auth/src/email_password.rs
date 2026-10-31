@@ -13,6 +13,13 @@ use uuid::Uuid;
 
 const USER_TABLE: &str = "user";
 const ACCOUNT_TABLE: &str = "account";
+/// A real scrypt hash with the default parameters, used only to equalize timing.
+/// It never matches a password a user could have, because it is a fixed value.
+const DUMMY_PASSWORD_HASH: &str =
+    "$scrypt$ln=15,r=8,p=1$psZvxW4xaeM76X2nvYV9Tw$pYBD6BLXG2Pn/CoYyM3g71r18m0bNhA7+lshZ6QvUxc";
+pub(crate) const TWO_FACTOR_TABLE: &str = "two_factor";
+pub(crate) const TWO_FACTOR_PLUGIN: &str = "two-factor";
+const TWO_FACTOR_REQUIRED: &str = "TWO_FACTOR_REQUIRED";
 const EMAIL_PROVIDER: &str = "credential";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -179,9 +186,7 @@ impl EmailPasswordService {
         self.require_database()?;
         let email = normalize_email(&input.email)?;
         validate_name(&input.name)?;
-        if input.password.is_empty() {
-            return Err(AuthError::InvalidRequest("password cannot be empty".into()));
-        }
+        validate_password(&input.password)?;
         if self
             .context
             .adapter
@@ -212,7 +217,8 @@ impl EmailPasswordService {
             "account_id": user.email,
             "password_hash": password_hash,
         });
-        self.context
+        let inserted = self
+            .context
             .adapter
             .transaction(vec![
                 DbOperation::InsertRecord {
@@ -224,33 +230,72 @@ impl EmailPasswordService {
                     record: account,
                 },
             ])
-            .await?;
-        self.context.after_user_create(&user).await?;
+            .await;
+        if let Err(error) = inserted {
+            // A concurrent sign-up for the same address can pass the read check
+            // above. The unique index rejects the loser, which then gets the same
+            // answer as a sequential duplicate instead of an internal error.
+            let taken = self
+                .context
+                .adapter
+                .find_one(USER_TABLE, Query::new().eq("email", user.email.clone()))
+                .await?
+                .is_some();
+            return Err(if taken {
+                AuthError::InvalidRequest("email is already registered".into())
+            } else {
+                error
+            });
+        }
+        if let Err(error) = self.context.after_user_create(&user).await {
+            // A failed lifecycle hook must not leave a usable account behind.
+            // Cleanup is best effort: the hook error is what the caller needs.
+            let _ = self
+                .context
+                .adapter
+                .transaction(vec![
+                    DbOperation::DeleteWhere {
+                        table: ACCOUNT_TABLE.into(),
+                        query: Query::new().eq("user_id", user.id.clone()),
+                    },
+                    DbOperation::DeleteWhere {
+                        table: USER_TABLE.into(),
+                        query: Query::new().eq("id", user.id.clone()),
+                    },
+                ])
+                .await;
+            return Err(error);
+        }
 
         self.finish_sign_in(user, secure_cookie).await
     }
 
-    pub async fn sign_in(&self, input: SignInInput, secure_cookie: bool) -> Result<AuthResult> {
+    /// Checks the email and password and returns the user without creating a
+    /// session. Callers that handle a second factor branch on the result.
+    pub async fn verify_credentials(&self, input: SignInInput) -> Result<User> {
         self.require_database()?;
         let email = normalize_email(&input.email)?;
-        let user_value = self
+        let Some(user_value) = self
             .context
             .adapter
             .find_one(USER_TABLE, Query::new().eq("email", email))
             .await?
-            .ok_or(AuthError::Unauthorized)?;
+        else {
+            return self.reject_after_dummy_verify(&input.password).await;
+        };
         let user: User = serde_json::from_value(user_value).map_err(serialize_error)?;
         let account_id = format!("{}:{EMAIL_PROVIDER}", user.id);
-        let account = self
+        let Some(account) = self
             .context
             .adapter
             .find_one(ACCOUNT_TABLE, Query::new().eq("id", account_id.clone()))
             .await?
-            .ok_or(AuthError::Unauthorized)?;
-        let password_hash = account
-            .get("password_hash")
-            .and_then(Value::as_str)
-            .ok_or(AuthError::Unauthorized)?;
+        else {
+            return self.reject_after_dummy_verify(&input.password).await;
+        };
+        let Some(password_hash) = account.get("password_hash").and_then(Value::as_str) else {
+            return self.reject_after_dummy_verify(&input.password).await;
+        };
         let verification = self
             .context
             .password_provider
@@ -271,6 +316,34 @@ impl EmailPasswordService {
                 .await?;
         }
 
+        Ok(user)
+    }
+
+    pub async fn sign_in(&self, input: SignInInput, secure_cookie: bool) -> Result<AuthResult> {
+        let user = self.verify_credentials(input).await?;
+        // No session may exist until the second factor is verified. Callers
+        // that can complete a challenge use `verify_credentials` instead.
+        if two_factor_required(&self.context, &user.id).await? {
+            return Err(AuthError::Forbidden(TWO_FACTOR_REQUIRED.into()));
+        }
+        self.finish_sign_in(user, secure_cookie).await
+    }
+
+    /// Spends the same password-hashing time as a real check before refusing.
+    /// Without this, an unknown address answers faster than a known one, and
+    /// response timing reveals which accounts exist.
+    async fn reject_after_dummy_verify(&self, password: &str) -> Result<User> {
+        let _ = self
+            .context
+            .password_provider
+            .verify(password, DUMMY_PASSWORD_HASH)
+            .await;
+        Err(AuthError::Unauthorized)
+    }
+
+    /// Creates the session for a user whose credentials, and any second factor,
+    /// have already been verified.
+    pub async fn complete_sign_in(&self, user: User, secure_cookie: bool) -> Result<AuthResult> {
         self.finish_sign_in(user, secure_cookie).await
     }
 
@@ -279,11 +352,15 @@ impl EmailPasswordService {
         headers: &http::HeaderMap,
         secure_cookie: bool,
     ) -> Result<Option<(User, Session)>> {
-        Ok(self
-            .sessions
-            .resolve(headers, secure_cookie)
-            .await?
-            .map(|principal| (principal.user, principal.session)))
+        let Some(principal) = self.sessions.resolve(headers, secure_cookie).await? else {
+            return Ok(None);
+        };
+        // A ban takes effect on the next request, even for a session that was
+        // created before it, in case the sessions were not deleted in time.
+        if crate::plugins::account_is_banned(&self.context, &principal.user.id).await? {
+            return Ok(None);
+        }
+        Ok(Some((principal.user, principal.session)))
     }
 
     pub async fn refresh_session_cookie(
@@ -307,6 +384,9 @@ impl EmailPasswordService {
         user: User,
         secure_cookie: bool,
     ) -> Result<AuthResult> {
+        if crate::plugins::account_is_banned(&self.context, &user.id).await? {
+            return Err(AuthError::Forbidden("account is banned".into()));
+        }
         self.sessions.create(user, secure_cookie).await
     }
 
@@ -314,18 +394,52 @@ impl EmailPasswordService {
         let result = self
             .create_authenticated_session(user, secure_cookie)
             .await?;
-        self.context
+        if let Err(error) = self
+            .context
             .after_sign_in(&AuthPrincipal {
                 user: result.user.clone(),
                 session: result.session.clone(),
             })
-            .await?;
+            .await
+        {
+            // The client never receives this session, so it must not stay valid.
+            let _ = self.sessions.discard(&result.session.id).await;
+            return Err(error);
+        }
         Ok(result)
     }
 
     fn require_database(&self) -> Result<()> {
         require_database(&self.context)
     }
+}
+
+/// Returns `true` when the user has a two-factor record that is not explicitly
+/// disabled. The check only runs when the two-factor plugin is registered,
+/// because its table is absent otherwise. A malformed `enabled` value is
+/// treated as enabled.
+/// Reports whether a plugin with this name is registered. Plugin-owned tables
+/// exist only when their plugin is registered, so queries must check first.
+pub(crate) fn has_plugin(context: &AuthContext, name: &str) -> bool {
+    context
+        .plugins
+        .plugins()
+        .iter()
+        .any(|plugin| plugin.name() == name)
+}
+
+pub(crate) async fn two_factor_required(context: &AuthContext, user_id: &str) -> Result<bool> {
+    if !has_plugin(context, TWO_FACTOR_PLUGIN) {
+        return Ok(false);
+    }
+    let record = context
+        .adapter
+        .find_one(
+            TWO_FACTOR_TABLE,
+            Query::new().eq("user_id", user_id.to_owned()),
+        )
+        .await?;
+    Ok(record.is_some_and(|record| record.get("enabled").and_then(Value::as_bool) != Some(false)))
 }
 
 fn require_database(context: &AuthContext) -> Result<()> {
@@ -338,7 +452,7 @@ fn require_database(context: &AuthContext) -> Result<()> {
     }
 }
 
-fn normalize_email(email: &str) -> Result<String> {
+pub(crate) fn normalize_email(email: &str) -> Result<String> {
     let normalized = email.trim().to_ascii_lowercase();
     let valid = normalized.len() >= 3
         && normalized.len() <= 320
@@ -354,7 +468,19 @@ fn normalize_email(email: &str) -> Result<String> {
     Ok(normalized)
 }
 
-fn validate_name(name: &str) -> Result<()> {
+/// Password policy shared by sign-up, password change and password reset.
+/// The minimum follows the NIST SP 800-63B recommendation of 8 characters.
+pub(crate) fn validate_password(password: &str) -> Result<()> {
+    let length = password.chars().count();
+    if !(8..=128).contains(&length) {
+        return Err(AuthError::InvalidRequest(
+            "password must be between 8 and 128 characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_name(name: &str) -> Result<()> {
     let length = name.chars().count();
     if !(1..=200).contains(&length) {
         return Err(AuthError::InvalidRequest(
@@ -455,6 +581,227 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    struct FailingSessionHook;
+
+    #[async_trait::async_trait]
+    impl crate::hooks::AuthHooks for FailingSessionHook {
+        async fn after_session_create(&self, _user: &User, _session: &Session) -> Result<()> {
+            Err(AuthError::Plugin("downstream sync failed".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_session_hook_leaves_no_orphan_session() {
+        let context = AuthContext::new_with_hooks(
+            AuthOptions {
+                secret: "h".repeat(32),
+                base_url: Some(BaseUrl::Static("https://example.com".into())),
+                has_database: true,
+                ..AuthOptions::default()
+            },
+            Arc::new(MemoryDb::default()),
+            None,
+            Vec::new(),
+            vec![Arc::new(FailingSessionHook)],
+        )
+        .unwrap();
+        let service = EmailPasswordService::new(context.clone()).unwrap();
+        let error = service
+            .sign_up(
+                SignUpInput {
+                    email: "orphan@example.com".into(),
+                    name: "Orphan".into(),
+                    password: "correct horse battery staple".into(),
+                },
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuthError::Plugin(_)));
+        let sessions = context
+            .adapter
+            .find_many("session", Query::new())
+            .await
+            .unwrap();
+        assert!(sessions.is_empty(), "orphan sessions: {sessions:?}");
+    }
+
+    struct CountingPasswords {
+        inner: crate::password::ScryptPhcPasswordProvider,
+        verifications: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::password::PasswordProvider for CountingPasswords {
+        async fn hash(&self, password: &str) -> Result<String> {
+            self.inner.hash(password).await
+        }
+
+        async fn verify(
+            &self,
+            password: &str,
+            encoded: &str,
+        ) -> Result<crate::password::PasswordVerification> {
+            self.verifications
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.verify(password, encoded).await
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_address_pays_the_same_hashing_cost_as_a_known_one() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let passwords = Arc::new(CountingPasswords {
+            inner: crate::password::ScryptPhcPasswordProvider::new(
+                AuthOptions::default().password_hash,
+            ),
+            verifications: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let context = AuthContext::new_with_password_provider(
+            AuthOptions {
+                secret: "u".repeat(32),
+                base_url: Some(BaseUrl::Static("https://example.com".into())),
+                has_database: true,
+                ..AuthOptions::default()
+            },
+            Arc::new(MemoryDb::default()),
+            None,
+            Vec::new(),
+            passwords.clone(),
+        )
+        .unwrap();
+        let service = EmailPasswordService::new(context).unwrap();
+        let attempt = |email: &str| SignInInput {
+            email: email.into(),
+            password: "some password here".into(),
+        };
+        let unknown = service.sign_in(attempt("nobody@example.com"), true).await;
+        assert!(matches!(unknown, Err(AuthError::Unauthorized)));
+        assert_eq!(
+            passwords.verifications.load(SeqCst),
+            1,
+            "unknown address is hashed too"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn concurrent_sign_up_with_one_email_creates_exactly_one_account() {
+        use crate::database::SqliteDbAdapter;
+        use better_auth_core::{migration::MigrationPlan, schema::core_schema};
+
+        let adapter = Arc::new(SqliteDbAdapter::in_memory().unwrap());
+        adapter
+            .apply_migrations(&MigrationPlan::from_schema(&core_schema()))
+            .await
+            .unwrap();
+        // The delay runs after the read check, so both sign-ups see no user and
+        // then race to insert. That is the window the unique index must close.
+        struct WidenRaceWindow;
+
+        #[async_trait::async_trait]
+        impl crate::hooks::AuthHooks for WidenRaceWindow {
+            async fn before_user_create(&self, _user: &mut User) -> Result<()> {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Ok(())
+            }
+        }
+
+        let context = AuthContext::new_with_hooks(
+            AuthOptions {
+                secret: "c".repeat(32),
+                base_url: Some(BaseUrl::Static("https://example.com".into())),
+                has_database: true,
+                ..AuthOptions::default()
+            },
+            adapter.clone(),
+            None,
+            Vec::new(),
+            vec![Arc::new(WidenRaceWindow)],
+        )
+        .unwrap();
+        let service = EmailPasswordService::new(context).unwrap();
+        let input = || SignUpInput {
+            email: "race@example.com".into(),
+            name: "Race".into(),
+            password: "correct horse battery staple".into(),
+        };
+        let (first, second) = tokio::join!(
+            service.sign_up(input(), true),
+            service.sign_up(input(), true)
+        );
+        let outcomes = [first, second];
+        assert_eq!(outcomes.iter().filter(|o| o.is_ok()).count(), 1);
+        let loser = outcomes
+            .into_iter()
+            .find(|o| o.is_err())
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(loser, AuthError::InvalidRequest(_)), "{loser:?}");
+        let users = adapter.find_many(USER_TABLE, Query::new()).await.unwrap();
+        assert_eq!(users.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_factor_enabled_user_gets_no_session_on_password_sign_in() {
+        let context = AuthContext::new(
+            AuthOptions {
+                secret: "t".repeat(32),
+                base_url: Some(BaseUrl::Static("https://example.com".into())),
+                has_database: true,
+                ..AuthOptions::default()
+            },
+            Arc::new(MemoryDb::default()),
+            None,
+            vec![Arc::new(crate::plugins::TwoFactorPlugin)],
+        )
+        .unwrap();
+        let service = EmailPasswordService::new(context.clone()).unwrap();
+        let signed_up = service
+            .sign_up(
+                SignUpInput {
+                    email: "mfa@example.com".into(),
+                    name: "MFA".into(),
+                    password: "correct horse battery staple".into(),
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        let user_id = signed_up.user.id.clone();
+        context
+            .adapter
+            .transaction(vec![DbOperation::InsertRecord {
+                table: "two_factor".into(),
+                record: json!({
+                    "id": "tf-1",
+                    "user_id": user_id,
+                    "secret": "JBSWY3DPEHPK3PXP",
+                    "enabled": true,
+                    "backup_codes": [],
+                }),
+            }])
+            .await
+            .unwrap();
+        let input = || SignInInput {
+            email: "mfa@example.com".into(),
+            password: "correct horse battery staple".into(),
+        };
+        let refused = service.sign_in(input(), true).await.unwrap_err();
+        assert!(matches!(refused, AuthError::Forbidden(ref code) if code == "TWO_FACTOR_REQUIRED"));
+
+        context
+            .adapter
+            .update_where(
+                "two_factor",
+                Query::new().eq("user_id", user_id.clone()),
+                json!({"enabled": false}),
+            )
+            .await
+            .unwrap();
+        assert!(service.sign_in(input(), true).await.is_ok());
     }
 
     #[tokio::test]

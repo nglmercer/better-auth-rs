@@ -5,16 +5,48 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      # Throwaway PostgreSQL for the live adapter and flow tests. It is local to
+      # this job and holds no secrets.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: mysql
+          MYSQL_DATABASE: better_auth_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pmysql --silent"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       # Optional repository secrets enable the environment-gated live adapter
       # conformance test without making forked pull requests depend on them.
       BETTER_AUTH_TEST_LIBSQL_URL: ${{ secrets.BETTER_AUTH_TEST_LIBSQL_URL }}
       BETTER_AUTH_TEST_LIBSQL_TOKEN: ${{ secrets.BETTER_AUTH_TEST_LIBSQL_TOKEN }}
-      BETTER_AUTH_TEST_POSTGRES_URL: ${{ secrets.BETTER_AUTH_TEST_POSTGRES_URL }}
-      BETTER_AUTH_TEST_MYSQL_URL: ${{ secrets.BETTER_AUTH_TEST_MYSQL_URL }}
+      BETTER_AUTH_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/postgres
+      BETTER_AUTH_TEST_MYSQL_URL: mysql://root:mysql@127.0.0.1:3306/better_auth_test
     steps:
       - uses: actions/checkout@v4
 
@@ -24,13 +56,108 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Check workspace
         run: cargo check --workspace --all-features
 
       - name: Run workspace tests
         run: cargo test --workspace --all-features
+
+      - name: Every upstream endpoint is mounted or deferred with a reason
+        run: python3 tools/parity/check_deferred.py
+
+      - name: Supply-chain policy (licenses, sources, advisories)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+      - name: Build release artifacts
+        run: cargo build --workspace --release --all-features
+
+  msrv:
+    # Keep in sync with `rust-version` in the workspace Cargo.toml.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SQLite development headers
+        run: sudo apt-get update && sudo apt-get install --yes libsqlite3-dev pkg-config
+
+      - name: Install MSRV toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89"
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace on MSRV
+        run: cargo check --workspace --all-features
+
+  typescript:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/better-auth-client
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: packages/better-auth-client/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Typecheck tests
+        run: npm run test:types
+
+      - name: Unit tests
+        run: npm test
+
+  browser:
+    name: Browser tests (Playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install --yes libsqlite3-dev pkg-config
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Playwright
+        working-directory: e2e
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      - name: Run browser tests
+        working-directory: e2e
+        run: npx playwright test
