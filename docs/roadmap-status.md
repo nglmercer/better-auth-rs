@@ -186,7 +186,7 @@ Merged to `main`: #5 (Google JWKS lifecycle), #6 (native desktop login), #7 (ses
 
 Verification on the merged `main`, with a local PostgreSQL 16 server:
 
-- `cargo test -p better-auth --all-features --no-fail-fast`: 268 passed, 0 failed, 1 ignored. The ignored test is the MySQL live test (`--ignored` regeneration helper), and MySQL was not run.
+- `cargo test -p better-auth --all-features --no-fail-fast`: 268 passed, 0 failed, 1 ignored. The ignored test is `regenerate_goldens`, a manual helper that rewrites the compatibility fixtures. The MySQL live tests return early without a server, so they count as passed but were not run.
 - `cargo clippy -p better-auth --all-targets --all-features -- -D warnings`: clean.
 - `cargo fmt --all -- --check`: clean.
 
