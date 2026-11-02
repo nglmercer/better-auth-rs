@@ -1,4 +1,4 @@
-use super::shared::{endpoint, hash_secret, required, urlencoding};
+use super::shared::{endpoint, hash_secret, optional, required, urlencoding};
 use better_auth_core::{
     error::{AuthError, Result},
     plugin::{Endpoint, Plugin},
@@ -46,6 +46,9 @@ impl Plugin for TwoFactorPlugin {
                 .field("id", required(FieldType::String).unique())
                 .field("user_id", required(FieldType::String).unique())
                 .field("secret", required(FieldType::String))
+                // Version of the secret-sealing key. Written by `second_factor.rs`; rows
+                // from before rotation tracking have no value, so the column is nullable.
+                .field("secret_version", optional(FieldType::String))
                 .field("enabled", required(FieldType::Boolean))
                 .field("backup_codes", required(FieldType::Json)),
         )
