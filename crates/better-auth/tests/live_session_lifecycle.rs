@@ -118,8 +118,8 @@ async fn revocation_on_one_instance_is_persistent_and_seen_by_others() {
 }
 
 async fn revocation_on_one_instance_is_persistent_and_seen_by_others_on(url: &str) {
-    let node_a = instance(&url).await;
-    let node_b = instance(&url).await;
+    let node_a = instance(url).await;
+    let node_b = instance(url).await;
     let email = format!("session-{}@example.test", Uuid::new_v4().simple());
     let login = EmailPasswordService::new(node_a.clone())
         .unwrap()
@@ -147,7 +147,7 @@ async fn revocation_on_one_instance_is_persistent_and_seen_by_others_on(url: &st
     assert!(!authenticates(&node_a, &bearer_headers, SessionTransport::Bearer).await);
 
     // A restart (fresh pools) sees the same revocation.
-    let restarted = instance(&url).await;
+    let restarted = instance(url).await;
     assert!(!authenticates(&restarted, &bearer_headers, SessionTransport::Bearer).await);
 }
 
@@ -163,7 +163,7 @@ async fn concurrent_logins_on_separate_instances_are_consistent_and_revocable_to
     url: &str,
 ) {
     let email = format!("session-{}@example.test", Uuid::new_v4().simple());
-    let setup = instance(&url).await;
+    let setup = instance(url).await;
     EmailPasswordService::new(setup.clone())
         .unwrap()
         .sign_up(
@@ -183,7 +183,7 @@ async fn concurrent_logins_on_separate_instances_are_consistent_and_revocable_to
         let url = url_owned.clone();
         let email = email.clone();
         tasks.push(tokio::spawn(async move {
-            let context = instance(&url).await;
+            let context = instance(url).await;
             let result = EmailPasswordService::new(context.clone())
                 .unwrap()
                 .sign_in(
@@ -210,7 +210,7 @@ async fn concurrent_logins_on_separate_instances_are_consistent_and_revocable_to
     tokens.dedup();
     assert_eq!(tokens.len(), 6, "every login gets its own session token");
 
-    let checker = instance(&url).await;
+    let checker = instance(url).await;
     SessionService::new(checker.clone())
         .unwrap()
         .revoke_all_for_user(&user_id)
