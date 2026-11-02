@@ -322,3 +322,91 @@ mod tests {
         assert!(source.needs_refresh(now + 61, None));
     }
 }
+
+/// Google's documented issuer spellings.
+const GOOGLE_ISSUER: &str = "https://accounts.google.com";
+const GOOGLE_ISSUER_ALTERNATE: &str = "accounts.google.com";
+const GOOGLE_JWKS: &str = "https://www.googleapis.com/oauth2/v3/certs";
+
+/// Verifies OIDC ID tokens against a JWKS endpoint. Keys refresh on schedule and when a
+/// token names an unknown `kid`, under the same rules as [`HttpOAuthProvider`]. Use it for
+/// flows that verify tokens outside the OAuth redirect, such as Google One Tap.
+///
+/// [`HttpOAuthProvider`]: crate::http_oauth::HttpOAuthProvider
+#[derive(Clone)]
+pub struct JwksIdTokenVerifier {
+    source: Arc<JwksKeySource>,
+}
+
+impl JwksIdTokenVerifier {
+    /// A verifier for `issuer` and `audience` whose keys come from `jwks_url`. The URL must
+    /// be a public HTTPS endpoint.
+    pub fn new(
+        issuer: impl Into<String>,
+        audience: impl Into<String>,
+        jwks_url: Url,
+        policy: JwksRefreshPolicy,
+    ) -> Result<Self> {
+        let template = OidcIdTokenValidator::new(issuer, audience);
+        let source = JwksKeySource::new(template, jwks_url, policy, Client::new(), false)?;
+        Ok(Self {
+            source: Arc::new(source),
+        })
+    }
+
+    /// Google's issuer, JWKS endpoint and default policy, for one client ID.
+    pub fn google(client_id: impl Into<String>) -> Result<Self> {
+        let template = OidcIdTokenValidator::new(GOOGLE_ISSUER, client_id)
+            .with_alternate_issuer(GOOGLE_ISSUER_ALTERNATE);
+        let url = Url::parse(GOOGLE_JWKS).expect("constant URL is valid");
+        let source = JwksKeySource::new(
+            template,
+            url,
+            JwksRefreshPolicy::default(),
+            Client::new(),
+            false,
+        )?;
+        Ok(Self {
+            source: Arc::new(source),
+        })
+    }
+
+    /// Fetches the keys now. Errors are returned, so a broken endpoint fails at startup.
+    pub async fn load(&self) -> Result<usize> {
+        self.source.refresh_now().await
+    }
+
+    /// Verifies one token. The signature, issuer, audience, expiry and nonce must all
+    /// match. Keys are refreshed first if the schedule or the token's `kid` requires it.
+    pub async fn validate(
+        &self,
+        token: &str,
+        expected_nonce: Option<&str>,
+    ) -> Result<crate::oidc::OidcClaims> {
+        let key_id = crate::oidc::token_key_id(token);
+        self.source.ensure(key_id.as_deref()).await;
+        self.source
+            .current(now_seconds())?
+            .validate(token, expected_nonce)
+    }
+
+    /// Test-only: a verifier whose JWKS may be a plain-HTTP localhost endpoint.
+    #[cfg(feature = "test-utils")]
+    pub fn insecure_for_testing(
+        issuer: impl Into<String>,
+        audience: impl Into<String>,
+        jwks_url: Url,
+        policy: JwksRefreshPolicy,
+    ) -> Result<Self> {
+        let source = JwksKeySource::new(
+            OidcIdTokenValidator::new(issuer, audience),
+            jwks_url,
+            policy,
+            Client::new(),
+            true,
+        )?;
+        Ok(Self {
+            source: Arc::new(source),
+        })
+    }
+}

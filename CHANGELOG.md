@@ -17,6 +17,9 @@ data (password hashes, signed envelopes, database schema) are marked **Compatibi
 - **Provider tokens are no longer retained by default.** Google sign-in stores nothing from the provider unless `OAuthService::with_provider_token_retention()` is enabled. When it is enabled, only the access token and its expiry are sealed. Refresh and ID tokens are dropped, and nothing reads the stored token back.
 
 ### Added
+- Google One Tap can verify tokens against a JWKS endpoint that refreshes on schedule and on key rotation (`OneTapService::with_jwks`, `Router::with_one_tap_jwks`, `JwksIdTokenVerifier`).
+- Provider token refresh and revocation (`HttpOAuthProvider::refresh_access_token`, `revoke_token`, `with_revocation_endpoint`). The caller supplies the token. The library does not store refresh tokens.
+- `examples/desktop-login.rs`: a runnable end-to-end desktop login over loopback HTTP.
 - Provider-token envelopes are bound to their provider and purpose. A session cookie cannot be presented as a provider envelope, and an envelope from one provider does not open for another. `ProviderTokenVault::open` now takes the provider ID.
 - Google OIDC signing keys refresh on schedule and on unknown `kid`, with a bounded stale
   window and fail-closed behavior (`JwksRefreshPolicy`, `HttpOAuthProvider::with_jwks_policy`).

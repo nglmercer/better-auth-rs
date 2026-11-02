@@ -248,6 +248,13 @@ impl AuthRouter {
         Ok(self)
     }
 
+    /// Google One Tap with signing keys fetched from a JWKS endpoint, refreshed on schedule
+    /// and on key rotation. Call [`JwksIdTokenVerifier::load`] at startup to fail fast.
+    pub fn with_one_tap_jwks(mut self, verifier: crate::jwks::JwksIdTokenVerifier) -> Result<Self> {
+        self.one_tap = Some(OneTapService::with_jwks(self.context.clone(), verifier)?);
+        Ok(self)
+    }
+
     /// Enables asymmetric JWTs: `GET /token` issues one to the signed-in user,
     /// and `GET /jwks` and `GET /.well-known/jwks.json` publish the public key.
     pub fn with_jwt(mut self, signer: crate::jwt_signing::JwtSigner) -> Self {
