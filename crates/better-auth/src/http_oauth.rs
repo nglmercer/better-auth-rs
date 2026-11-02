@@ -238,6 +238,26 @@ impl HttpOAuthProvider {
         &self.id
     }
 
+    /// The token endpoint this provider exchanges codes and refresh tokens at.
+    pub fn token_endpoint(&self) -> &Url {
+        &self.token_endpoint
+    }
+
+    /// The userinfo endpoint used to read the profile.
+    pub fn userinfo_endpoint(&self) -> &Url {
+        &self.userinfo_endpoint
+    }
+
+    /// The authorization endpoint users are sent to, when configured.
+    pub fn authorization_endpoint(&self) -> Option<&Url> {
+        self.authorization_endpoint.as_ref()
+    }
+
+    /// The revocation endpoint, when configured.
+    pub fn revocation_endpoint(&self) -> Option<&Url> {
+        self.revocation_endpoint.as_ref()
+    }
+
     /// Test-only constructor that accepts plain HTTP endpoints, so fixture
     /// providers on localhost can exercise the full flow. It exists only with the
     /// `test-utils` feature and must never be enabled in production.

@@ -371,6 +371,11 @@ impl JwksIdTokenVerifier {
         })
     }
 
+    /// The JWKS endpoint keys are fetched from.
+    pub fn jwks_url(&self) -> &Url {
+        self.source.url()
+    }
+
     /// Fetches the keys now. Errors are returned, so a broken endpoint fails at startup.
     pub async fn load(&self) -> Result<usize> {
         self.source.refresh_now().await
