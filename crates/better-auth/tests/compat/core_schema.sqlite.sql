@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS "account" ("account_id" TEXT NOT NULL, "id" TEXT NOT NULL PRIMARY KEY, "password_hash" TEXT, "provider_id" TEXT NOT NULL, "user_id" TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS "account" ("account_id" TEXT NOT NULL, "id" TEXT NOT NULL PRIMARY KEY, "password_hash" TEXT, "provider_id" TEXT NOT NULL, "token_envelope" TEXT, "user_id" TEXT NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS "account_id_unique" ON "account" ("id");
 CREATE TABLE IF NOT EXISTS "session" ("expires_at" BIGINT NOT NULL, "id" TEXT NOT NULL PRIMARY KEY, "token_hash" TEXT NOT NULL, "user_id" TEXT NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS "session_id_unique" ON "session" ("id");

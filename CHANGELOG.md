@@ -13,7 +13,11 @@ data (password hashes, signed envelopes, database schema) are marked **Compatibi
   column once: `ALTER TABLE two_factor ADD COLUMN secret_version VARCHAR(255);`. Runtime
   migrations only create missing tables; they do not add columns to existing tables.
 
+- **Database schema:** the `account` table gains a nullable `token_envelope` column. OAuth sign-in has always written it, but the table definition did not declare it, so every OAuth sign-in on PostgreSQL failed with `column "token_envelope" of relation "account" does not exist`. Databases created before this change must add it once: `ALTER TABLE account ADD COLUMN token_envelope TEXT;`.
+- **Provider tokens are no longer retained by default.** Google sign-in stores nothing from the provider unless `OAuthService::with_provider_token_retention()` is enabled. When it is enabled, only the access token and its expiry are sealed. Refresh and ID tokens are dropped, and nothing reads the stored token back.
+
 ### Added
+- Provider-token envelopes are bound to their provider and purpose. A session cookie cannot be presented as a provider envelope, and an envelope from one provider does not open for another. `ProviderTokenVault::open` now takes the provider ID.
 - Google OIDC signing keys refresh on schedule and on unknown `kid`, with a bounded stale
   window and fail-closed behavior (`JwksRefreshPolicy`, `HttpOAuthProvider::with_jwks_policy`).
 - Native-client login: loopback redirect validation, a one-shot callback receiver with timeout
