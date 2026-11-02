@@ -15,6 +15,7 @@ pub mod client;
 pub mod context;
 pub mod cookies;
 pub mod database;
+pub mod desktop;
 pub mod device_auth;
 pub mod email;
 pub mod email_password;
@@ -66,6 +67,10 @@ pub use database::{
 };
 #[cfg(feature = "sqlite")]
 pub use database::{SqliteDbAdapter, SqliteSecondaryStorage};
+pub use desktop::{
+    loopback_callback_url, validate_loopback_redirect_uri, DesktopHandoffService, HandoffRequest,
+    LoopbackCallbackReceiver, RedeemRequest,
+};
 pub use email_password::{
     AuthResult, CredentialService, EmailPasswordService, ImportCredential, SignInInput,
     SignUpInput, User,

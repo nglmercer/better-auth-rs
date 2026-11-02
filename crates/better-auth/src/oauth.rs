@@ -316,6 +316,9 @@ pub struct OAuthService {
     context: AuthContext,
     state: OAuthStateManager,
     token_vault: ProviderTokenVault,
+    /// Native clients listen on a loopback address with an ephemeral port (RFC 8252).
+    /// Off by default, so a deployment must opt in.
+    allow_loopback_redirects: bool,
 }
 
 impl OAuthService {
@@ -332,6 +335,7 @@ impl OAuthService {
             context,
             state,
             token_vault: ProviderTokenVault::new(keys),
+            allow_loopback_redirects: false,
         })
     }
 
@@ -350,9 +354,20 @@ impl OAuthService {
     /// Only HTTPS origins that the deployment trusts may receive the callback.
     /// Plain HTTP is allowed for loopback development hosts only. Userinfo and
     /// fragments are refused because they can hide the real destination.
+    /// Accepts loopback redirects (`http://127.0.0.1:<port>/...` or `http://[::1]:<port>/...`)
+    /// from native clients, without a configured origin. The exact redirect URI is stored with
+    /// the state and must match at completion, so an intercepted callback cannot be redirected.
+    pub fn with_loopback_redirects(mut self) -> Self {
+        self.allow_loopback_redirects = true;
+        self
+    }
+
     fn validate_redirect_uri(&self, redirect_uri: &str) -> Result<()> {
         let url = Url::parse(redirect_uri)
             .map_err(|_| AuthError::InvalidRequest("redirect URI is not a valid URL".into()))?;
+        if self.allow_loopback_redirects && crate::desktop::is_loopback_redirect(&url) {
+            return crate::desktop::validate_loopback_redirect_uri(redirect_uri).map(|_| ());
+        }
         if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
             return Err(AuthError::InvalidRequest(
                 "redirect URI must not contain credentials or a fragment".into(),
