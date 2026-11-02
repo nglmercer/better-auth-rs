@@ -48,7 +48,8 @@ PostgreSQL or MySQL server are described in [docs/live-tests.md](docs/live-tests
   E2E and SDK methods still missing, see docs/roadmap-status.md), admin role guards, OIDC/SAML SSO, concrete optional
   `saml-rs` validation, SCIM filtering/PATCH/groups/bulk operations and token
   hashing, and JWT issuance.
-- framework-neutral HTTP endpoints, an optional Axum adapter, and a client
+- framework-neutral HTTP endpoints, an optional Axum adapter with `auth_routes`,
+  `AuthUser` and `NativeAuthUser` extractors (see `docs/operations/PRODUCTION.md`), and a client
   request SDK with reqwest transport, cookie-jar support, and safe retries.
 - a TypeScript client package at `packages/better-auth-client` with typed
   fetch-based sign-up/sign-in, sessions, sign-out, generic requests, cookie

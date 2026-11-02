@@ -179,6 +179,12 @@ impl AuthRouter {
 
     /// Enables email delivery for password reset and verification links. The
     /// links point at the configured static base URL, so it must be set.
+    /// The context this router was built from. Useful for reading `base_path` or for
+    /// building session helpers next to the router.
+    pub fn context(&self) -> &AuthContext {
+        &self.context
+    }
+
     pub fn with_email_sender(mut self, sender: Arc<dyn EmailSender>) -> Result<Self> {
         if self.context.base_origin().is_none() {
             return Err(AuthError::InvalidConfiguration(
