@@ -6,6 +6,20 @@ data (password hashes, signed envelopes, database schema) are marked **Compatibi
 
 ## Unreleased
 
+### Compatibility
+- **Database schema:** the `two_factor` table gains a nullable `secret_version` column. The
+  second-factor service has always written it, but the table definition did not declare it,
+  so PostgreSQL rejected enrollment. Databases created before this change must add the
+  column once: `ALTER TABLE two_factor ADD COLUMN secret_version VARCHAR(255);`. Runtime
+  migrations only create missing tables; they do not add columns to existing tables.
+
+### Added
+- Google OIDC signing keys refresh on schedule and on unknown `kid`, with a bounded stale
+  window and fail-closed behavior (`JwksRefreshPolicy`, `HttpOAuthProvider::with_jwks_policy`).
+- Native-client login: loopback redirect validation, a one-shot callback receiver with timeout
+  and cancellation, and single-use PKCE-bound handoff codes (`desktop` module,
+  `DesktopHandoffService`, `OAuthService::with_loopback_redirects`).
+
 ### Security
 - OAuth provider endpoints (token, userinfo, authorization, verified emails, JWKS) must be
   public HTTPS hosts. Credentials in the URL, `localhost`, and private, loopback, link-local
