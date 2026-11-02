@@ -74,6 +74,25 @@ async fn google_sign_in_completes_and_stores_no_provider_tokens_on_postgres() {
     let adapter = Arc::new(SqlxDbAdapter::postgres(&url).await.unwrap());
     let storage = SqlxSecondaryStorage::postgres(&url).await.unwrap();
     storage.migrate().await.unwrap();
+    google_sign_in(adapter, storage, SqlDialect::Postgres).await;
+}
+
+#[tokio::test]
+async fn google_sign_in_completes_and_stores_no_provider_tokens_on_mysql() {
+    let Ok(url) = std::env::var("BETTER_AUTH_TEST_MYSQL_URL") else {
+        return;
+    };
+    let adapter = Arc::new(SqlxDbAdapter::mysql(&url).await.unwrap());
+    let storage = SqlxSecondaryStorage::mysql(&url).await.unwrap();
+    storage.migrate().await.unwrap();
+    google_sign_in(adapter, storage, SqlDialect::MySql).await;
+}
+
+async fn google_sign_in(
+    adapter: Arc<SqlxDbAdapter>,
+    storage: SqlxSecondaryStorage,
+    dialect: SqlDialect,
+) {
     let context = AuthContext::new(
         AuthOptions {
             secret: "o".repeat(32),
@@ -92,7 +111,7 @@ async fn google_sign_in_completes_and_stores_no_provider_tokens_on_postgres() {
     .unwrap();
     // Apply the core schema explicitly. A test must not depend on another test having run first.
     adapter
-        .apply_migrations(&context.migration_plan(), SqlDialect::Postgres)
+        .apply_migrations(&context.migration_plan(), dialect)
         .await
         .unwrap();
     let service = OAuthService::new(context.clone(), OAuthStateStorage::Verification).unwrap();

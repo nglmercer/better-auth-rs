@@ -38,6 +38,8 @@ pub struct HttpOAuthProvider {
     client: Client,
     id_token_verifier: Option<IdTokenVerifier>,
     jwks_policy: JwksRefreshPolicy,
+    /// RFC 7009 revocation endpoint. Needed only for [`HttpOAuthProvider::revoke_token`].
+    revocation_endpoint: Option<Url>,
     /// Where users are sent to authorize. Sign-in cannot start without it.
     authorization_endpoint: Option<Url>,
     scopes: Vec<String>,
@@ -70,6 +72,7 @@ impl HttpOAuthProvider {
             client: Client::new(),
             id_token_verifier: None,
             jwks_policy: JwksRefreshPolicy::default(),
+            revocation_endpoint: None,
             authorization_endpoint: None,
             scopes: Vec::new(),
             #[cfg(feature = "test-utils")]
@@ -114,6 +117,100 @@ impl HttpOAuthProvider {
     pub fn with_oidc_validator(mut self, validator: OidcIdTokenValidator) -> Self {
         self.id_token_verifier = Some(IdTokenVerifier::Static(Arc::new(validator)));
         self
+    }
+
+    /// Sets the RFC 7009 revocation endpoint. HTTPS, public host, like the other endpoints.
+    pub fn with_revocation_endpoint(mut self, endpoint: Url) -> Result<Self> {
+        if !self.allows_plain_http_for_testing() {
+            crate::security::validate_public_https_endpoint(
+                &endpoint,
+                "OAuth revocation endpoint",
+            )?;
+        }
+        self.revocation_endpoint = Some(endpoint);
+        Ok(self)
+    }
+
+    /// Exchanges a refresh token for a new access token. The caller supplies the refresh
+    /// token; this library does not keep one. `invalid_grant` (expired, revoked or
+    /// already used) returns `Unauthorized`, and the user must sign in again. Provider
+    /// error bodies are never included in the error.
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuthTokens> {
+        let response = self
+            .client
+            .post(self.token_endpoint.clone())
+            .header("Accept", "application/json")
+            .form(&[
+                ("client_id", self.client_id.as_str()),
+                ("client_secret", self.client_secret.as_str()),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_token),
+            ])
+            .send()
+            .await
+            .map_err(network_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body: Value = response.json().await.unwrap_or(Value::Null);
+            return Err(
+                if body.get("error").and_then(Value::as_str) == Some("invalid_grant") {
+                    AuthError::Unauthorized
+                } else {
+                    AuthError::Adapter(format!(
+                        "OAuth refresh failed with status {}",
+                        status.as_u16()
+                    ))
+                },
+            );
+        }
+        let body: Value = response.json().await.map_err(network_error)?;
+        let access_token = body
+            .get("access_token")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AuthError::Adapter("OAuth refresh response has no access_token".into())
+            })?;
+        Ok(OAuthTokens {
+            access_token: access_token.to_owned(),
+            // Providers may rotate the refresh token. The caller decides whether to store it.
+            refresh_token: body
+                .get("refresh_token")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            expires_at: body
+                .get("expires_in")
+                .and_then(Value::as_u64)
+                .map(|seconds| now_seconds() + seconds),
+            token_type: body
+                .get("token_type")
+                .and_then(Value::as_str)
+                .unwrap_or("Bearer")
+                .to_owned(),
+            id_token: None,
+        })
+    }
+
+    /// Revokes an access or refresh token (RFC 7009). A token the provider already reports
+    /// as invalid counts as revoked, so the call is safe to repeat.
+    pub async fn revoke_token(&self, token: &str) -> Result<()> {
+        let endpoint = self.revocation_endpoint.clone().ok_or_else(|| {
+            AuthError::InvalidConfiguration("no revocation endpoint is configured".into())
+        })?;
+        let response = self
+            .client
+            .post(endpoint)
+            .header("Accept", "application/json")
+            .form(&[("token", token)])
+            .send()
+            .await
+            .map_err(network_error)?;
+        match response.status().as_u16() {
+            200 | 204 => Ok(()),
+            400 => Ok(()),
+            status => Err(AuthError::Adapter(format!(
+                "OAuth revocation failed with status {status}"
+            ))),
+        }
     }
 
     /// Sets how long fetched JWKS keys are trusted and how often they are
@@ -164,6 +261,7 @@ impl HttpOAuthProvider {
             client: Client::new(),
             id_token_verifier: None,
             jwks_policy: JwksRefreshPolicy::default(),
+            revocation_endpoint: None,
             authorization_endpoint: Some(authorization_endpoint),
             scopes: scopes.into_iter().map(Into::into).collect(),
             insecure_for_testing: true,
@@ -232,7 +330,8 @@ impl HttpOAuthProvider {
         .with_authorization_endpoint(
             Url::parse("https://accounts.google.com/o/oauth2/v2/auth").unwrap(),
         )?
-        .with_scopes(["openid", "email", "profile"]);
+        .with_scopes(["openid", "email", "profile"])
+        .with_revocation_endpoint(Url::parse("https://oauth2.googleapis.com/revoke").unwrap())?;
         // Keys are fetched on first use and refreshed on schedule and rotation.
         // Until a fetch succeeds, every ID token is refused.
         let source = JwksKeySource::new(

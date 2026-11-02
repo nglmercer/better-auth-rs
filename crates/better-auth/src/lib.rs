@@ -79,7 +79,7 @@ pub use email_password::{
 };
 pub use hooks::AuthHooks;
 pub use http_oauth::HttpOAuthProvider;
-pub use jwks::JwksRefreshPolicy;
+pub use jwks::{JwksIdTokenVerifier, JwksRefreshPolicy};
 pub use jwt::JwtService;
 pub use oauth::{
     OAuthAuthorization, OAuthProvider, OAuthProviderConfig, OAuthService, OAuthStateManager,

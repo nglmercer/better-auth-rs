@@ -5,7 +5,10 @@
 //! claimed atomically in secondary storage, so a copied token cannot be replayed.
 
 use crate::{
-    context::AuthContext, email_password::User, oidc::OidcIdTokenValidator,
+    context::AuthContext,
+    email_password::User,
+    jwks::JwksIdTokenVerifier,
+    oidc::{OidcClaims, OidcIdTokenValidator},
     passwordless::PasswordlessService,
 };
 use better_auth_core::{
@@ -14,28 +17,55 @@ use better_auth_core::{
 };
 use std::{sync::Arc, time::Duration};
 
+/// Where One Tap's signing keys come from.
+#[derive(Clone)]
+enum CredentialKeys {
+    /// Keys the application supplied. They never change unless the application replaces them.
+    Static(OidcIdTokenValidator),
+    /// Keys fetched from a JWKS endpoint and refreshed on schedule and on rotation.
+    Jwks(JwksIdTokenVerifier),
+}
+
 #[derive(Clone)]
 pub struct OneTapService {
-    validator: OidcIdTokenValidator,
+    keys: CredentialKeys,
     storage: Arc<dyn SecondaryStorage>,
     passwordless: PasswordlessService,
 }
 
 impl OneTapService {
+    /// One Tap with keys the application supplies.
     pub fn new(context: AuthContext, validator: OidcIdTokenValidator) -> Result<Self> {
+        Self::build(context, CredentialKeys::Static(validator))
+    }
+
+    /// One Tap whose keys are fetched from a JWKS endpoint and refresh on rotation.
+    /// Prefer this for Google, so a rotated key does not stop sign-in until restart.
+    pub fn with_jwks(context: AuthContext, verifier: JwksIdTokenVerifier) -> Result<Self> {
+        Self::build(context, CredentialKeys::Jwks(verifier))
+    }
+
+    fn build(context: AuthContext, keys: CredentialKeys) -> Result<Self> {
         let storage = context.secondary_storage.clone().ok_or_else(|| {
             AuthError::InvalidConfiguration("one-tap requires secondary storage".into())
         })?;
         Ok(Self {
-            validator,
+            keys,
             storage,
             passwordless: PasswordlessService::new(context)?,
         })
     }
 
+    async fn verify(&self, credential: &str) -> Result<OidcClaims> {
+        match &self.keys {
+            CredentialKeys::Static(validator) => validator.validate(credential, None),
+            CredentialKeys::Jwks(verifier) => verifier.validate(credential, None).await,
+        }
+    }
+
     /// Verifies the credential and returns the signed-in user.
     pub async fn sign_in(&self, credential: &str) -> Result<User> {
-        let claims = self.validator.validate(credential, None)?;
+        let claims = self.verify(credential).await?;
         if claims.email_verified != Some(true) {
             return Err(AuthError::Forbidden(
                 "the Google account email is not verified".into(),
