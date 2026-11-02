@@ -1,15 +1,28 @@
 use crate::{
+    jwks::{JwksKeySource, JwksRefreshPolicy},
     oauth::{OAuthProvider, OAuthProviderConfig, OAuthTokens, OAuthUserProfile},
-    oidc::OidcIdTokenValidator,
+    oidc::{token_key_id, OidcIdTokenValidator},
 };
 use async_trait::async_trait;
 use better_auth_core::error::{AuthError, Result};
 use reqwest::Client;
 use serde_json::Value;
+use std::sync::Arc;
 use url::Url;
 
 const GOOGLE_ISSUER: &str = "https://accounts.google.com";
+/// Google documents this spelling of the same issuer.
+const GOOGLE_ISSUER_ALTERNATE: &str = "accounts.google.com";
 const GOOGLE_JWKS_URL: &str = "https://www.googleapis.com/oauth2/v3/certs";
+
+/// How this provider verifies the signature of OIDC ID tokens.
+#[derive(Clone)]
+enum IdTokenVerifier {
+    /// Keys fixed by the application.
+    Static(Arc<OidcIdTokenValidator>),
+    /// Keys fetched from a JWKS endpoint, refreshed on schedule and on rotation.
+    Jwks(Arc<JwksKeySource>),
+}
 
 #[derive(Clone)]
 pub struct HttpOAuthProvider {
@@ -23,7 +36,8 @@ pub struct HttpOAuthProvider {
     /// verified primary email is the only trusted email proof.
     verified_emails_endpoint: Option<Url>,
     client: Client,
-    id_token_validator: Option<OidcIdTokenValidator>,
+    id_token_verifier: Option<IdTokenVerifier>,
+    jwks_policy: JwksRefreshPolicy,
     /// Where users are sent to authorize. Sign-in cannot start without it.
     authorization_endpoint: Option<Url>,
     scopes: Vec<String>,
@@ -54,7 +68,8 @@ impl HttpOAuthProvider {
             userinfo_endpoint,
             verified_emails_endpoint: None,
             client: Client::new(),
-            id_token_validator: None,
+            id_token_verifier: None,
+            jwks_policy: JwksRefreshPolicy::default(),
             authorization_endpoint: None,
             scopes: Vec::new(),
             #[cfg(feature = "test-utils")]
@@ -97,8 +112,20 @@ impl HttpOAuthProvider {
     }
 
     pub fn with_oidc_validator(mut self, validator: OidcIdTokenValidator) -> Self {
-        self.id_token_validator = Some(validator);
+        self.id_token_verifier = Some(IdTokenVerifier::Static(Arc::new(validator)));
         self
+    }
+
+    /// Sets how long fetched JWKS keys are trusted and how often they are
+    /// refetched. Applies to JWKS endpoints configured on this provider.
+    pub fn with_jwks_policy(mut self, policy: JwksRefreshPolicy) -> Result<Self> {
+        policy.validate()?;
+        if let Some(IdTokenVerifier::Jwks(source)) = &self.id_token_verifier {
+            let rebuilt = source.rebuilt(source.url().clone(), policy)?;
+            self.id_token_verifier = Some(IdTokenVerifier::Jwks(Arc::new(rebuilt)));
+        }
+        self.jwks_policy = policy;
+        Ok(self)
     }
 
     pub fn with_verified_emails_endpoint(mut self, endpoint: Url) -> Result<Self> {
@@ -135,34 +162,56 @@ impl HttpOAuthProvider {
             userinfo_endpoint,
             verified_emails_endpoint: None,
             client: Client::new(),
-            id_token_validator: None,
+            id_token_verifier: None,
+            jwks_policy: JwksRefreshPolicy::default(),
             authorization_endpoint: Some(authorization_endpoint),
             scopes: scopes.into_iter().map(Into::into).collect(),
             insecure_for_testing: true,
         }
     }
 
+    /// Points ID-token verification at `jwks_url` and loads its keys now. The
+    /// provider must already have an OIDC validator (or Google's preset). The
+    /// keys are then refreshed on schedule and when a token names an unknown key ID.
     pub async fn refresh_oidc_jwks(&mut self, jwks_url: Url) -> Result<usize> {
-        crate::security::validate_public_https_endpoint(&jwks_url, "OIDC JWKS endpoint")?;
-        let body: Value = self
-            .client
-            .get(jwks_url)
-            .send()
-            .await
-            .map_err(network_error)?
-            .error_for_status()
-            .map_err(network_error)?
-            .json()
-            .await
-            .map_err(network_error)?;
-        self.id_token_validator
-            .as_mut()
-            .ok_or_else(|| {
-                AuthError::InvalidConfiguration(
+        let source = match &self.id_token_verifier {
+            Some(IdTokenVerifier::Static(validator)) => JwksKeySource::new(
+                (**validator).clone(),
+                jwks_url,
+                self.jwks_policy,
+                self.client.clone(),
+                self.allows_plain_http_for_testing(),
+            )?,
+            Some(IdTokenVerifier::Jwks(source)) => source.rebuilt(jwks_url, self.jwks_policy)?,
+            None => {
+                return Err(AuthError::InvalidConfiguration(
                     "configure an OIDC validator before refreshing JWKS".into(),
-                )
-            })?
-            .replace_from_jwks(&body)
+                ))
+            }
+        };
+        let count = source.refresh_now().await?;
+        self.id_token_verifier = Some(IdTokenVerifier::Jwks(Arc::new(source)));
+        Ok(count)
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn allows_plain_http_for_testing(&self) -> bool {
+        self.insecure_for_testing
+    }
+
+    #[cfg(not(feature = "test-utils"))]
+    fn allows_plain_http_for_testing(&self) -> bool {
+        false
+    }
+
+    /// The validator for the key set that is currently trusted. Fails closed
+    /// when the keys were never loaded or have expired.
+    fn trusted_validator(&self) -> Result<Option<Arc<OidcIdTokenValidator>>> {
+        match &self.id_token_verifier {
+            None => Ok(None),
+            Some(IdTokenVerifier::Static(validator)) => Ok(Some(validator.clone())),
+            Some(IdTokenVerifier::Jwks(source)) => source.current(now_seconds()).map(Some),
+        }
     }
 
     /// Google preset. The ID token is mandatory and validated against Google's
@@ -171,19 +220,30 @@ impl HttpOAuthProvider {
     /// rejected, so the preset fails closed.
     pub fn google(client_id: impl Into<String>, client_secret: impl Into<String>) -> Result<Self> {
         let client_id = client_id.into();
-        let validator = OidcIdTokenValidator::new(GOOGLE_ISSUER, client_id.clone());
-        Self::new(
+        let template = OidcIdTokenValidator::new(GOOGLE_ISSUER, client_id.clone())
+            .with_alternate_issuer(GOOGLE_ISSUER_ALTERNATE);
+        let mut provider = Self::new(
             "google",
             client_id,
             client_secret,
             Url::parse("https://oauth2.googleapis.com/token").unwrap(),
             Url::parse("https://openidconnect.googleapis.com/v1/userinfo").unwrap(),
         )?
-        .with_oidc_validator(validator)
         .with_authorization_endpoint(
             Url::parse("https://accounts.google.com/o/oauth2/v2/auth").unwrap(),
-        )
-        .map(|provider| provider.with_scopes(["openid", "email", "profile"]))
+        )?
+        .with_scopes(["openid", "email", "profile"]);
+        // Keys are fetched on first use and refreshed on schedule and rotation.
+        // Until a fetch succeeds, every ID token is refused.
+        let source = JwksKeySource::new(
+            template,
+            Url::parse(GOOGLE_JWKS_URL).unwrap(),
+            provider.jwks_policy,
+            provider.client.clone(),
+            false,
+        )?;
+        provider.id_token_verifier = Some(IdTokenVerifier::Jwks(Arc::new(source)));
+        Ok(provider)
     }
 
     /// Google preset with signing keys fetched from Google's JWKS endpoint.
@@ -300,7 +360,7 @@ impl OAuthProvider for HttpOAuthProvider {
             .get("expires_in")
             .and_then(Value::as_u64)
             .map(|seconds| now_seconds() + seconds);
-        Ok(OAuthTokens {
+        let tokens = OAuthTokens {
             access_token: access_token.to_owned(),
             refresh_token: body
                 .get("refresh_token")
@@ -316,7 +376,16 @@ impl OAuthProvider for HttpOAuthProvider {
                 .get("id_token")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-        })
+        };
+        // Load or refresh signing keys before `validate_tokens`, which is
+        // synchronous. The key ID comes from the unverified header and only
+        // selects which key set to refresh; the signature is still checked later.
+        if let (Some(IdTokenVerifier::Jwks(source)), Some(id_token)) =
+            (&self.id_token_verifier, tokens.id_token.as_deref())
+        {
+            source.ensure(token_key_id(id_token).as_deref()).await;
+        }
+        Ok(tokens)
     }
 
     async fn profile(&self, tokens: &OAuthTokens) -> Result<OAuthUserProfile> {
@@ -349,7 +418,7 @@ impl OAuthProvider for HttpOAuthProvider {
         // A validated ID token must belong to the same account as userinfo.
         // Otherwise a token from one account could be paired with another
         // account's profile response.
-        if let (Some(validator), Some(id_token)) = (&self.id_token_validator, &tokens.id_token) {
+        if let (Some(validator), Some(id_token)) = (self.trusted_validator()?, &tokens.id_token) {
             let claims = validator.validate(id_token, None)?;
             if claims.sub != account_id {
                 return Err(AuthError::Unauthorized);
@@ -404,7 +473,7 @@ impl OAuthProvider for HttpOAuthProvider {
     }
 
     fn validate_tokens(&self, tokens: &OAuthTokens, expected_nonce: &str) -> Result<()> {
-        if let Some(validator) = &self.id_token_validator {
+        if let Some(validator) = self.trusted_validator()? {
             let id_token = tokens.id_token.as_deref().ok_or(AuthError::Unauthorized)?;
             validator.validate(id_token, Some(expected_nonce))?;
         }

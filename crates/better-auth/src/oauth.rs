@@ -767,6 +767,52 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn parallel_callbacks_consume_one_state_exactly_once() {
+        let options = AuthOptions {
+            secret: "o".repeat(32),
+            ..AuthOptions::default()
+        };
+        let keys = SecretKeySet::from_options(&options).unwrap();
+        let manager = Arc::new(
+            OAuthStateManager::new(
+                Some(Arc::new(MemorySecondaryStorage::default())),
+                keys.clone(),
+                OAuthStateStorage::Verification,
+                "/api/auth",
+            )
+            .unwrap(),
+        );
+        let config = OAuthProviderConfig::new(
+            "example",
+            Url::parse("https://provider.example/authorize").unwrap(),
+            "client",
+        )
+        .unwrap();
+        let auth = manager
+            .begin(&config, "https://app.example/callback", true)
+            .await
+            .unwrap();
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let manager = manager.clone();
+            let state = auth.state.clone();
+            tasks.push(tokio::spawn(async move {
+                manager.consume("example", &state, None).await.is_ok()
+            }));
+        }
+        let mut successes = 0;
+        for task in tasks {
+            if task.await.unwrap() {
+                successes += 1;
+            }
+        }
+        assert_eq!(
+            successes, 1,
+            "exactly one parallel callback may consume the state"
+        );
+    }
+
+    #[tokio::test]
     async fn pkce_and_verification_state_are_single_use() {
         let options = AuthOptions {
             secret: "o".repeat(32),

@@ -67,7 +67,7 @@ PostgreSQL or MySQL server are described in [docs/live-tests.md](docs/live-tests
   with automatic rehashing, and executable plugin endpoints/lifecycle hooks.
 
 The remaining work is deployment hardening: live MySQL conformance, signed
-SAML and browser-level WebAuthn fixtures, scheduled OIDC JWKS refresh, browser
+SAML and browser-level WebAuthn fixtures, JWKS refresh for the SSO plugin, browser
 client examples, and independent security review. The contracts remain
 database- and framework-neutral so these integrations do not make the core
 depend on one database or web framework.
@@ -121,8 +121,13 @@ email ownership**. Existing provider-account links take precedence over email
 matching. The provisioner is called only for a new identity, and cleanup is
 attempted after errors in Better Auth persistence, hooks, or session creation.
 
-Google: use `HttpOAuthProvider::google` with an OIDC validator and refresh the
-Google JWKS at startup. GitHub: use `HttpOAuthProvider::github`, which consults
+Google: use `HttpOAuthProvider::google`. Its signing keys are fetched on first
+use and refreshed on schedule and on unknown key IDs; use
+`HttpOAuthProvider::google_with_jwks` to load them at startup instead, so an
+unreachable JWKS endpoint fails the boot. Tune the schedule with
+`with_jwks_policy(JwksRefreshPolicy { .. })`. Keys that cannot be refreshed are
+trusted for at most `max_stale` (default 24 h), then every ID token is refused.
+GitHub: use `HttpOAuthProvider::github`, which consults
 the verified-email API rather than trusting the unaudited email in `/user`.
 Facebook/Meta: construct `HttpOAuthProvider::new` with the provider's token
 and userinfo endpoints, and define your authorization URL/scopes separately
