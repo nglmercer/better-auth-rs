@@ -142,7 +142,9 @@ pub fn core_schema() -> SchemaExtension {
                 .field("user_id", FieldSchema::required(String))
                 .field("provider_id", FieldSchema::required(String))
                 .field("account_id", FieldSchema::required(String))
-                .field("password_hash", FieldSchema::optional(String)),
+                .field("password_hash", FieldSchema::optional(String))
+                // Sealed provider tokens. Null unless the application opts in to retention.
+                .field("token_envelope", FieldSchema::optional(String)),
         )
         .table(
             "verification",

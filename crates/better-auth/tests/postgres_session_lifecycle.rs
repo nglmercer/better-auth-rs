@@ -14,7 +14,10 @@ use better_auth::{
     email_password::{EmailPasswordService, SignInInput, SignUpInput},
     session::{SessionService, SessionTransport},
 };
-use better_auth_core::options::{AuthOptions, BaseUrl, PasswordHashOptions};
+use better_auth_core::{
+    migration::SqlDialect,
+    options::{AuthOptions, BaseUrl, PasswordHashOptions},
+};
 use http::{header, HeaderMap};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -25,7 +28,7 @@ async fn instance(url: &str) -> AuthContext {
     let adapter = Arc::new(SqlxDbAdapter::postgres(url).await.unwrap());
     let storage = SqlxSecondaryStorage::postgres(url).await.unwrap();
     storage.migrate().await.unwrap();
-    AuthContext::new(
+    let context = AuthContext::new(
         AuthOptions {
             secret: "p".repeat(32),
             base_url: Some(BaseUrl::Static("https://example.com".into())),
@@ -36,11 +39,17 @@ async fn instance(url: &str) -> AuthContext {
             },
             ..AuthOptions::default()
         },
-        adapter,
+        adapter.clone(),
         Some(Arc::new(storage)),
         vec![],
     )
-    .unwrap()
+    .unwrap();
+    // Idempotent: every instance may apply the same plan.
+    adapter
+        .apply_migrations(&context.migration_plan(), SqlDialect::Postgres)
+        .await
+        .unwrap();
+    context
 }
 
 fn cookie(name: &str, value: &str) -> HeaderMap {

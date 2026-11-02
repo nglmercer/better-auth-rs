@@ -53,8 +53,10 @@ security review and operational evidence exist (see `docs/roadmap-status.md`).
 - Rotate with `secret_version` and `secret_rotation`: the new version signs, and old
   versions still verify until they are removed. Two-factor secrets are re-sealed under the
   current version the next time they are read.
-- Provider tokens are sealed with AES-GCM. Retention rules for them are not implemented
-  (see roadmap item D).
+- Provider tokens are not kept by default. Opt in with
+  `OAuthService::with_provider_token_retention()` only if the application needs the access
+  token later. Only the access token and its expiry are kept, sealed with the versioned
+  secret set, and they expire with the token. Deleting the account removes the stored token.
 
 ## Google sign-in
 

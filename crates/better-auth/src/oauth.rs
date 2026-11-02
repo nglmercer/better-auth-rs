@@ -319,6 +319,9 @@ pub struct OAuthService {
     /// Native clients listen on a loopback address with an ephemeral port (RFC 8252).
     /// Off by default, so a deployment must opt in.
     allow_loopback_redirects: bool,
+    /// Provider tokens are not kept unless the application asks for it. Identity-only
+    /// deployments need none of them, so the default retains nothing.
+    retain_provider_tokens: bool,
 }
 
 impl OAuthService {
@@ -336,6 +339,7 @@ impl OAuthService {
             state,
             token_vault: ProviderTokenVault::new(keys),
             allow_loopback_redirects: false,
+            retain_provider_tokens: false,
         })
     }
 
@@ -359,6 +363,14 @@ impl OAuthService {
     /// the state and must match at completion, so an intercepted callback cannot be redirected.
     pub fn with_loopback_redirects(mut self) -> Self {
         self.allow_loopback_redirects = true;
+        self
+    }
+
+    /// Keeps the provider's access token, sealed, on the account for later use. Only the
+    /// access token and its expiry are kept: refresh and ID tokens are dropped, and a
+    /// token without an expiry is not kept. Nothing in this crate reads the token back.
+    pub fn with_provider_token_retention(mut self) -> Self {
+        self.retain_provider_tokens = true;
         self
     }
 
@@ -563,7 +575,19 @@ impl OAuthService {
         }
         // Encrypt tokens before allocating an external legacy row, so a
         // vault/serialization failure cannot leave that row orphaned.
-        let token_envelope = self.token_vault.seal(provider_id, tokens)?;
+        // A token without an expiry is not kept, but the sign-in still completes.
+        let token_envelope = if self.retain_provider_tokens && tokens.expires_at.is_some() {
+            let retained = OAuthTokens {
+                access_token: tokens.access_token.clone(),
+                refresh_token: None,
+                expires_at: tokens.expires_at,
+                token_type: tokens.token_type.clone(),
+                id_token: None,
+            };
+            Some(self.token_vault.seal(provider_id, &retained)?)
+        } else {
+            None
+        };
         let existing = self
             .context
             .adapter
@@ -723,6 +747,10 @@ pub struct ProviderTokenVault {
     codec: CookieCacheCodec,
 }
 
+/// Purpose label inside every provider-token envelope. Session and other cookie-cache
+/// payloads never carry it, so an envelope cannot be accepted as one of them.
+const PROVIDER_TOKEN_PURPOSE: &str = "oauth-provider-token";
+
 impl ProviderTokenVault {
     pub fn new(keys: SecretKeySet) -> Self {
         Self {
@@ -730,24 +758,55 @@ impl ProviderTokenVault {
         }
     }
 
+    fn subject(provider_id: &str) -> String {
+        format!("{PROVIDER_TOKEN_PURPOSE}:{provider_id}")
+    }
+
+    /// Seals `tokens` for `provider_id`. The envelope expires with the access token;
+    /// tokens without an expiry are refused rather than kept indefinitely.
     pub fn seal(&self, provider_id: &str, tokens: &OAuthTokens) -> Result<String> {
+        let expires_at = tokens.expires_at.ok_or_else(|| {
+            AuthError::InvalidRequest("provider token without an expiry is not retained".into())
+        })?;
         let now = now_seconds();
+        if expires_at <= now {
+            return Err(AuthError::InvalidRequest(
+                "provider token is already expired".into(),
+            ));
+        }
         self.codec.encode(
             better_auth_core::options::CookieCacheStrategy::Jwe,
-            provider_id,
-            serde_json::to_value(tokens).map_err(serialize_error)?,
+            Self::subject(provider_id),
+            json!({
+                "purpose": PROVIDER_TOKEN_PURPOSE,
+                "provider_id": provider_id,
+                "tokens": tokens,
+            }),
             now,
-            tokens.expires_at.unwrap_or(now + 24 * 60 * 60).max(now + 1),
+            expires_at,
         )
     }
 
-    pub fn open(&self, envelope: &str) -> Result<OAuthTokens> {
+    /// Opens an envelope only for the provider it was sealed for, and only if it carries
+    /// the provider-token purpose. Expired envelopes are refused.
+    pub fn open(&self, provider_id: &str, envelope: &str) -> Result<OAuthTokens> {
         let claims = self.codec.decode(
             better_auth_core::options::CookieCacheStrategy::Jwe,
             envelope,
             now_seconds(),
         )?;
-        serde_json::from_value(claims.data).map_err(serialize_error)
+        if claims.sub != Self::subject(provider_id)
+            || claims.data.get("purpose").and_then(Value::as_str) != Some(PROVIDER_TOKEN_PURPOSE)
+            || claims.data.get("provider_id").and_then(Value::as_str) != Some(provider_id)
+        {
+            return Err(AuthError::Unauthorized);
+        }
+        let tokens = claims
+            .data
+            .get("tokens")
+            .cloned()
+            .ok_or(AuthError::Unauthorized)?;
+        serde_json::from_value(tokens).map_err(serialize_error)
     }
 }
 
@@ -1520,5 +1579,282 @@ mod tests {
                 "{table}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod provider_token_tests {
+    use super::*;
+    use crate::cookies::{CookieCacheCodec, SecretKeySet};
+    use async_trait::async_trait;
+    use better_auth_core::{
+        adapter::{memory::MemoryDb, memory::MemorySecondaryStorage},
+        options::{AuthOptions, BaseUrl, CookieCacheStrategy, SecretVersion},
+    };
+
+    const ACCESS: &str = "provider-access-secret";
+    const REFRESH: &str = "provider-refresh-secret";
+    const ID_TOKEN: &str = "provider-id-token-secret";
+
+    struct TokenProvider {
+        expires_at: Option<u64>,
+    }
+
+    #[async_trait]
+    impl OAuthProvider for TokenProvider {
+        fn id(&self) -> &str {
+            "mock"
+        }
+
+        async fn exchange_code(&self, _: &str, _: &str, _: &str) -> Result<OAuthTokens> {
+            Ok(OAuthTokens {
+                access_token: ACCESS.into(),
+                refresh_token: Some(REFRESH.into()),
+                expires_at: self.expires_at,
+                token_type: "Bearer".into(),
+                id_token: Some(ID_TOKEN.into()),
+            })
+        }
+
+        async fn profile(&self, _tokens: &OAuthTokens) -> Result<OAuthUserProfile> {
+            Ok(OAuthUserProfile {
+                provider_account_id: "acct-1".into(),
+                email: Some("retained@example.com".into()),
+                name: Some("Retained".into()),
+                image: None,
+                email_verified: true,
+            })
+        }
+    }
+
+    fn now() -> u64 {
+        now_seconds()
+    }
+
+    fn options(secret: &str, version: &str, rotation: Vec<SecretVersion>) -> AuthOptions {
+        AuthOptions {
+            secret: format!("{secret}{}", "k".repeat(32)),
+            secret_version: version.into(),
+            secret_rotation: rotation,
+            base_url: Some(BaseUrl::Static("https://example.com".into())),
+            has_database: true,
+            ..AuthOptions::default()
+        }
+    }
+
+    fn context() -> AuthContext {
+        AuthContext::new(
+            options("a", "v1", vec![]),
+            Arc::new(MemoryDb::default()),
+            Some(Arc::new(MemorySecondaryStorage::default())),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    fn vault(options: &AuthOptions) -> ProviderTokenVault {
+        ProviderTokenVault::new(SecretKeySet::from_options(options).unwrap())
+    }
+
+    async fn sign_in(service: &OAuthService, provider: &TokenProvider) -> Result<()> {
+        let config = OAuthProviderConfig::new(
+            "mock",
+            Url::parse("https://provider.example/authorize").unwrap(),
+            "client",
+        )
+        .unwrap();
+        let authorization = service
+            .begin(&config, "https://example.com/callback", true)
+            .await
+            .unwrap();
+        service
+            .complete(provider, "code", &authorization.state, None, true)
+            .await
+            .map(|_| ())
+    }
+
+    async fn account_record(context: &AuthContext) -> Value {
+        context
+            .adapter
+            .find_one(
+                "account",
+                Query::new()
+                    .eq("provider_id", "mock")
+                    .eq("account_id", "acct-1"),
+            )
+            .await
+            .unwrap()
+            .expect("account row")
+    }
+
+    #[tokio::test]
+    async fn provider_tokens_are_not_retained_by_default() {
+        let context = context();
+        let service = OAuthService::new(context.clone(), OAuthStateStorage::Verification).unwrap();
+        sign_in(
+            &service,
+            &TokenProvider {
+                expires_at: Some(now() + 3600),
+            },
+        )
+        .await
+        .unwrap();
+        let record = account_record(&context).await;
+        assert!(record["token_envelope"].is_null());
+        let text = record.to_string();
+        assert!(!text.contains(ACCESS) && !text.contains(REFRESH) && !text.contains(ID_TOKEN));
+    }
+
+    #[tokio::test]
+    async fn retention_keeps_only_the_access_token_and_its_expiry() {
+        let context = context();
+        let service = OAuthService::new(context.clone(), OAuthStateStorage::Verification)
+            .unwrap()
+            .with_provider_token_retention();
+        sign_in(
+            &service,
+            &TokenProvider {
+                expires_at: Some(now() + 3600),
+            },
+        )
+        .await
+        .unwrap();
+        let record = account_record(&context).await;
+        let envelope = record["token_envelope"].as_str().expect("sealed envelope");
+        assert!(!envelope.contains(ACCESS), "envelope must be encrypted");
+
+        let opened = vault(&context.options).open("mock", envelope).unwrap();
+        assert_eq!(opened.access_token, ACCESS);
+        assert!(
+            opened.refresh_token.is_none(),
+            "refresh token must not be kept"
+        );
+        assert!(opened.id_token.is_none(), "ID token must not be kept");
+    }
+
+    #[tokio::test]
+    async fn retention_without_an_expiry_still_signs_in_and_keeps_nothing() {
+        let context = context();
+        let service = OAuthService::new(context.clone(), OAuthStateStorage::Verification)
+            .unwrap()
+            .with_provider_token_retention();
+        sign_in(&service, &TokenProvider { expires_at: None })
+            .await
+            .unwrap();
+        assert!(account_record(&context).await["token_envelope"].is_null());
+    }
+
+    #[test]
+    fn an_envelope_opens_only_for_its_provider_and_purpose() {
+        let options = options("a", "v1", vec![]);
+        let vault = vault(&options);
+        let tokens = OAuthTokens {
+            access_token: ACCESS.into(),
+            refresh_token: None,
+            expires_at: Some(now() + 600),
+            token_type: "Bearer".into(),
+            id_token: None,
+        };
+        let envelope = vault.seal("mock", &tokens).unwrap();
+        assert!(vault.open("mock", &envelope).is_ok());
+        assert!(vault.open("other-provider", &envelope).is_err());
+
+        // A session-shaped cookie-cache value with the same keys must not open as provider tokens.
+        let codec = CookieCacheCodec::new(SecretKeySet::from_options(&options).unwrap());
+        let session_shaped = codec
+            .encode(
+                CookieCacheStrategy::Jwe,
+                "user-1",
+                json!({"token": ACCESS, "user": {"id": "user-1"}, "session": {"id": "s"}}),
+                now(),
+                now() + 600,
+            )
+            .unwrap();
+        assert!(vault.open("mock", &session_shaped).is_err());
+    }
+
+    #[test]
+    fn tokens_without_an_expiry_or_already_expired_are_not_sealed() {
+        let vault = vault(&options("a", "v1", vec![]));
+        let base = OAuthTokens {
+            access_token: ACCESS.into(),
+            refresh_token: None,
+            expires_at: None,
+            token_type: "Bearer".into(),
+            id_token: None,
+        };
+        assert!(vault.seal("mock", &base).is_err());
+        let expired = OAuthTokens {
+            expires_at: Some(now() - 1),
+            ..base
+        };
+        assert!(vault.seal("mock", &expired).is_err());
+    }
+
+    #[test]
+    fn envelopes_survive_key_rotation_until_the_old_key_is_removed() {
+        let v1 = options("a", "v1", vec![]);
+        let sealed = vault(&v1)
+            .seal(
+                "mock",
+                &OAuthTokens {
+                    access_token: ACCESS.into(),
+                    refresh_token: None,
+                    expires_at: Some(now() + 600),
+                    token_type: "Bearer".into(),
+                    id_token: None,
+                },
+            )
+            .unwrap();
+
+        let rotated = options(
+            "b",
+            "v2",
+            vec![SecretVersion {
+                version: "v1".into(),
+                secret: format!("a{}", "k".repeat(32)),
+            }],
+        );
+        assert_eq!(
+            vault(&rotated).open("mock", &sealed).unwrap().access_token,
+            ACCESS
+        );
+
+        let retired = options("c", "v3", vec![]);
+        assert!(vault(&retired).open("mock", &sealed).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_session_cookie_is_not_accepted_as_a_provider_envelope_or_the_reverse() {
+        let context = context();
+        let service = OAuthService::new(context.clone(), OAuthStateStorage::Verification)
+            .unwrap()
+            .with_provider_token_retention();
+        sign_in(
+            &service,
+            &TokenProvider {
+                expires_at: Some(now() + 3600),
+            },
+        )
+        .await
+        .unwrap();
+        let envelope = account_record(&context).await["token_envelope"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // Presented as a session cookie, the provider envelope must not authenticate anyone.
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            format!("better-auth.session_token={envelope}")
+                .parse()
+                .unwrap(),
+        );
+        let principal = crate::session::SessionService::new(context.clone())
+            .unwrap()
+            .resolve(&headers, false)
+            .await
+            .unwrap();
+        assert!(principal.is_none());
     }
 }
