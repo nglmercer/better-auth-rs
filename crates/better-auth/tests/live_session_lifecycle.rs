@@ -1,6 +1,6 @@
-//! Session lifecycle against a live PostgreSQL server. Runs only when
-//! `BETTER_AUTH_TEST_POSTGRES_URL` is set, and then uses fresh random emails so the
-//! database can be reused between runs.
+//! Session lifecycle against live PostgreSQL and MySQL servers. Each runs only when its
+//! URL variable is set (`BETTER_AUTH_TEST_POSTGRES_URL`, `BETTER_AUTH_TEST_MYSQL_URL`), and
+//! uses fresh random emails so the database can be reused between runs.
 //!
 //! Each simulated application instance has its own connection pool, so every check
 //! below goes through the database. Revocation must be visible to the other instances
@@ -24,9 +24,39 @@ use uuid::Uuid;
 
 const PASSWORD: &str = "correct horse battery staple";
 
+/// Every configured live database: PostgreSQL and/or MySQL. Empty when neither is set.
+fn database_urls() -> Vec<String> {
+    [
+        "BETTER_AUTH_TEST_POSTGRES_URL",
+        "BETTER_AUTH_TEST_MYSQL_URL",
+    ]
+    .iter()
+    .filter_map(|name| std::env::var(name).ok())
+    .collect()
+}
+
+fn dialect_of(url: &str) -> SqlDialect {
+    if url.starts_with("mysql") {
+        SqlDialect::MySql
+    } else {
+        SqlDialect::Postgres
+    }
+}
+
 async fn instance(url: &str) -> AuthContext {
-    let adapter = Arc::new(SqlxDbAdapter::postgres(url).await.unwrap());
-    let storage = SqlxSecondaryStorage::postgres(url).await.unwrap();
+    let (adapter, storage, dialect) = if dialect_of(url) == SqlDialect::MySql {
+        (
+            Arc::new(SqlxDbAdapter::mysql(url).await.unwrap()),
+            SqlxSecondaryStorage::mysql(url).await.unwrap(),
+            SqlDialect::MySql,
+        )
+    } else {
+        (
+            Arc::new(SqlxDbAdapter::postgres(url).await.unwrap()),
+            SqlxSecondaryStorage::postgres(url).await.unwrap(),
+            SqlDialect::Postgres,
+        )
+    };
     storage.migrate().await.unwrap();
     let context = AuthContext::new(
         AuthOptions {
@@ -46,7 +76,7 @@ async fn instance(url: &str) -> AuthContext {
     .unwrap();
     // Idempotent: every instance may apply the same plan.
     adapter
-        .apply_migrations(&context.migration_plan(), SqlDialect::Postgres)
+        .apply_migrations(&context.migration_plan(), dialect)
         .await
         .unwrap();
     context
@@ -82,9 +112,12 @@ async fn authenticates(
 
 #[tokio::test]
 async fn revocation_on_one_instance_is_persistent_and_seen_by_others() {
-    let Ok(url) = std::env::var("BETTER_AUTH_TEST_POSTGRES_URL") else {
-        return;
-    };
+    for url in database_urls() {
+        revocation_on_one_instance_is_persistent_and_seen_by_others_on(&url).await;
+    }
+}
+
+async fn revocation_on_one_instance_is_persistent_and_seen_by_others_on(url: &str) {
     let node_a = instance(&url).await;
     let node_b = instance(&url).await;
     let email = format!("session-{}@example.test", Uuid::new_v4().simple());
@@ -120,9 +153,15 @@ async fn revocation_on_one_instance_is_persistent_and_seen_by_others() {
 
 #[tokio::test]
 async fn concurrent_logins_on_separate_instances_are_consistent_and_revocable_together() {
-    let Ok(url) = std::env::var("BETTER_AUTH_TEST_POSTGRES_URL") else {
-        return;
-    };
+    for url in database_urls() {
+        concurrent_logins_on_separate_instances_are_consistent_and_revocable_together_on(&url)
+            .await;
+    }
+}
+
+async fn concurrent_logins_on_separate_instances_are_consistent_and_revocable_together_on(
+    url: &str,
+) {
     let email = format!("session-{}@example.test", Uuid::new_v4().simple());
     let setup = instance(&url).await;
     EmailPasswordService::new(setup.clone())
@@ -139,8 +178,9 @@ async fn concurrent_logins_on_separate_instances_are_consistent_and_revocable_to
         .unwrap();
 
     let mut tasks = Vec::new();
+    let url_owned = url.to_owned();
     for _ in 0..6 {
-        let url = url.clone();
+        let url = url_owned.clone();
         let email = email.clone();
         tasks.push(tokio::spawn(async move {
             let context = instance(&url).await;
