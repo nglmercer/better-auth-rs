@@ -179,3 +179,35 @@ TikTools Cloud backend needs. This library stays generic, and nothing TikTools-s
 | E. PostgreSQL integration | Verified locally | Live PostgreSQL 16 tests pass: shared adapter contract, concurrent sign-up and second factor, two nodes surviving a connection kill, the session lifecycle, and Google/OAuth sign-in (`tests/postgres_oauth.rs`). Each live test applies the core migration itself, so none depends on another test's order. Not verified: MySQL (skipped without a server), CI runs. |
 | F. Axum integration | Done for the library surface | `axum_integration::auth_routes` mounts the routes at `base_path`. `AuthUser` authenticates the cookie with the CSRF policy on unsafe methods. `NativeAuthUser` authenticates an explicit bearer token only. Both are chosen per route. `tests/axum_integration.rs` (8 tests) serves an application over HTTP: Google redirect with state and PKCE, forged callback, cross-site refusal, and sign-out. `examples/external-axum-google.rs` is the external-style example. Not done: a live Google round trip, and proxy tests at the reverse-proxy boundary. |
 | G. Production configuration | Documented | `docs/operations/PRODUCTION.md`: origins, proxies, cookies, secrets, Google keys, storage, rate limits. |
+
+### Final status after merge (2026-11-02)
+
+Merged to `main`: #5 (Google JWKS lifecycle), #6 (native desktop login), #7 (session reliability and the PostgreSQL two-factor fix), #8 (Axum helpers, external example, production configuration), #9 (provider-token lifecycle and the PostgreSQL OAuth fix).
+
+Verification on the merged `main`, with a local PostgreSQL 16 server:
+
+- `cargo test -p better-auth --all-features --no-fail-fast`: 268 passed, 0 failed, 1 ignored. The ignored test is the MySQL live test (`--ignored` regeneration helper), and MySQL was not run.
+- `cargo clippy -p better-auth --all-targets --all-features -- -D warnings`: clean.
+- `cargo fmt --all -- --check`: clean.
+
+Definition of Done, as it stands:
+
+- Relevant Rust tests pass: yes, with the PostgreSQL suites enabled.
+- Strict Clippy passes: yes, with all features. Default-feature `clippy --all-targets` still fails in `database/mod.rs` test code that predates this work. It was left alone.
+- Formatting passes: yes.
+- No breaking public API changes without justification: `ProviderTokenVault::open` now takes a provider ID, and provider tokens are no longer retained by default. Both are recorded in the changelog as compatibility changes.
+- No duplicated OAuth or session implementations: yes. New code reuses `SessionService`, `OAuthService`, `check_csrf`, and the secret-version codec.
+- Real PostgreSQL verified: yes, for OAuth sign-in, session lifecycle, concurrent logins, and the two-factor path.
+- Security-negative tests included: yes (forged and replayed callbacks, expired and wrong-audience tokens, handoff replay, PKCE mismatch, cross-site mutation, provider-envelope confusion).
+- No secrets in logs or errors: fixed-message errors throughout, and JWKS and token-fetch errors carry no response bodies or key material.
+- Documentation and status matrix updated: yes (`docs/roadmap-status.md`, `docs/parity/MATRIX.md`, `docs/operations/PRODUCTION.md`, `README.md`, `CHANGELOG.md`).
+
+Not verified or not done:
+
+- GitHub Actions CI has never run on this repository. The workflow file exists, and the repository docs say Actions is blocked by billing.
+- MySQL live conformance was not run here.
+- No live Google round trip. Google flows are covered by local fixtures.
+- Provider-token refresh and revoke are not implemented, because nothing in the library reuses provider tokens.
+- The One Tap validator is caller-supplied and does not refresh its keys.
+- Desktop login has no example application and no browser-side tests.
+- No independent security review has been done, so this is not a production-readiness claim.
