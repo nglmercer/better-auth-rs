@@ -20,6 +20,7 @@ pub mod email;
 pub mod email_password;
 pub mod hooks;
 pub mod http_oauth;
+pub mod jwks;
 pub mod jwt;
 pub mod jwt_signing;
 pub mod multi_session;
@@ -71,6 +72,7 @@ pub use email_password::{
 };
 pub use hooks::AuthHooks;
 pub use http_oauth::HttpOAuthProvider;
+pub use jwks::JwksRefreshPolicy;
 pub use jwt::JwtService;
 pub use oauth::{
     OAuthAuthorization, OAuthProvider, OAuthProviderConfig, OAuthService, OAuthStateManager,

@@ -4,9 +4,15 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// Upper bound on the number of keys accepted from one JWKS document. Providers
+/// publish a handful of keys; a larger document is treated as hostile.
+pub const MAX_JWKS_KEYS: usize = 32;
+
 #[derive(Clone)]
 pub struct OidcIdTokenValidator {
     issuer: String,
+    /// Additional issuer spellings the provider is documented to use.
+    alternate_issuers: Vec<String>,
     audience: String,
     keys: HashMap<String, (DecodingKey, Algorithm)>,
 }
@@ -15,30 +21,46 @@ impl OidcIdTokenValidator {
     pub fn new(issuer: impl Into<String>, audience: impl Into<String>) -> Self {
         Self {
             issuer: issuer.into(),
+            alternate_issuers: Vec::new(),
             audience: audience.into(),
             keys: HashMap::new(),
         }
     }
 
-    pub fn add_rsa_key(mut self, key_id: impl Into<String>, pem: &[u8]) -> Result<Self> {
-        let key = DecodingKey::from_rsa_pem(pem)
-            .map_err(|error| AuthError::Crypto(format!("invalid OIDC RSA key: {error}")))?;
-        self.keys.insert(key_id.into(), (key, Algorithm::RS256));
-        Ok(self)
+    /// Accepts a second `iss` spelling for the same issuer, such as Google's
+    /// documented `accounts.google.com` form alongside `https://accounts.google.com`.
+    pub fn with_alternate_issuer(mut self, issuer: impl Into<String>) -> Self {
+        self.alternate_issuers.push(issuer.into());
+        self
     }
 
-    pub fn add_ec_key(mut self, key_id: impl Into<String>, pem: &[u8]) -> Result<Self> {
-        let key = DecodingKey::from_ec_pem(pem)
-            .map_err(|error| AuthError::Crypto(format!("invalid OIDC EC key: {error}")))?;
-        self.keys.insert(key_id.into(), (key, Algorithm::ES256));
-        Ok(self)
+    pub fn audience(&self) -> &str {
+        &self.audience
     }
 
-    pub fn replace_from_jwks(&mut self, jwks: &Value) -> Result<usize> {
+    /// Whether a signing key with this `kid` is loaded.
+    pub fn has_key(&self, key_id: &str) -> bool {
+        self.keys.contains_key(key_id)
+    }
+
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Returns a copy of this validator (same issuer, audience and issuers)
+    /// that trusts exactly the RSA keys in `jwks`. Keys that are not RSA are
+    /// skipped; the document is refused when it is malformed, has no usable
+    /// key, or exceeds [`MAX_JWKS_KEYS`].
+    pub fn with_jwks(&self, jwks: &Value) -> Result<Self> {
         let keys = jwks
             .get("keys")
             .and_then(Value::as_array)
             .ok_or_else(|| AuthError::InvalidRequest("OIDC JWKS has no keys array".into()))?;
+        if keys.len() > MAX_JWKS_KEYS {
+            return Err(AuthError::InvalidRequest(format!(
+                "OIDC JWKS lists more than {MAX_JWKS_KEYS} keys"
+            )));
+        }
         let mut replacement = HashMap::new();
         for jwk in keys {
             if jwk.get("kty").and_then(Value::as_str) != Some("RSA") {
@@ -65,8 +87,32 @@ impl OidcIdTokenValidator {
                 "OIDC JWKS has no supported RSA signing keys".into(),
             ));
         }
-        let count = replacement.len();
-        self.keys = replacement;
+        Ok(Self {
+            issuer: self.issuer.clone(),
+            alternate_issuers: self.alternate_issuers.clone(),
+            audience: self.audience.clone(),
+            keys: replacement,
+        })
+    }
+
+    pub fn add_rsa_key(mut self, key_id: impl Into<String>, pem: &[u8]) -> Result<Self> {
+        let key = DecodingKey::from_rsa_pem(pem)
+            .map_err(|error| AuthError::Crypto(format!("invalid OIDC RSA key: {error}")))?;
+        self.keys.insert(key_id.into(), (key, Algorithm::RS256));
+        Ok(self)
+    }
+
+    pub fn add_ec_key(mut self, key_id: impl Into<String>, pem: &[u8]) -> Result<Self> {
+        let key = DecodingKey::from_ec_pem(pem)
+            .map_err(|error| AuthError::Crypto(format!("invalid OIDC EC key: {error}")))?;
+        self.keys.insert(key_id.into(), (key, Algorithm::ES256));
+        Ok(self)
+    }
+
+    pub fn replace_from_jwks(&mut self, jwks: &Value) -> Result<usize> {
+        let replacement = self.with_jwks(jwks)?;
+        let count = replacement.keys.len();
+        self.keys = replacement.keys;
         Ok(count)
     }
 
@@ -92,10 +138,13 @@ impl OidcIdTokenValidator {
         validation.validate_exp = true;
         validation.validate_nbf = true;
         validation.validate_aud = false;
+        // No clock-skew allowance: a token is valid exactly until its `exp`.
+        validation.leeway = 0;
         let token = decode::<OidcClaims>(token, key, &validation)
             .map_err(|_| AuthError::Unauthorized)?
             .claims;
-        if token.iss != self.issuer || !audience_contains(&token.aud, &self.audience) {
+        let issuer_ok = token.iss == self.issuer || self.alternate_issuers.contains(&token.iss);
+        if !issuer_ok || !audience_contains(&token.aud, &self.audience) {
             return Err(AuthError::Unauthorized);
         }
         // OIDC Core: with several audiences the authorized party must be this
@@ -113,6 +162,13 @@ impl OidcIdTokenValidator {
         }
         Ok(token)
     }
+}
+
+/// The `kid` from an unverified token header. It only selects which key to
+/// try; the signature is still verified against that key before any claim is
+/// trusted.
+pub fn token_key_id(token: &str) -> Option<String> {
+    decode_header(token).ok().and_then(|header| header.kid)
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -218,6 +274,35 @@ mod tests {
         assert!(result.is_err());
         assert!(validator
             .replace_from_jwks(&json!({"keys": [{"kty":"RSA","kid":"missing"}]}))
+            .is_err());
+    }
+
+    #[test]
+    fn documented_alternate_issuer_is_accepted_and_others_are_not() {
+        let secret = b"oidc-test-secret";
+        let validator = OidcIdTokenValidator::new("https://accounts.google.com", "client-1")
+            .with_alternate_issuer("accounts.google.com")
+            .add_test_hs_key("test", secret);
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("test".into());
+        let token = |issuer: &str| {
+            let claims = json!({
+                "iss": issuer,
+                "sub": "subject-1",
+                "aud": "client-1",
+                "exp": (now_seconds() + 60) as usize,
+                "iat": now_seconds() as usize,
+            });
+            encode(&header, &claims, &EncodingKey::from_secret(secret)).unwrap()
+        };
+        assert!(validator
+            .validate(&token("accounts.google.com"), None)
+            .is_ok());
+        assert!(validator
+            .validate(&token("https://accounts.google.com"), None)
+            .is_ok());
+        assert!(validator
+            .validate(&token("accounts.google.com.evil.example"), None)
             .is_err());
     }
 

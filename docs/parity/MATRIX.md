@@ -57,7 +57,7 @@ Evidence paths are relative to `crates/better-auth/src/` unless stated.
 | Package | Status | Evidence | Gaps |
 |---|---|---|---|
 | passkey | Service implemented | `webauthn.rs` and `router.rs` routes under `/passkey/*`; `tests/passkey_flow.rs` runs registration and sign-in with a software authenticator, including replay, cloned counters, wrong origin, cross-account and deleted credentials | Route names are not verified against the pinned upstream, because passkey ships outside the core package; no browser authenticator E2E; no SDK methods; no attestation trust policy; the two-factor gate on passkey sign-in is not tested |
-| sso (OIDC) | Service implemented | `oidc.rs`: `multi_audience_tokens_require_matching_authorized_party`, signature and nonce tests; `plugins/sso.rs` | No discovery or routes; JWKS refresh is not scheduled |
+| sso (OIDC) | Service implemented | `oidc.rs`: `multi_audience_tokens_require_matching_authorized_party`, signature and nonce tests; `plugins/sso.rs` | No discovery or routes. Scheduled JWKS refresh exists for `HttpOAuthProvider` (`jwks.rs`), not for the `plugins/sso.rs` validator, which is still caller-supplied keys
 | sso (SAML) | Primitive only | `saml_rs_integration.rs` (optional `saml` feature) | No signed fixtures, no enterprise IdP E2E |
 | scim | Service implemented | `plugins/scim/`; routes in `router.rs`; `tests/scim_routes.rs`, `tests/scim_groups.rs` cover tokens, bearer auth, organization scope for users and groups, shared users, role refusal and group membership rules | No bulk, no ServiceProviderConfig, no live identity-provider interoperability |
 
