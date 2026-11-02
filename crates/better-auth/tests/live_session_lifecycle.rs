@@ -183,7 +183,7 @@ async fn concurrent_logins_on_separate_instances_are_consistent_and_revocable_to
         let url = url_owned.clone();
         let email = email.clone();
         tasks.push(tokio::spawn(async move {
-            let context = instance(url).await;
+            let context = instance(&url).await;
             let result = EmailPasswordService::new(context.clone())
                 .unwrap()
                 .sign_in(
