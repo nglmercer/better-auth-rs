@@ -11,6 +11,8 @@
 
 pub mod account;
 pub mod api_key;
+#[cfg(feature = "axum")]
+pub mod axum_integration;
 pub mod client;
 pub mod context;
 pub mod cookies;

@@ -66,3 +66,7 @@ required-features = ["axum"]
 [[example]]
 name = "web-example"
 required-features = ["axum"]
+
+[[example]]
+name = "external-axum-google"
+required-features = ["axum"]
