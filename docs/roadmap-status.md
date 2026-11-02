@@ -164,3 +164,13 @@ Items updated in the latest round (see the tables above for the current status):
 - Phase 6: anonymous guests (upgrade keeps the user id), last-login method.
 - Phase 9: compatibility fixtures (`crates/better-auth/tests/compat/`), CHANGELOG,
   SECURITY.md, and the release policy in `docs/governance/RELEASE.md`.
+
+## TikTools Cloud readiness
+
+Scope set on 2026-11-01: only the authentication features and security fixes that a separate
+TikTools Cloud backend needs. This library stays generic, and nothing TikTools-specific lives here.
+
+| Item | Status | Evidence and gaps |
+|---|---|---|
+| A. Google OAuth / OIDC reliability | Done for the library path | Scheduled, rotation-aware JWKS cache with `max_stale` and fail-closed behavior (`jwks.rs`, `tests/google_jwks.rs`, 13 tests). Retired keys stay trusted until the next refresh. One Tap still takes a caller-supplied validator. |
+| B. Desktop authentication | Library support done | Loopback redirect validation, a one-shot callback receiver with timeout and cancellation, and a backend-mediated handoff: single-use codes bound to PKCE, client and redirect URI, stored hashed (`desktop.rs`, `tests/desktop_login.rs`, 13 tests). `OAuthService::with_loopback_redirects` is opt-in. Not done: an example application, and browser-side tests. |
