@@ -1,20 +1,28 @@
-use super::common::{json_error, now_seconds};
+use super::common::now_seconds;
+use super::sqlite_sql::{
+    self, field_type, record_object, Sql, SqlParam, KV_DDL, KV_DELETE, KV_GET, KV_PURGE, KV_SET,
+};
 use better_auth_core::{
-    adapter::{
-        record_id, DbAdapter, DbOperation, FilterOp, OrderDirection, Query, SecondaryStorage,
-        StorageValue,
-    },
+    adapter::{record_id, DbAdapter, DbOperation, Query, SecondaryStorage, StorageValue},
     error::{AuthError, Result},
     migration::{MigrationExecutor, MigrationPlan, SqlDialect},
-    schema::{core_schema, FieldType, SchemaExtension},
+    schema::{core_schema, SchemaExtension},
 };
 use rusqlite::{
     params, params_from_iter,
-    types::{Value as SqlValue, ValueRef},
-    Connection, OptionalExtension, TransactionBehavior,
+    types::{ToSqlOutput, ValueRef},
+    Connection, OptionalExtension, ToSql, TransactionBehavior,
 };
-use serde_json::{Map, Number, Value};
-use std::{path::Path, sync::Mutex, time::Duration};
+use serde_json::{Map, Value};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex, MutexGuard, RwLock},
+    time::Duration,
+};
+
+/// Distinct statements the adapters keep prepared. Auth traffic repeats a
+/// small set of query shapes, so nearly every call reuses a compiled statement.
+const STATEMENT_CACHE_CAPACITY: usize = 128;
 
 fn sqlite_error(error: rusqlite::Error) -> AuthError {
     AuthError::Adapter(format!("SQLite adapter error: {error}"))
@@ -24,9 +32,51 @@ fn lock_error() -> AuthError {
     AuthError::Adapter("SQLite adapter lock poisoned".into())
 }
 
+impl ToSql for SqlParam {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::Borrowed(match self {
+            SqlParam::Null => ValueRef::Null,
+            SqlParam::Integer(value) => ValueRef::Integer(*value),
+            SqlParam::Real(value) => ValueRef::Real(*value),
+            SqlParam::Text(value) => ValueRef::Text(value.as_bytes()),
+            SqlParam::Blob(value) => ValueRef::Blob(value),
+        }))
+    }
+}
+
+fn from_value_ref(value: ValueRef<'_>) -> Result<SqlParam> {
+    Ok(match value {
+        ValueRef::Null => SqlParam::Null,
+        ValueRef::Integer(value) => SqlParam::Integer(value),
+        ValueRef::Real(value) => SqlParam::Real(value),
+        ValueRef::Text(value) => SqlParam::Text(
+            std::str::from_utf8(value)
+                .map_err(|error| AuthError::Adapter(format!("SQLite text error: {error}")))?
+                .to_owned(),
+        ),
+        ValueRef::Blob(value) => SqlParam::Blob(value.to_vec()),
+    })
+}
+
+fn execute(connection: &Connection, sql: &Sql) -> Result<u64> {
+    let changed = connection
+        .prepare_cached(&sql.text)
+        .map_err(sqlite_error)?
+        .execute(params_from_iter(sql.params.iter()))
+        .map_err(sqlite_error)?;
+    Ok(changed as u64)
+}
+
+/// Switches a file database to write-ahead logging with `synchronous = NORMAL`.
+fn enable_wal(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+        .map_err(sqlite_error)
+}
+
 pub struct SqliteDbAdapter {
     connection: Mutex<Connection>,
-    schema: Mutex<SchemaExtension>,
+    schema: RwLock<Arc<SchemaExtension>>,
 }
 
 impl SqliteDbAdapter {
@@ -45,10 +95,22 @@ impl SqliteDbAdapter {
         connection
             .execute_batch("PRAGMA foreign_keys = ON;")
             .map_err(sqlite_error)?;
+        connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         Ok(Self {
             connection: Mutex::new(connection),
-            schema: Mutex::new(core_schema()),
+            schema: RwLock::new(Arc::new(core_schema())),
         })
+    }
+
+    /// Switches the database file to write-ahead logging with
+    /// `synchronous = NORMAL`. Commits no longer wait for a full fsync of the
+    /// main database file, and readers on other connections (for example a
+    /// [`SqliteSecondaryStorage`] on the same file) are not blocked by a
+    /// writer. The journal mode is stored in the database file, so this is an
+    /// explicit call rather than something `open` does. It has no effect on an
+    /// in-memory database.
+    pub fn enable_wal(&self) -> Result<()> {
+        enable_wal(&*self.connection()?)
     }
 
     pub async fn apply_migrations(&self, plan: &MigrationPlan) -> Result<()> {
@@ -58,32 +120,34 @@ impl SqliteDbAdapter {
     /// Registers application/plugin schema metadata so JSON and boolean
     /// values can be converted back from SQLite without guessing their type.
     pub fn register_schema(&self, schema: &SchemaExtension) -> Result<()> {
-        self.schema.lock().map_err(|_| lock_error())?.merge(schema)
+        let mut current = self.schema.write().map_err(|_| lock_error())?;
+        let mut merged = SchemaExtension::clone(&current);
+        merged.merge(schema)?;
+        *current = Arc::new(merged);
+        Ok(())
     }
 
-    fn field_type(&self, table: &str, field: &str) -> Option<FieldType> {
-        let schema = self.schema.lock().ok()?;
-        schema
-            .tables
-            .get(table)
-            .and_then(|table| table.fields.get(field))
-            .map(|field| field.field_type.clone())
+    fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.connection.lock().map_err(|_| lock_error())
+    }
+
+    /// A cheap snapshot of the registered schema.
+    fn schema(&self) -> Result<Arc<SchemaExtension>> {
+        Ok(Arc::clone(&*self.schema.read().map_err(|_| lock_error())?))
     }
 }
 
 #[async_trait::async_trait]
 impl MigrationExecutor for SqliteDbAdapter {
     async fn execute(&self, statement: &str) -> Result<()> {
-        self.connection
-            .lock()
-            .map_err(|_| lock_error())?
+        self.connection()?
             .execute_batch(statement)
             .map_err(sqlite_error)
     }
 
     async fn column_exists(&self, table: &str, column: &str) -> Result<Option<bool>> {
-        let connection = self.connection.lock().map_err(|_| lock_error())?;
-        let exists = connection
+        let exists = self
+            .connection()?
             .query_row(
                 "SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2 LIMIT 1",
                 params![table, column],
@@ -108,109 +172,49 @@ impl DbAdapter for SqliteDbAdapter {
     }
 
     async fn find_many(&self, table: &str, query: Query) -> Result<Vec<Value>> {
-        let (where_sql, mut values) = where_clause(&query)?;
-        let mut sql = format!("SELECT * FROM {}", quote_identifier(table)?);
-        sql.push_str(&where_sql);
-        sql.push_str(&order_clause(&query)?);
-        append_pagination(&mut sql, &query, &mut values);
-
-        let connection = self.connection.lock().map_err(|_| lock_error())?;
-        let mut statement = connection.prepare(&sql).map_err(sqlite_error)?;
+        let sql = sqlite_sql::select(table, &query)?;
+        let schema = self.schema()?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare_cached(&sql.text).map_err(sqlite_error)?;
+        // Resolve each column's name and declared type once, not per row.
+        let columns = statement
+            .column_names()
+            .into_iter()
+            .map(|name| (name.to_owned(), field_type(&schema, table, name)))
+            .collect::<Vec<_>>();
         let mut rows = statement
-            .query(params_from_iter(values))
+            .query(params_from_iter(sql.params.iter()))
             .map_err(sqlite_error)?;
         let mut result = Vec::new();
         while let Some(row) = rows.next().map_err(sqlite_error)? {
-            let schema = self.schema.lock().map_err(|_| lock_error())?;
-            result.push(row_to_json(row, table, &schema)?);
+            let mut object = Map::new();
+            for (index, (name, field_type)) in columns.iter().enumerate() {
+                let value = from_value_ref(row.get_ref(index).map_err(sqlite_error)?)?;
+                object.insert(name.clone(), sqlite_sql::param_to_json(value, *field_type)?);
+            }
+            result.push(Value::Object(object));
         }
         Ok(result)
     }
 
     async fn insert_record(&self, table: &str, record: Value) -> Result<Value> {
-        let object = record_object(&record)?;
-        let mut fields = object.keys().cloned().collect::<Vec<_>>();
-        fields.sort();
-        let quoted_fields = fields
-            .iter()
-            .map(|field| quote_identifier(field))
-            .collect::<Result<Vec<_>>>()?
-            .join(", ");
-        let placeholders = (1..=fields.len())
-            .map(|index| format!("?{index}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut values = Vec::with_capacity(fields.len());
-        for field in &fields {
-            values.push(json_to_sql(
-                object
-                    .get(field)
-                    .ok_or_else(|| AuthError::Adapter("record field disappeared".into()))?,
-                self.field_type(table, field).as_ref(),
-            )?);
-        }
-        let sql = format!(
-            "INSERT INTO {} ({quoted_fields}) VALUES ({placeholders})",
-            quote_identifier(table)?
-        );
-        self.connection
-            .lock()
-            .map_err(|_| lock_error())?
-            .execute(&sql, params_from_iter(values))
-            .map_err(sqlite_error)?;
+        let sql = sqlite_sql::insert(table, record_object(&record)?, &*self.schema()?)?;
+        execute(&*self.connection()?, &sql)?;
         Ok(record)
     }
 
     async fn update_where(&self, table: &str, query: Query, changes: Value) -> Result<u64> {
-        let object = record_object(&changes)?;
-        if object.is_empty() {
+        let changes = record_object(&changes)?;
+        if changes.is_empty() {
             return Ok(0);
         }
-        let mut fields = object.keys().cloned().collect::<Vec<_>>();
-        fields.sort();
-        let (where_sql, where_values) = where_clause(&query)?;
-        let assignments = fields
-            .iter()
-            .enumerate()
-            .map(|(index, field)| Ok(format!("{} = ?{}", quote_identifier(field)?, index + 1)))
-            .collect::<Result<Vec<_>>>()?
-            .join(", ");
-        let mut values = fields
-            .iter()
-            .map(|field| {
-                json_to_sql(
-                    object
-                        .get(field)
-                        .ok_or_else(|| AuthError::Adapter("change field disappeared".into()))?,
-                    self.field_type(table, field).as_ref(),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        values.extend(where_values);
-        let where_sql = renumber_placeholders(&where_sql, fields.len());
-        let sql = format!(
-            "UPDATE {} SET {assignments}{where_sql}",
-            quote_identifier(table)?
-        );
-        let changed = self
-            .connection
-            .lock()
-            .map_err(|_| lock_error())?
-            .execute(&sql, params_from_iter(values))
-            .map_err(sqlite_error)?;
-        Ok(changed as u64)
+        let sql = sqlite_sql::update(table, &query, changes, &*self.schema()?)?;
+        execute(&*self.connection()?, &sql)
     }
 
     async fn delete_where(&self, table: &str, query: Query) -> Result<u64> {
-        let (where_sql, values) = where_clause(&query)?;
-        let sql = format!("DELETE FROM {}{where_sql}", quote_identifier(table)?);
-        let changed = self
-            .connection
-            .lock()
-            .map_err(|_| lock_error())?
-            .execute(&sql, params_from_iter(values))
-            .map_err(sqlite_error)?;
-        Ok(changed as u64)
+        let sql = sqlite_sql::delete(table, &query)?;
+        execute(&*self.connection()?, &sql)
     }
 
     async fn list(&self, table: &str) -> Result<Vec<(String, Value)>> {
@@ -222,13 +226,21 @@ impl DbAdapter for SqliteDbAdapter {
     }
 
     async fn transaction(&self, operations: Vec<DbOperation>) -> Result<()> {
-        let mut connection = self.connection.lock().map_err(|_| lock_error())?;
+        let schema = self.schema()?;
+        // Build every statement before taking the write lock on the database.
+        let statements = operations
+            .into_iter()
+            .map(|operation| sqlite_sql::operation(operation, &schema))
+            .collect::<Result<Vec<_>>>()?;
+        let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error)?;
-        let schema = self.schema.lock().map_err(|_| lock_error())?;
-        for operation in operations {
-            apply_transaction_operation(&transaction, operation, &schema)?;
+        for statement in &statements {
+            let Some(sql) = &statement.sql else { continue };
+            if execute(&transaction, sql)? == 0 && statement.require_change {
+                return Err(AuthError::NotFound);
+            }
         }
         transaction.commit().map_err(sqlite_error)
     }
@@ -252,23 +264,38 @@ impl SqliteSecondaryStorage {
     /// Creates the secondary-storage table. This is intentionally explicit so
     /// connecting to a production database never changes its schema.
     pub fn migrate(&self) -> Result<()> {
-        self.connection
-            .lock()
-            .map_err(|_| lock_error())?
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS _better_auth_kv (\
-                    storage_key TEXT PRIMARY KEY,\
-                    value_json TEXT NOT NULL,\
-                    expires_at INTEGER\
-                );",
-            )
+        self.connection()?
+            .execute_batch(KV_DDL)
             .map_err(sqlite_error)
+    }
+
+    /// See [`SqliteDbAdapter::enable_wal`]. Rate-limit counters write on every
+    /// request, so a file-backed store benefits the most from it.
+    pub fn enable_wal(&self) -> Result<()> {
+        enable_wal(&*self.connection()?)
+    }
+
+    /// Deletes every expired entry and returns how many were removed. Expired
+    /// entries are otherwise only removed when their key is read again, so a
+    /// long-running service should call this periodically.
+    pub fn purge_expired(&self) -> Result<u64> {
+        let changed = self
+            .connection()?
+            .prepare_cached(KV_PURGE)
+            .map_err(sqlite_error)?
+            .execute(params![now_seconds() as i64])
+            .map_err(sqlite_error)?;
+        Ok(changed as u64)
     }
 
     fn from_connection(connection: Connection) -> Result<Self> {
         Ok(Self {
             connection: Mutex::new(connection),
         })
+    }
+
+    fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.connection.lock().map_err(|_| lock_error())
     }
 }
 
@@ -280,8 +307,15 @@ fn initialize_libsql_runtime() -> Result<()> {
     // Initializing it here keeps this crate's SQLite and libSQL features
     // linkable together. Applications that initialize a different SQLite C
     // engine before constructing either adapter should choose one engine.
-    libsql::Database::open_in_memory()
-        .map(|_| ())
+    static INITIALIZED: std::sync::OnceLock<std::result::Result<(), String>> =
+        std::sync::OnceLock::new();
+    INITIALIZED
+        .get_or_init(|| {
+            libsql::Database::open_in_memory()
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+        .clone()
         .map_err(|error| AuthError::Adapter(format!("libSQL initialization error: {error}")))
 }
 
@@ -293,37 +327,21 @@ fn initialize_libsql_runtime() -> Result<()> {
 #[async_trait::async_trait]
 impl SecondaryStorage for SqliteSecondaryStorage {
     async fn get(&self, key: &str) -> Result<Option<StorageValue>> {
-        let connection = self.connection.lock().map_err(|_| lock_error())?;
-        read_kv(&connection, key)
+        read_kv(&*self.connection()?, key)
     }
 
     async fn set(&self, key: &str, value: StorageValue) -> Result<()> {
-        let connection = self.connection.lock().map_err(|_| lock_error())?;
-        let expires_at = value
-            .expires_in
-            .map(|ttl| now_seconds() as i64 + ttl.as_secs() as i64);
-        connection
-            .execute(
-                "INSERT INTO _better_auth_kv(storage_key, value_json, expires_at) VALUES (?1, ?2, ?3) ON CONFLICT(storage_key) DO UPDATE SET value_json = excluded.value_json, expires_at = excluded.expires_at",
-                params![key, value.value.to_string(), expires_at],
-            )
-            .map_err(sqlite_error)?;
-        Ok(())
+        let now = now_seconds() as i64;
+        let expires_at = value.expires_in.map(|ttl| sqlite_sql::expiry(now, ttl));
+        write_kv(&*self.connection()?, key, &value.value, expires_at)
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let connection = self.connection.lock().map_err(|_| lock_error())?;
-        connection
-            .execute(
-                "DELETE FROM _better_auth_kv WHERE storage_key = ?1",
-                params![key],
-            )
-            .map_err(sqlite_error)?;
-        Ok(())
+        delete_kv(&*self.connection()?, key)
     }
 
     async fn increment(&self, key: &str, amount: i64, expires_in: Duration) -> Result<i64> {
-        let mut connection = self.connection.lock().map_err(|_| lock_error())?;
+        let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error)?;
@@ -335,430 +353,72 @@ impl SecondaryStorage for SqliteSecondaryStorage {
         let next = current
             .checked_add(amount)
             .ok_or_else(|| AuthError::Adapter("counter overflow".into()))?;
-        let expires_at = existing
+        // A live counter keeps its window. A new or expired one starts a fresh one.
+        let now = now_seconds() as i64;
+        let ttl = existing
             .and_then(|value| value.expires_in)
-            .map(|ttl| now_seconds() as i64 + ttl.as_secs() as i64)
-            .unwrap_or(now_seconds() as i64 + expires_in.as_secs() as i64);
-        transaction
-            .execute(
-                "INSERT INTO _better_auth_kv(storage_key, value_json, expires_at) VALUES (?1, ?2, ?3) ON CONFLICT(storage_key) DO UPDATE SET value_json = excluded.value_json, expires_at = excluded.expires_at",
-                params![key, Value::from(next).to_string(), expires_at],
-            )
-            .map_err(sqlite_error)?;
+            .unwrap_or(expires_in);
+        write_kv(
+            &transaction,
+            key,
+            &Value::from(next),
+            Some(sqlite_sql::expiry(now, ttl)),
+        )?;
         transaction.commit().map_err(sqlite_error)?;
         Ok(next)
     }
 
     async fn get_and_delete(&self, key: &str) -> Result<Option<StorageValue>> {
-        let mut connection = self.connection.lock().map_err(|_| lock_error())?;
+        let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sqlite_error)?;
         let result = read_kv(&transaction, key)?;
-        transaction
-            .execute(
-                "DELETE FROM _better_auth_kv WHERE storage_key = ?1",
-                params![key],
-            )
-            .map_err(sqlite_error)?;
+        if result.is_some() {
+            delete_kv(&transaction, key)?;
+        }
         transaction.commit().map_err(sqlite_error)?;
         Ok(result)
     }
 }
 
-fn record_object(record: &Value) -> Result<&Map<String, Value>> {
-    record
-        .as_object()
-        .ok_or_else(|| AuthError::Adapter("database records must be JSON objects".into()))
-}
-
-fn quote_identifier(identifier: &str) -> Result<String> {
-    if identifier.is_empty()
-        || !identifier
-            .chars()
-            .all(|character| character == '_' || character.is_ascii_alphanumeric())
-    {
-        return Err(AuthError::Adapter(format!(
-            "invalid SQL identifier: {identifier}"
-        )));
-    }
-    Ok(format!("\"{identifier}\""))
-}
-
-fn where_clause(query: &Query) -> Result<(String, Vec<SqlValue>)> {
-    let mut values = Vec::new();
-    let mut predicates = Vec::new();
-    for filter in &query.filters {
-        let field = quote_identifier(&filter.field)?;
-        match filter.op {
-            FilterOp::Eq
-            | FilterOp::Ne
-            | FilterOp::Lt
-            | FilterOp::Lte
-            | FilterOp::Gt
-            | FilterOp::Gte => {
-                let operator = match filter.op {
-                    FilterOp::Eq => "=",
-                    FilterOp::Ne => "<>",
-                    FilterOp::Lt => "<",
-                    FilterOp::Lte => "<=",
-                    FilterOp::Gt => ">",
-                    FilterOp::Gte => ">=",
-                    FilterOp::In => unreachable!(),
-                };
-                values.push(json_to_sql(&filter.value, None)?);
-                predicates.push(format!("{field} {operator} ?{}", values.len()));
-            }
-            FilterOp::In => {
-                let Some(items) = filter.value.as_array() else {
-                    return Err(AuthError::Adapter(format!(
-                        "IN filter for {} must contain an array",
-                        filter.field
-                    )));
-                };
-                if items.is_empty() {
-                    predicates.push("1 = 0".into());
-                } else {
-                    let placeholders = items
-                        .iter()
-                        .map(|item| {
-                            values.push(json_to_sql(item, None)?);
-                            Ok(format!("?{}", values.len()))
-                        })
-                        .collect::<Result<Vec<_>>>()?
-                        .join(", ");
-                    predicates.push(format!("{field} IN ({placeholders})"));
-                }
-            }
-        }
-    }
-    if predicates.is_empty() {
-        Ok((String::new(), values))
-    } else {
-        Ok((format!(" WHERE {}", predicates.join(" AND ")), values))
-    }
-}
-
-fn order_clause(query: &Query) -> Result<String> {
-    if query.order_by.is_empty() {
-        return Ok(" ORDER BY \"id\" ASC".into());
-    }
-    let mut orders = Vec::new();
-    for order in &query.order_by {
-        let direction = match order.direction {
-            OrderDirection::Asc => "ASC",
-            OrderDirection::Desc => "DESC",
-        };
-        orders.push(format!("{} {direction}", quote_identifier(&order.field)?));
-    }
-    Ok(format!(" ORDER BY {}", orders.join(", ")))
-}
-
-fn append_pagination(sql: &mut String, query: &Query, values: &mut Vec<SqlValue>) {
-    if let Some(limit) = query.limit {
-        values.push(SqlValue::Integer(limit as i64));
-        sql.push_str(&format!(" LIMIT ?{}", values.len()));
-    } else if query.offset.is_some() {
-        sql.push_str(" LIMIT -1");
-    }
-    if let Some(offset) = query.offset {
-        values.push(SqlValue::Integer(offset as i64));
-        sql.push_str(&format!(" OFFSET ?{}", values.len()));
-    }
-}
-
-fn renumber_placeholders(sql: &str, offset: usize) -> String {
-    let mut output = String::with_capacity(sql.len());
-    let characters = sql.chars().collect::<Vec<_>>();
-    let mut position = 0;
-    while position < characters.len() {
-        if characters[position] == '?' {
-            position += 1;
-            let start = position;
-            while position < characters.len() && characters[position].is_ascii_digit() {
-                position += 1;
-            }
-            let index = characters[start..position]
-                .iter()
-                .collect::<String>()
-                .parse::<usize>()
-                .unwrap_or(1);
-            output.push_str(&format!("?{}", index + offset));
-        } else {
-            output.push(characters[position]);
-            position += 1;
-        }
-    }
-    output
-}
-
-fn json_to_sql(value: &Value, field_type: Option<&FieldType>) -> Result<SqlValue> {
-    if value.is_null() {
-        return Ok(SqlValue::Null);
-    }
-    match field_type {
-        Some(FieldType::Boolean) => Ok(SqlValue::Integer(
-            value
-                .as_bool()
-                .ok_or_else(|| AuthError::Adapter("expected a boolean value".into()))?
-                as i64,
-        )),
-        Some(FieldType::Bytes) => Ok(SqlValue::Blob(
-            value
-                .as_array()
-                .ok_or_else(|| AuthError::Adapter("expected an array of bytes".into()))?
-                .iter()
-                .map(|item| {
-                    item.as_u64()
-                        .and_then(|byte| u8::try_from(byte).ok())
-                        .ok_or_else(|| AuthError::Adapter("invalid byte value".into()))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        )),
-        Some(FieldType::Json) | None if value.is_array() || value.is_object() => Ok(
-            SqlValue::Text(serde_json::to_string(value).map_err(json_error)?),
-        ),
-        _ => match value {
-            Value::String(value) => Ok(SqlValue::Text(value.clone())),
-            Value::Bool(value) => Ok(SqlValue::Integer(*value as i64)),
-            Value::Number(value) => value
-                .as_i64()
-                .map(SqlValue::Integer)
-                .or_else(|| value.as_f64().map(SqlValue::Real))
-                .ok_or_else(|| AuthError::Adapter("unsupported JSON number".into())),
-            Value::Array(_) | Value::Object(_) => Ok(SqlValue::Text(
-                serde_json::to_string(value).map_err(json_error)?,
-            )),
-            Value::Null => Ok(SqlValue::Null),
-        },
-    }
-}
-
-fn row_to_json(row: &rusqlite::Row<'_>, table: &str, schema: &SchemaExtension) -> Result<Value> {
-    let mut object = Map::new();
-    let statement = row.as_ref();
-    for index in 0..statement.column_count() {
-        let name = statement
-            .column_name(index)
-            .map_err(|error| AuthError::Adapter(format!("SQLite column error: {error}")))?;
-        let field_type = schema
-            .tables
-            .get(table)
-            .and_then(|table| table.fields.get(name))
-            .map(|field| &field.field_type);
-        object.insert(
-            name.to_owned(),
-            sql_to_json(row.get_ref(index).map_err(sqlite_error)?, field_type)?,
-        );
-    }
-    Ok(Value::Object(object))
-}
-
-fn sql_to_json(value: ValueRef<'_>, field_type: Option<&FieldType>) -> Result<Value> {
-    match value {
-        ValueRef::Null => Ok(Value::Null),
-        ValueRef::Integer(value) if matches!(field_type, Some(FieldType::Boolean)) => {
-            Ok(Value::Bool(value != 0))
-        }
-        ValueRef::Integer(value) => Ok(Value::Number(value.into())),
-        ValueRef::Real(value) => Ok(Number::from_f64(value)
-            .map(Value::Number)
-            .unwrap_or(Value::Null)),
-        ValueRef::Text(value) => {
-            let text = std::str::from_utf8(value)
-                .map_err(|error| AuthError::Adapter(format!("SQLite text error: {error}")))?;
-            if matches!(field_type, Some(FieldType::Json)) {
-                serde_json::from_str(text).map_err(json_error)
-            } else {
-                Ok(Value::String(text.to_owned()))
-            }
-        }
-        ValueRef::Blob(value) => Ok(Value::Array(
-            value.iter().copied().map(Value::from).collect(),
-        )),
-    }
-}
-
-fn apply_transaction_operation(
+fn write_kv(
     connection: &Connection,
-    operation: DbOperation,
-    schema: &SchemaExtension,
+    key: &str,
+    value: &Value,
+    expires_at: Option<i64>,
 ) -> Result<()> {
-    match operation {
-        DbOperation::Insert { table, id, record } => {
-            let record = record_with_id(record, &id)?;
-            insert_sync(connection, &table, &record, schema)
-        }
-        DbOperation::Update { table, id, record } => {
-            let changed = update_sync(
-                connection,
-                &table,
-                Query::new().eq("id", id),
-                &record,
-                schema,
-            )?;
-            if changed == 0 {
-                return Err(AuthError::NotFound);
-            }
-            Ok(())
-        }
-        DbOperation::Delete { table, id } => {
-            delete_sync(connection, &table, Query::new().eq("id", id))?;
-            Ok(())
-        }
-        DbOperation::InsertRecord { table, record } => {
-            insert_sync(connection, &table, &record, schema)
-        }
-        DbOperation::UpdateWhere {
-            table,
-            query,
-            changes,
-        } => {
-            update_sync(connection, &table, query, &changes, schema)?;
-            Ok(())
-        }
-        DbOperation::DeleteWhere { table, query } => {
-            delete_sync(connection, &table, query)?;
-            Ok(())
-        }
-    }
-}
-
-fn insert_sync(
-    connection: &Connection,
-    table: &str,
-    record: &Value,
-    schema: &SchemaExtension,
-) -> Result<()> {
-    let object = record_object(record)?;
-    let mut fields = object.keys().cloned().collect::<Vec<_>>();
-    fields.sort();
-    let quoted_fields = fields
-        .iter()
-        .map(|field| quote_identifier(field))
-        .collect::<Result<Vec<_>>>()?
-        .join(", ");
-    let placeholders = (1..=fields.len())
-        .map(|index| format!("?{index}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let values = fields
-        .iter()
-        .map(|field| {
-            json_to_sql(
-                object
-                    .get(field)
-                    .ok_or_else(|| AuthError::Adapter("record field disappeared".into()))?,
-                schema
-                    .tables
-                    .get(table)
-                    .and_then(|table| table.fields.get(field))
-                    .map(|field| &field.field_type),
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
     connection
-        .execute(
-            &format!(
-                "INSERT INTO {} ({quoted_fields}) VALUES ({placeholders})",
-                quote_identifier(table)?
-            ),
-            params_from_iter(values),
-        )
+        .prepare_cached(KV_SET)
+        .map_err(sqlite_error)?
+        .execute(params![key, value.to_string(), expires_at])
         .map_err(sqlite_error)?;
     Ok(())
 }
 
-fn update_sync(
-    connection: &Connection,
-    table: &str,
-    query: Query,
-    changes: &Value,
-    schema: &SchemaExtension,
-) -> Result<u64> {
-    let object = record_object(changes)?;
-    if object.is_empty() {
-        return Ok(0);
-    }
-    let mut fields = object.keys().cloned().collect::<Vec<_>>();
-    fields.sort();
-    let (where_sql, where_values) = where_clause(&query)?;
-    let assignments = fields
-        .iter()
-        .enumerate()
-        .map(|(index, field)| Ok(format!("{} = ?{}", quote_identifier(field)?, index + 1)))
-        .collect::<Result<Vec<_>>>()?
-        .join(", ");
-    let mut values = fields
-        .iter()
-        .map(|field| {
-            json_to_sql(
-                object
-                    .get(field)
-                    .ok_or_else(|| AuthError::Adapter("change field disappeared".into()))?,
-                schema
-                    .tables
-                    .get(table)
-                    .and_then(|table| table.fields.get(field))
-                    .map(|field| &field.field_type),
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    values.extend(where_values);
-    let where_sql = renumber_placeholders(&where_sql, fields.len());
-    let sql = format!(
-        "UPDATE {} SET {assignments}{where_sql}",
-        quote_identifier(table)?
-    );
-    Ok(connection
-        .execute(&sql, params_from_iter(values))
-        .map_err(sqlite_error)? as u64)
+fn delete_kv(connection: &Connection, key: &str) -> Result<()> {
+    connection
+        .prepare_cached(KV_DELETE)
+        .map_err(sqlite_error)?
+        .execute(params![key])
+        .map_err(sqlite_error)?;
+    Ok(())
 }
 
-fn delete_sync(connection: &Connection, table: &str, query: Query) -> Result<u64> {
-    let (where_sql, values) = where_clause(&query)?;
-    Ok(connection
-        .execute(
-            &format!("DELETE FROM {}{where_sql}", quote_identifier(table)?),
-            params_from_iter(values),
-        )
-        .map_err(sqlite_error)? as u64)
-}
-
-fn record_with_id(record: Value, id: &str) -> Result<Value> {
-    let Value::Object(mut object) = record else {
-        return Err(AuthError::Adapter(
-            "database records must be JSON objects".into(),
-        ));
-    };
-    object.insert("id".into(), Value::String(id.to_owned()));
-    Ok(Value::Object(object))
-}
-
+/// Reads a live entry. An expired entry is deleted and reported as missing.
 fn read_kv(connection: &Connection, key: &str) -> Result<Option<StorageValue>> {
     let row: Option<(String, Option<i64>)> = connection
-        .query_row(
-            "SELECT value_json, expires_at FROM _better_auth_kv WHERE storage_key = ?1",
-            params![key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+        .prepare_cached(KV_GET)
+        .map_err(sqlite_error)?
+        .query_row(params![key], |row| Ok((row.get(0)?, row.get(1)?)))
         .optional()
         .map_err(sqlite_error)?;
     let Some((raw, expires_at)) = row else {
         return Ok(None);
     };
-    let now = now_seconds() as i64;
-    if expires_at.is_some_and(|expires_at| expires_at <= now) {
-        connection
-            .execute(
-                "DELETE FROM _better_auth_kv WHERE storage_key = ?1",
-                params![key],
-            )
-            .map_err(sqlite_error)?;
-        return Ok(None);
+    let value = sqlite_sql::kv_value(&raw, expires_at, now_seconds() as i64)?;
+    if value.is_none() {
+        delete_kv(connection, key)?;
     }
-    Ok(Some(StorageValue {
-        value: serde_json::from_str(&raw).map_err(json_error)?,
-        expires_in: expires_at.map(|expires_at| Duration::from_secs((expires_at - now) as u64)),
-    }))
+    Ok(value)
 }

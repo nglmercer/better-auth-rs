@@ -163,15 +163,11 @@ impl DbAdapter for SqlxDbAdapter {
         let (where_sql, mut values) = where_clause(&query, self.backend)?;
         let mut fields = object.keys().cloned().collect::<Vec<_>>();
         fields.sort();
+        // A bad field name is an adapter error, never a panic.
         let assignments = fields
             .iter()
-            .map(|field| {
-                format!(
-                    "{} = ?",
-                    quote_identifier(field, self.backend).expect("validated identifier")
-                )
-            })
-            .collect::<Vec<_>>()
+            .map(|field| Ok(format!("{} = ?", quote_identifier(field, self.backend)?)))
+            .collect::<Result<Vec<_>>>()?
             .join(", ");
         let mut change_values = fields
             .iter()

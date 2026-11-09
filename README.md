@@ -142,6 +142,50 @@ resolver. For separate databases, compensation is best-effort; a shared
 transaction or a durable reconciliation mechanism is needed to guarantee
 atomicity across storage systems.
 
+### SQLite
+
+The `sqlite` feature is on by default and uses `rusqlite` against the system
+SQLite library:
+
+```rust,no_run
+use better_auth::{AuthContext, SqliteDbAdapter, SqliteSecondaryStorage};
+use better_auth::core::options::AuthOptions;
+use std::sync::Arc;
+
+let db = Arc::new(SqliteDbAdapter::open("auth.db")?);
+let secondary = Arc::new(SqliteSecondaryStorage::open("auth.db")?);
+// Optional, recommended for a file database: write-ahead logging. The journal
+// mode is stored in the file, so it is an explicit call.
+db.enable_wal()?;
+secondary.enable_wal()?;
+
+let auth = AuthContext::builder(AuthOptions {
+    secret: "replace-with-a-secret-at-least-32-bytes".into(),
+    ..AuthOptions::default()
+})
+    .database(db.clone())
+    .secondary_storage(Some(secondary.clone()))
+    .build()?;
+
+db.apply_migrations(&auth.migration_plan()).await?;
+secondary.migrate()?;
+```
+
+Expired secondary-storage entries (rate-limit counters, one-time tokens) are
+removed when their key is read again. Call `purge_expired()` on the SQLite or
+libSQL secondary storage from a periodic task so keys that are never read
+again do not accumulate.
+
+`examples/sqlite-turso.rs` runs sign-up, sign-in, session resolution and rate
+limiting against SQLite, a local libSQL file, or a remote Turso database:
+
+```sh
+cargo run -p better-auth --example sqlite-turso
+AUTH_BACKEND=libsql cargo run -p better-auth --example sqlite-turso --features libsql
+TURSO_DATABASE_URL=libsql://... TURSO_AUTH_TOKEN=... \
+  cargo run -p better-auth --example sqlite-turso --features libsql
+```
+
 ### LibSQL/Turso
 
 Enable the adapter explicitly and choose local or remote storage without

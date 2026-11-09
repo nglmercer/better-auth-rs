@@ -7,6 +7,13 @@ data (password hashes, signed envelopes, database schema) are marked **Compatibi
 ## Unreleased
 
 ### Compatibility
+- **Database schema:** foreign-key columns that queries filter by now get a plain index
+  (`session.user_id`, `account.user_id`, and the `user_id`, `organization_id`, `team_id` and
+  `group_id` columns of the API-key, passkey, organization and SCIM plugin tables). The change
+  is additive: `MigrationPlan::from_schema` emits `CREATE INDEX IF NOT EXISTS` (checked first on
+  MySQL), so re-applying the migration plan to an existing database creates them. Custom schemas
+  can request the same with `FieldSchema::indexed()`. `MigrationStep` gains a `CreateIndex`
+  variant and `FieldSchema` an `indexed` field.
 - **Database schema:** the `two_factor` table gains a nullable `secret_version` column. The
   second-factor service has always written it, but the table definition did not declare it,
   so PostgreSQL rejected enrollment. Databases created before this change must add the
@@ -17,6 +24,11 @@ data (password hashes, signed envelopes, database schema) are marked **Compatibi
 - **Provider tokens are no longer retained by default.** Google sign-in stores nothing from the provider unless `OAuthService::with_provider_token_retention()` is enabled. When it is enabled, only the access token and its expiry are sealed. Refresh and ID tokens are dropped, and nothing reads the stored token back.
 
 ### Added
+- `examples/sqlite-turso.rs`: the email/password flow, session resolution and rate limiting on
+  SQLite, a local libSQL file, or a remote Turso database.
+- `SqliteDbAdapter::enable_wal` and `SqliteSecondaryStorage::enable_wal` switch a file database to
+  write-ahead logging with `synchronous = NORMAL`.
+- `purge_expired()` on the SQLite and libSQL secondary storage deletes expired entries in bulk.
 - Google One Tap can verify tokens against a JWKS endpoint that refreshes on schedule and on key rotation (`OneTapService::with_jwks`, `Router::with_one_tap_jwks`, `JwksIdTokenVerifier`).
 - Provider token refresh and revocation (`HttpOAuthProvider::refresh_access_token`, `revoke_token`, `with_revocation_endpoint`). The caller supplies the token. The library does not store refresh tokens.
 - `examples/desktop-login.rs`: a runnable end-to-end desktop login over loopback HTTP.
@@ -27,7 +39,24 @@ data (password hashes, signed envelopes, database schema) are marked **Compatibi
   and cancellation, and single-use PKCE-bound handoff codes (`desktop` module,
   `DesktopHandoffService`, `OAuthService::with_loopback_redirects`).
 
+### Fixed
+- libSQL local databases and embedded replicas: a transaction no longer captures statements that
+  other tasks run on the shared connection (they were silently rolled back with it), and
+  concurrent transactions no longer fail with `cannot start a transaction within a transaction`.
+- libSQL secondary storage: reading an expired key can no longer delete a value that another
+  task wrote in between.
+
+### Changed
+- The SQLite and libSQL adapters share one SQL builder, reuse prepared statements (SQLite), and
+  no longer copy the registered schema on every query (libSQL).
+- libSQL rate-limit increments and one-time reads are a single statement instead of a
+  four-statement transaction, which is one network round trip on Turso instead of four.
+- An authenticated request reads its session and user once instead of twice, and the ban check
+  no longer costs a separate query.
+
 ### Security
+- A banned user's session is refused by `SessionService` itself, so the axum extractors, bearer
+  transport and multi-session lookups enforce bans, not only the router's cookie path.
 - OAuth provider endpoints (token, userinfo, authorization, verified emails, JWKS) must be
   public HTTPS hosts. Credentials in the URL, `localhost`, and private, loopback, link-local
   (including cloud metadata), shared and unspecified addresses are refused.

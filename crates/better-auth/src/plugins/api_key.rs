@@ -36,7 +36,7 @@ impl Plugin for ApiKeyPlugin {
             TableSchema::default()
                 .primary_key("id")
                 .field("id", required(FieldType::String).unique())
-                .field("user_id", required(FieldType::String))
+                .field("user_id", required(FieldType::String).indexed())
                 .field("name", required(FieldType::String))
                 .field("prefix", required(FieldType::String).unique())
                 .field("key_hash", required(FieldType::String))

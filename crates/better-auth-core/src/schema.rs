@@ -18,6 +18,11 @@ pub struct FieldSchema {
     pub required: bool,
     pub unique: bool,
     pub nullable: bool,
+    /// Requests a plain (non-unique) index. Set it on columns that queries
+    /// filter by, such as foreign keys. Ignored when `unique` is set, because
+    /// a unique index already serves lookups.
+    #[serde(default)]
+    pub indexed: bool,
 }
 
 impl FieldSchema {
@@ -27,6 +32,7 @@ impl FieldSchema {
             required: true,
             unique: false,
             nullable: false,
+            indexed: false,
         }
     }
 
@@ -36,11 +42,17 @@ impl FieldSchema {
             required: false,
             unique: false,
             nullable: true,
+            indexed: false,
         }
     }
 
     pub fn unique(mut self) -> Self {
         self.unique = true;
+        self
+    }
+
+    pub fn indexed(mut self) -> Self {
+        self.indexed = true;
         self
     }
 }
@@ -130,7 +142,7 @@ pub fn core_schema() -> SchemaExtension {
             TableSchema::default()
                 .primary_key("id")
                 .field("id", FieldSchema::required(String).unique())
-                .field("user_id", FieldSchema::required(String))
+                .field("user_id", FieldSchema::required(String).indexed())
                 .field("expires_at", FieldSchema::required(DateTime))
                 .field("token_hash", FieldSchema::required(String).unique()),
         )
@@ -139,7 +151,7 @@ pub fn core_schema() -> SchemaExtension {
             TableSchema::default()
                 .primary_key("id")
                 .field("id", FieldSchema::required(String).unique())
-                .field("user_id", FieldSchema::required(String))
+                .field("user_id", FieldSchema::required(String).indexed())
                 .field("provider_id", FieldSchema::required(String))
                 .field("account_id", FieldSchema::required(String))
                 .field("password_hash", FieldSchema::optional(String))

@@ -355,11 +355,7 @@ impl EmailPasswordService {
         let Some(principal) = self.sessions.resolve(headers, secure_cookie).await? else {
             return Ok(None);
         };
-        // A ban takes effect on the next request, even for a session that was
-        // created before it, in case the sessions were not deleted in time.
-        if crate::plugins::account_is_banned(&self.context, &principal.user.id).await? {
-            return Ok(None);
-        }
+        // Session resolution already refuses a banned user.
         Ok(Some((principal.user, principal.session)))
     }
 

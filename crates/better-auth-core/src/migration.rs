@@ -17,6 +17,11 @@ pub enum MigrationStep {
         table: String,
         field: String,
     },
+    /// A plain index for a field marked `indexed`.
+    CreateIndex {
+        table: String,
+        field: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -33,12 +38,7 @@ impl MigrationPlan {
                 schema: table_schema.clone(),
             });
             for (field_name, field_schema) in &table_schema.fields {
-                if field_schema.unique {
-                    steps.push(MigrationStep::CreateUniqueIndex {
-                        table: table_name.clone(),
-                        field: field_name.clone(),
-                    });
-                }
+                steps.extend(index_step(table_name, field_name, field_schema));
             }
         }
         Self { steps }
@@ -58,12 +58,7 @@ impl MigrationPlan {
                     schema: desired_table.clone(),
                 });
                 for (field_name, field_schema) in &desired_table.fields {
-                    if field_schema.unique {
-                        steps.push(MigrationStep::CreateUniqueIndex {
-                            table: table_name.clone(),
-                            field: field_name.clone(),
-                        });
-                    }
+                    steps.extend(index_step(table_name, field_name, field_schema));
                 }
                 continue;
             };
@@ -77,7 +72,11 @@ impl MigrationPlan {
             }
             for (field_name, field_schema) in &desired_table.fields {
                 if let Some(previous_field) = previous_table.fields.get(field_name) {
-                    if previous_field != field_schema {
+                    // An index can be added to an existing column in place;
+                    // any other change to the definition cannot.
+                    let mut comparable = previous_field.clone();
+                    comparable.indexed = field_schema.indexed;
+                    if &comparable != field_schema {
                         return Err(AuthError::InvalidConfiguration(format!(
                             "changing the definition of {table_name}.{field_name} requires a manual migration"
                         )));
@@ -89,12 +88,7 @@ impl MigrationPlan {
                         schema: field_schema.clone(),
                     });
                 }
-                if field_schema.unique {
-                    steps.push(MigrationStep::CreateUniqueIndex {
-                        table: table_name.clone(),
-                        field: field_name.clone(),
-                    });
-                }
+                steps.extend(index_step(table_name, field_name, field_schema));
             }
         }
         Ok(Self { steps })
@@ -165,6 +159,16 @@ impl MigrationPlan {
                         quote(field, dialect)
                     ),
                 },
+                MigrationStep::CreateIndex { table, field } => format!(
+                    "CREATE INDEX {}{} ON {} ({});",
+                    match dialect {
+                        SqlDialect::MySql => "",
+                        SqlDialect::Postgres | SqlDialect::Sqlite => "IF NOT EXISTS ",
+                    },
+                    quote(&index_name(table, field), dialect),
+                    quote(table, dialect),
+                    quote(field, dialect)
+                ),
             })
             .collect()
     }
@@ -175,10 +179,19 @@ impl MigrationPlan {
         dialect: SqlDialect,
     ) -> Result<()> {
         for (step, statement) in self.steps.iter().zip(self.sql(dialect)) {
-            if let MigrationStep::CreateUniqueIndex { table, field } = step {
+            let index = match step {
+                MigrationStep::CreateUniqueIndex { table, field } => {
+                    Some((table, unique_index_name(table, field)))
+                }
+                MigrationStep::CreateIndex { table, field } => {
+                    Some((table, index_name(table, field)))
+                }
+                _ => None,
+            };
+            if let Some((table, name)) = index {
                 if dialect == SqlDialect::MySql
                     && executor
-                        .index_exists(table, &unique_index_name(table, field))
+                        .index_exists(table, &name)
                         .await?
                         .is_some_and(|exists| exists)
                 {
@@ -220,6 +233,23 @@ pub trait MigrationExecutor: Send + Sync {
 
 fn unique_index_name(table: &str, field: &str) -> String {
     format!("{table}_{field}_unique")
+}
+
+fn index_name(table: &str, field: &str) -> String {
+    format!("{table}_{field}_idx")
+}
+
+/// The index a field asks for, if any. A unique index already serves lookups,
+/// so `indexed` adds nothing on a unique field.
+fn index_step(table: &str, field: &str, schema: &FieldSchema) -> Option<MigrationStep> {
+    let (table, field) = (table.to_owned(), field.to_owned());
+    if schema.unique {
+        Some(MigrationStep::CreateUniqueIndex { table, field })
+    } else if schema.indexed {
+        Some(MigrationStep::CreateIndex { table, field })
+    } else {
+        None
+    }
 }
 
 pub fn migration_error(message: impl Into<String>) -> AuthError {
@@ -286,6 +316,45 @@ mod tests {
             .sql(SqlDialect::Postgres)
             .iter()
             .any(|sql| sql.contains("CREATE UNIQUE INDEX")));
+    }
+
+    #[test]
+    fn indexed_fields_get_a_plain_index_in_every_dialect() {
+        let plan = MigrationPlan::from_schema(&core_schema());
+        assert!(plan.sql(SqlDialect::Sqlite).contains(
+            &r#"CREATE INDEX IF NOT EXISTS "session_user_id_idx" ON "session" ("user_id");"#
+                .to_owned()
+        ));
+        assert!(plan
+            .sql(SqlDialect::MySql)
+            .contains(&"CREATE INDEX `session_user_id_idx` ON `session` (`user_id`);".to_owned()));
+        // A unique field is not indexed twice.
+        assert!(!plan.steps.iter().any(|step| matches!(
+            step,
+            MigrationStep::CreateIndex { field, .. } if field == "token_hash"
+        )));
+    }
+
+    #[test]
+    fn schema_diff_adds_an_index_to_an_existing_column() {
+        let mut previous = core_schema();
+        previous
+            .tables
+            .get_mut("session")
+            .unwrap()
+            .fields
+            .get_mut("user_id")
+            .unwrap()
+            .indexed = false;
+        let plan = MigrationPlan::diff(&previous, &core_schema()).unwrap();
+        assert!(plan.steps.contains(&MigrationStep::CreateIndex {
+            table: "session".into(),
+            field: "user_id".into(),
+        }));
+        assert!(!plan
+            .steps
+            .iter()
+            .any(|step| matches!(step, MigrationStep::AddField { .. })));
     }
 
     #[test]

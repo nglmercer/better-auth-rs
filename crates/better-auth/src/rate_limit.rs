@@ -93,10 +93,7 @@ impl RateLimiter {
 }
 
 fn stable_identity(identity: &str) -> String {
-    Sha256::digest(identity.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    data_encoding::HEXLOWER.encode(&Sha256::digest(identity.as_bytes()))
 }
 
 #[cfg(test)]

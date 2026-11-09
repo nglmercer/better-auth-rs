@@ -66,15 +66,15 @@ impl Plugin for OrganizationPlugin {
                 "organization_member",
                 TableSchema::default()
                     .field("id", required(FieldType::String).unique())
-                    .field("organization_id", required(FieldType::String))
-                    .field("user_id", required(FieldType::String))
+                    .field("organization_id", required(FieldType::String).indexed())
+                    .field("user_id", required(FieldType::String).indexed())
                     .field("role", required(FieldType::String)),
             )
             .table(
                 "organization_invitation",
                 TableSchema::default()
                     .field("id", required(FieldType::String).unique())
-                    .field("organization_id", required(FieldType::String))
+                    .field("organization_id", required(FieldType::String).indexed())
                     .field("email", required(FieldType::String))
                     .field("role", required(FieldType::String))
                     .field("token_hash", required(FieldType::String).unique())
@@ -85,15 +85,15 @@ impl Plugin for OrganizationPlugin {
                 "organization_team",
                 TableSchema::default()
                     .field("id", required(FieldType::String).unique())
-                    .field("organization_id", required(FieldType::String))
+                    .field("organization_id", required(FieldType::String).indexed())
                     .field("name", required(FieldType::String)),
             )
             .table(
                 "organization_team_member",
                 TableSchema::default()
                     .field("id", required(FieldType::String).unique())
-                    .field("team_id", required(FieldType::String))
-                    .field("user_id", required(FieldType::String)),
+                    .field("team_id", required(FieldType::String).indexed())
+                    .field("user_id", required(FieldType::String).indexed()),
             )
     }
 }

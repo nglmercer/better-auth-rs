@@ -10,8 +10,8 @@ mod sso;
 mod two_factor;
 mod username;
 
-pub(crate) use admin::account_is_banned;
 pub(crate) use admin::admin_grants;
+pub(crate) use admin::{account_is_banned, user_record_is_banned};
 pub use admin::{AdminGuard, AdminPlugin, AdminService};
 pub use api_key::{ApiKeyPlugin, API_KEY_PLUGIN};
 pub use jwt::JwtPlugin;

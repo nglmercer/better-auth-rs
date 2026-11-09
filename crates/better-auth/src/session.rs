@@ -362,6 +362,12 @@ impl SessionService {
             .find_one(USER_TABLE, Query::new().eq("id", session.user_id.clone()))
             .await?
             .ok_or(AuthError::Unauthorized)?;
+        // A ban takes effect on the next request, even for a session created
+        // before it, in case the sessions were not deleted in time. Checked
+        // here so every transport and integration enforces it.
+        if crate::plugins::user_record_is_banned(&self.context, &user_value) {
+            return Ok(None);
+        }
         let user = serde_json::from_value(user_value).map_err(serialize_error)?;
         Ok(Some(AuthPrincipal { user, session }))
     }
@@ -425,7 +431,7 @@ enum VerifiedCookie {
 
 fn hash_session_token(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    data_encoding::HEXLOWER.encode(&digest)
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {

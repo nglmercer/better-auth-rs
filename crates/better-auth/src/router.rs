@@ -100,6 +100,25 @@ impl HttpResponse {
     }
 }
 
+/// The session the access gate resolved for the current request, handed to
+/// the route's first lookup so one request does not read the same session and
+/// user twice. It is taken, not shared: any later lookup in the same route
+/// reads the database again and sees what the route has changed since.
+#[derive(Default)]
+struct GateSession(std::sync::Mutex<Option<(User, Session)>>);
+
+impl GateSession {
+    fn put(&self, principal: (User, Session)) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(principal);
+        }
+    }
+
+    fn take(&self) -> Option<(User, Session)> {
+        self.0.lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
 #[derive(Clone)]
 pub struct AuthRouter {
     context: AuthContext,
@@ -771,6 +790,20 @@ impl AuthRouter {
             .ok_or(AuthError::Unauthorized)
     }
 
+    /// The current user for a route handler. The first call in a request
+    /// reuses what the access gate resolved; later calls read again.
+    async fn gated_user(
+        &self,
+        gate: &GateSession,
+        headers: &HeaderMap,
+        secure_cookie: bool,
+    ) -> Result<(User, Session)> {
+        match gate.take() {
+            Some(principal) => Ok(principal),
+            None => self.current_user(headers, secure_cookie).await,
+        }
+    }
+
     async fn is_admin(&self, user_id: &str) -> Result<bool> {
         let role = self
             .context
@@ -908,6 +941,14 @@ impl AuthRouter {
     }
 
     async fn handle_with_id(&self, request: HttpRequest, request_id: &str) -> HttpResponse {
+        if self.context.plugins.hooks().is_empty() {
+            // No hook will read them, so skip copying the headers and parsing
+            // the body a second time.
+            return match self.handle_result(request).await {
+                Ok(response) => response,
+                Err(error) => error_response(error, request_id),
+            };
+        }
         let hook_request = HookRequest {
             method: request.method.clone(),
             path: request.uri.path().to_owned(),
@@ -999,15 +1040,17 @@ impl AuthRouter {
         }
 
         // The central access gate. Every built-in route's requirement comes from `route_access`.
+        let gate = GateSession::default();
         match route_access(&request.method, endpoint_path_name) {
             RouteAccess::Session => {
-                self.current_user(&request.headers, secure_cookie).await?;
+                gate.put(self.current_user(&request.headers, secure_cookie).await?);
             }
             RouteAccess::Admin => {
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
-                if !self.is_admin(&user.id).await? {
+                let principal = self.current_user(&request.headers, secure_cookie).await?;
+                if !self.is_admin(&principal.0.id).await? {
                     return Err(AuthError::Forbidden("administrator role required".into()));
                 }
+                gate.put(principal);
             }
             RouteAccess::Public | RouteAccess::Bearer => {}
         }
@@ -1050,7 +1093,9 @@ impl AuthRouter {
 
             (Method::GET, "/multi-session/list-device-sessions") => {
                 require_plugin(&self.context, MULTI_SESSION_PLUGIN)?;
-                let (_, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (_, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let active = self
                     .active_session_token(&request.headers, secure_cookie)
                     .await?
@@ -1076,7 +1121,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, MULTI_SESSION_PLUGIN)?;
                 let input: SessionTokenInput = parse_json(&request.body)?;
-                let (_, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (_, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let active = self
                     .active_session_token(&request.headers, secure_cookie)
                     .await?
@@ -1111,7 +1158,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, MULTI_SESSION_PLUGIN)?;
                 let input: SessionTokenInput = parse_json(&request.body)?;
-                let (_, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (_, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let active = self
                     .active_session_token(&request.headers, secure_cookie)
                     .await?
@@ -1193,7 +1242,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, USERNAME_PLUGIN)?;
                 let input: UsernameSetInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let username = self.usernames.set(&user.id, &input.username).await?;
                 Ok(HttpResponse::json(
                     StatusCode::OK,
@@ -1204,7 +1255,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, TWO_FACTOR_PLUGIN)?;
                 let input: PasswordInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.enforce_action_limit(&request_context, "two-factor-enable", Some(&user.email))
                     .await?;
                 self.account
@@ -1224,7 +1277,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, TWO_FACTOR_PLUGIN)?;
                 let input: CodeInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.enforce_action_limit(
                     &request_context,
                     "two-factor-confirm",
@@ -1240,7 +1295,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, TWO_FACTOR_PLUGIN)?;
                 let input: PasswordInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.enforce_action_limit(
                     &request_context,
                     "two-factor-disable",
@@ -1259,7 +1316,9 @@ impl AuthRouter {
             (Method::POST, "/verify-password") => {
                 check_csrf(&request_context, &request.metadata())?;
                 let input: PasswordInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.enforce_action_limit(&request_context, "verify-password", Some(&user.email))
                     .await?;
                 self.account
@@ -1285,7 +1344,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, TWO_FACTOR_PLUGIN)?;
                 let input: PasswordInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.enforce_action_limit(
                     &request_context,
                     "two-factor-totp-uri",
@@ -1308,7 +1369,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, TWO_FACTOR_PLUGIN)?;
                 let input: PasswordInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.enforce_action_limit(
                     &request_context,
                     "two-factor-backup-codes",
@@ -1584,7 +1647,9 @@ impl AuthRouter {
             }
             (Method::GET, "/admin/list-users") => {
                 require_plugin(&self.context, ADMIN_PLUGIN)?;
-                let (actor, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (actor, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let params = query_params(&request.uri);
                 let limit = params
                     .get("limit")
@@ -1607,7 +1672,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ADMIN_PLUGIN)?;
                 let input: SetRoleInput = parse_json(&request.body)?;
-                let (actor, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (actor, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.admin_service()
                     .set_role(&actor.id, &input.user_id, &input.role)
                     .await?;
@@ -1623,7 +1690,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ADMIN_PLUGIN)?;
                 let input: BanUserInput = parse_json(&request.body)?;
-                let (actor, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (actor, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let user = self
                     .admin_service()
                     .ban_user(
@@ -1645,7 +1714,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ADMIN_PLUGIN)?;
                 let input: TargetUserInput = parse_json(&request.body)?;
-                let (actor, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (actor, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let user = self
                     .admin_service()
                     .unban_user(&actor.id, &input.user_id)
@@ -1657,7 +1728,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ADMIN_PLUGIN)?;
                 let input: TargetUserInput = parse_json(&request.body)?;
-                let (actor, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (actor, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let sessions = self
                     .admin_service()
                     .list_user_sessions(&actor.id, &input.user_id)
@@ -1671,7 +1744,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ADMIN_PLUGIN)?;
                 let input: SessionIdInput = parse_json(&request.body)?;
-                let (actor, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (actor, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let revoked = self
                     .admin_service()
                     .revoke_user_session(&actor.id, &input.id)
@@ -1685,7 +1760,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ADMIN_PLUGIN)?;
                 let input: TargetUserInput = parse_json(&request.body)?;
-                let (actor, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (actor, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.admin_service()
                     .remove_user(&actor.id, &input.user_id)
                     .await?;
@@ -1700,7 +1777,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ADMIN_PLUGIN)?;
                 let input: TargetUserInput = parse_json(&request.body)?;
-                let (actor, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (actor, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let revoked = self
                     .admin_service()
                     .revoke_user_sessions(&actor.id, &input.user_id)
@@ -1802,7 +1881,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ADMIN_PLUGIN)?;
                 let input: CreateUserInput = parse_json(&request.body)?;
-                let (actor, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (actor, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.admin_service().ensure_admin(&actor.id).await?;
                 crate::email_password::validate_password(&input.password)?;
                 let password_hash = self.context.password_provider.hash(&input.password).await?;
@@ -1833,7 +1914,9 @@ impl AuthRouter {
             }
             (Method::GET, "/admin/get-user") => {
                 require_plugin(&self.context, ADMIN_PLUGIN)?;
-                let (actor, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (actor, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let user_id = query_params(&request.uri)
                     .get("id")
                     .cloned()
@@ -1845,7 +1928,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ADMIN_PLUGIN)?;
                 let input: AdminUpdateUserInput = parse_json(&request.body)?;
-                let (actor, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (actor, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let user = self
                     .admin_service()
                     .update_user(
@@ -1861,7 +1946,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ADMIN_PLUGIN)?;
                 let input: SetUserPasswordInput = parse_json(&request.body)?;
-                let (actor, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (actor, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.admin_service().ensure_admin(&actor.id).await?;
                 self.admin_service()
                     .get_user(&actor.id, &input.user_id)
@@ -1882,7 +1969,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ADMIN_PLUGIN)?;
                 let input: AdminPermissionInput = parse_json(&request.body)?;
-                let (actor, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (actor, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let success = self.is_admin(&actor.id).await?
                     && crate::plugins::admin_grants(&input.permission);
                 Ok(HttpResponse::json(
@@ -1914,7 +2003,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, EMAIL_OTP_PLUGIN)?;
                 let input: RequestEmailChangeInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let to = input.new_email.trim().to_ascii_lowercase();
                 self.enforce_action_limit(&request_context, "email-otp-send", Some(&to))
                     .await?;
@@ -1938,7 +2029,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, EMAIL_OTP_PLUGIN)?;
                 let input: ChangeEmailInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let to = input.new_email.trim().to_ascii_lowercase();
                 self.enforce_action_limit(&request_context, "email-otp-verify", Some(&to))
                     .await?;
@@ -1996,7 +2089,9 @@ impl AuthRouter {
             }
             (Method::GET, "/organization/get-full-organization") => {
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let organization_id = query_params(&request.uri)
                     .get("organization_id")
                     .cloned()
@@ -2009,7 +2104,9 @@ impl AuthRouter {
             }
             (Method::GET, "/organization/get-invitation") => {
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let params = query_params(&request.uri);
                 let organization_id = params.get("organization_id").cloned().unwrap_or_default();
                 let invitation_id = params.get("invitation_id").cloned().unwrap_or_default();
@@ -2158,7 +2255,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, API_KEY_PLUGIN)?;
                 let input: CreateApiKeyInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let created = self
                     .api_keys()?
                     .create(
@@ -2175,7 +2274,9 @@ impl AuthRouter {
             }
             (Method::GET, "/api-key/list") => {
                 require_plugin(&self.context, API_KEY_PLUGIN)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let keys = self.api_keys()?.list(&user.id).await?;
                 Ok(HttpResponse::json(
                     StatusCode::OK,
@@ -2186,7 +2287,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, API_KEY_PLUGIN)?;
                 let input: ApiKeyIdInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let revoked = self.api_keys()?.revoke(&user.id, &input.id).await?;
                 Ok(HttpResponse::json(
                     StatusCode::OK,
@@ -2210,7 +2313,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ONE_TIME_TOKEN_PLUGIN)?;
                 let input: OneTimeTokenGenerateInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let token = self
                     .one_time_tokens()?
                     .generate(
@@ -2244,7 +2349,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ONE_TIME_TOKEN_PLUGIN)?;
                 let input: OneTimeTokenUseInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let revoked = self
                     .one_time_tokens()?
                     .revoke(&user.id, &input.purpose, &input.token)
@@ -2259,7 +2366,9 @@ impl AuthRouter {
                 require_plugin(&self.context, PASSKEY_PLUGIN)?;
                 self.enforce_action_limit(&request_context, "passkey-register", None)
                     .await?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let existing = self.passkey_store().list_for_user(&user.id).await?;
                 let (transaction_id, options) = self
                     .passkey_service()?
@@ -2285,7 +2394,9 @@ impl AuthRouter {
                     .await?;
                 let input: PasskeyRegisterInput = parse_json(&request.body)?;
                 let name = input.name.as_deref().map(passkey_name).transpose()?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let credential = self
                     .passkey_service()?
                     .finish_registration_persisted(
@@ -2353,7 +2464,9 @@ impl AuthRouter {
             }
             (Method::GET, "/passkey/list-user-passkeys") => {
                 require_plugin(&self.context, PASSKEY_PLUGIN)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let passkeys: Vec<Value> = self
                     .passkey_store()
                     .list_for_user(&user.id)
@@ -2371,7 +2484,9 @@ impl AuthRouter {
                 require_plugin(&self.context, PASSKEY_PLUGIN)?;
                 let input: PasskeyRenameInput = parse_json(&request.body)?;
                 let name = passkey_name(&input.name)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let updated = self
                     .passkey_store()
                     .rename(&user.id, &input.id, &name)
@@ -2385,7 +2500,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, PASSKEY_PLUGIN)?;
                 let input: PasskeyIdInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let deleted = self.passkey_store().delete(&user.id, &input.id).await?;
                 Ok(HttpResponse::json(
                     StatusCode::OK,
@@ -2398,7 +2515,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, SCIM_PLUGIN)?;
                 let input: ScimTokenInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let allowed = self
                     .organizations()
                     .has_permission(
@@ -2582,7 +2701,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, DEVICE_PLUGIN)?;
                 let input: UserCodeInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.enforce_action_limit(&request_context, "device-decide", Some(&user.email))
                     .await?;
                 let service = self.device_auth()?;
@@ -2668,7 +2789,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ANONYMOUS_PLUGIN)?;
                 let input: UpgradeInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 if !self.is_anonymous(&user.id).await? {
                     return Err(AuthError::Forbidden(
                         "only guest accounts can be upgraded".into(),
@@ -2727,7 +2850,9 @@ impl AuthRouter {
             (Method::POST, "/delete-anonymous-user") => {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ANONYMOUS_PLUGIN)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 if !self.is_anonymous(&user.id).await? {
                     return Err(AuthError::Forbidden(
                         "only guest accounts can be deleted here".into(),
@@ -2759,7 +2884,9 @@ impl AuthRouter {
             }
             (Method::GET, "/last-login-method") => {
                 require_plugin(&self.context, LAST_LOGIN_PLUGIN)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let method = self
                     .context
                     .adapter
@@ -2847,7 +2974,9 @@ impl AuthRouter {
             }
             (Method::GET, "/organization/list") => {
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let organizations = self.organizations().list_for_user(&user.id).await?;
                 Ok(HttpResponse::json(
                     StatusCode::OK,
@@ -2858,7 +2987,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: OrganizationNameInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let organization = self.organizations().create(&input.name, &user.id).await?;
                 Ok(HttpResponse::json(
                     StatusCode::OK,
@@ -2867,7 +2998,9 @@ impl AuthRouter {
             }
             (Method::GET, "/organization/list-members") => {
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let organization_id = query_params(&request.uri)
                     .get("organization_id")
                     .cloned()
@@ -2885,7 +3018,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: InviteInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.enforce_action_limit(
                     &request_context,
                     "organization-invite",
@@ -2919,7 +3054,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: TokenInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let member = self
                     .organizations()
                     .accept(&user.id, &user.email, &input.token)
@@ -2933,7 +3070,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: MemberTargetInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.organizations()
                     .remove_member(&input.organization_id, &user.id, &input.user_id)
                     .await?;
@@ -2943,7 +3082,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: MemberRoleInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.organizations()
                     .set_role(
                         &input.organization_id,
@@ -2956,7 +3097,9 @@ impl AuthRouter {
             }
             (Method::GET, "/organization/get-organization") => {
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let organization_id = query_params(&request.uri)
                     .get("organization_id")
                     .cloned()
@@ -2971,7 +3114,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: UpdateOrganizationInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let organization = self
                     .organizations()
                     .update(
@@ -2990,7 +3135,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: OrganizationIdInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.organizations()
                     .delete(&input.organization_id, &user.id)
                     .await?;
@@ -3001,7 +3148,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: OrganizationIdInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.organizations()
                     .leave(&input.organization_id, &user.id)
                     .await?;
@@ -3009,7 +3158,9 @@ impl AuthRouter {
             }
             (Method::GET, "/organization/list-invitations") => {
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let organization_id = query_params(&request.uri)
                     .get("organization_id")
                     .cloned()
@@ -3027,7 +3178,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: CancelInvitationInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let cancelled = self
                     .organizations()
                     .cancel_invitation(&input.organization_id, &user.id, &input.invitation_id)
@@ -3041,7 +3194,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: InvitationIdInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let rejected = self
                     .organizations()
                     .reject_invitation(&user.email, &input.invitation_id)
@@ -3053,7 +3208,9 @@ impl AuthRouter {
             }
             (Method::GET, "/organization/list-user-invitations") => {
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let invitations = self
                     .organizations()
                     .list_user_invitations(&user.email)
@@ -3067,7 +3224,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: SlugInput = parse_json(&request.body)?;
-                let _ = self.current_user(&request.headers, secure_cookie).await?;
+                let _ = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let available = self.organizations().slug_available(&input.slug).await?;
                 Ok(HttpResponse::json(
                     StatusCode::OK,
@@ -3078,7 +3237,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: HasPermissionInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let allowed = self
                     .organizations()
                     .has_permission(&input.organization_id, &user.id, &input.permission)
@@ -3090,7 +3251,9 @@ impl AuthRouter {
             }
             (Method::GET, "/organization/list-teams") => {
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let organization_id = query_params(&request.uri)
                     .get("organization_id")
                     .cloned()
@@ -3108,7 +3271,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: CreateTeamInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let team = self
                     .organizations()
                     .create_team(&input.organization_id, &user.id, &input.name)
@@ -3119,7 +3284,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: UpdateTeamInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let team = self
                     .organizations()
                     .update_team(
@@ -3135,7 +3302,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: TeamIdInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.organizations()
                     .remove_team(&input.organization_id, &user.id, &input.team_id)
                     .await?;
@@ -3145,7 +3314,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: TeamMemberInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 self.organizations()
                     .add_team_member(
                         &input.organization_id,
@@ -3160,7 +3331,9 @@ impl AuthRouter {
                 check_csrf(&request_context, &request.metadata())?;
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
                 let input: TeamMemberInput = parse_json(&request.body)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let removed = self
                     .organizations()
                     .remove_team_member(
@@ -3177,7 +3350,9 @@ impl AuthRouter {
             }
             (Method::GET, "/organization/list-team-members") => {
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let params = query_params(&request.uri);
                 let organization_id = params.get("organization_id").cloned().unwrap_or_default();
                 let team_id = params.get("team_id").cloned().unwrap_or_default();
@@ -3192,7 +3367,9 @@ impl AuthRouter {
             }
             (Method::GET, "/organization/list-user-teams") => {
                 require_plugin(&self.context, ORGANIZATION_PLUGIN)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let teams = self.organizations().list_user_teams(&user.id).await?;
                 Ok(HttpResponse::json(
                     StatusCode::OK,
@@ -3205,7 +3382,9 @@ impl AuthRouter {
             }
             (Method::GET, "/token") => {
                 let signer = self.jwt.as_ref().ok_or(AuthError::NotFound)?;
-                let (user, _) = self.current_user(&request.headers, secure_cookie).await?;
+                let (user, _) = self
+                    .gated_user(&gate, &request.headers, secure_cookie)
+                    .await?;
                 let mut claims = serde_json::Map::new();
                 claims.insert("email".into(), json!(user.email));
                 claims.insert("name".into(), json!(user.name));

@@ -73,5 +73,5 @@ pub(super) fn serialize_error(error: impl std::fmt::Display) -> AuthError {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    data_encoding::HEXLOWER.encode(bytes)
 }

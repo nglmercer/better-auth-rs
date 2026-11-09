@@ -1,8 +1,10 @@
 CREATE TABLE IF NOT EXISTS "account" ("account_id" TEXT NOT NULL, "id" TEXT NOT NULL PRIMARY KEY, "password_hash" TEXT, "provider_id" TEXT NOT NULL, "token_envelope" TEXT, "user_id" TEXT NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS "account_id_unique" ON "account" ("id");
+CREATE INDEX IF NOT EXISTS "account_user_id_idx" ON "account" ("user_id");
 CREATE TABLE IF NOT EXISTS "session" ("expires_at" BIGINT NOT NULL, "id" TEXT NOT NULL PRIMARY KEY, "token_hash" TEXT NOT NULL, "user_id" TEXT NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS "session_id_unique" ON "session" ("id");
 CREATE UNIQUE INDEX IF NOT EXISTS "session_token_hash_unique" ON "session" ("token_hash");
+CREATE INDEX IF NOT EXISTS "session_user_id_idx" ON "session" ("user_id");
 CREATE TABLE IF NOT EXISTS "user" ("additional_fields" TEXT, "email" TEXT NOT NULL, "email_verified" BOOLEAN NOT NULL, "id" TEXT NOT NULL PRIMARY KEY, "image" TEXT, "name" TEXT NOT NULL, "role" TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS "user_email_unique" ON "user" ("email");
 CREATE UNIQUE INDEX IF NOT EXISTS "user_id_unique" ON "user" ("id");

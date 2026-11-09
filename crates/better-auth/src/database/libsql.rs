@@ -1,21 +1,51 @@
-use super::common::{json_error, now_seconds};
+use super::common::now_seconds;
+use super::sqlite_sql::{
+    self, field_type, record_object, Sql, SqlParam, KV_DDL, KV_DELETE, KV_GET, KV_PURGE, KV_SET,
+};
 use better_auth_core::{
-    adapter::{
-        record_id, DbAdapter, DbOperation, FilterOp, OrderDirection, Query, SecondaryStorage,
-        StorageValue,
-    },
+    adapter::{record_id, DbAdapter, DbOperation, Query, SecondaryStorage, StorageValue},
     error::{AuthError, Result},
     migration::{MigrationExecutor, MigrationPlan, SqlDialect},
-    schema::{core_schema, FieldType, SchemaExtension},
+    schema::{core_schema, SchemaExtension},
 };
 use libsql::{params_from_iter, Builder, TransactionBehavior};
 use secrecy::{ExposeSecret, SecretString};
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Value};
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, RwLock},
     time::Duration,
 };
+use tokio::sync::{RwLock as AsyncRwLock, RwLockReadGuard};
+
+/// How long a local connection waits for another connection's write lock on
+/// the same file before failing with `SQLITE_BUSY`.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Removes one entry only if it is still expired at `?2`, so a value written
+/// by another task between the read and this delete is left alone.
+const KV_DELETE_EXPIRED: &str =
+    "DELETE FROM _better_auth_kv WHERE storage_key = ?1 AND expires_at <= ?2";
+
+/// Atomic read-and-remove in one statement and one round trip.
+const KV_TAKE: &str =
+    "DELETE FROM _better_auth_kv WHERE storage_key = ?1 RETURNING value_json, expires_at";
+
+/// Atomic counter increment in one statement and one round trip.
+/// `?1` key, `?2` amount, `?3` expiry for a fresh window, `?4` now.
+/// An expired counter restarts at `?2` with a fresh window; a live one keeps
+/// its window. The `WHERE` skips the update when the sum would overflow a
+/// 64-bit integer, in which case no row is returned.
+const KV_INCREMENT: &str = "INSERT INTO _better_auth_kv(storage_key, value_json, expires_at) \
+VALUES (?1, CAST(?2 AS TEXT), ?3) \
+ON CONFLICT(storage_key) DO UPDATE SET \
+value_json = CASE WHEN _better_auth_kv.expires_at <= ?4 THEN excluded.value_json \
+ELSE CAST(CAST(_better_auth_kv.value_json AS INTEGER) + ?2 AS TEXT) END, \
+expires_at = CASE WHEN _better_auth_kv.expires_at <= ?4 THEN excluded.expires_at \
+ELSE COALESCE(_better_auth_kv.expires_at, excluded.expires_at) END \
+WHERE _better_auth_kv.expires_at <= ?4 \
+OR typeof(CAST(_better_auth_kv.value_json AS INTEGER) + ?2) = 'integer' \
+RETURNING value_json";
 
 #[derive(Clone, Debug)]
 pub enum LibSqlConfig {
@@ -36,9 +66,6 @@ pub struct RemoteReplica {
     pub auth_token: SecretString,
     pub sync_interval: Option<Duration>,
 }
-
-const SECONDARY_STORAGE_DDL: &str =
-    "CREATE TABLE IF NOT EXISTS _better_auth_kv (storage_key TEXT PRIMARY KEY, value_json TEXT NOT NULL, expires_at INTEGER)";
 
 async fn build_database(config: LibSqlConfig) -> Result<libsql::Database> {
     match config {
@@ -70,23 +97,98 @@ async fn build_database(config: LibSqlConfig) -> Result<libsql::Database> {
     }
 }
 
-pub struct LibSqlDbAdapter {
+impl From<SqlParam> for libsql::Value {
+    fn from(value: SqlParam) -> Self {
+        match value {
+            SqlParam::Null => libsql::Value::Null,
+            SqlParam::Integer(value) => libsql::Value::Integer(value),
+            SqlParam::Real(value) => libsql::Value::Real(value),
+            SqlParam::Text(value) => libsql::Value::Text(value),
+            SqlParam::Blob(value) => libsql::Value::Blob(value),
+        }
+    }
+}
+
+fn from_libsql(value: libsql::Value) -> SqlParam {
+    match value {
+        libsql::Value::Null => SqlParam::Null,
+        libsql::Value::Integer(value) => SqlParam::Integer(value),
+        libsql::Value::Real(value) => SqlParam::Real(value),
+        libsql::Value::Text(value) => SqlParam::Text(value),
+        libsql::Value::Blob(value) => SqlParam::Blob(value),
+    }
+}
+
+fn bind(params: Vec<SqlParam>) -> impl libsql::params::IntoParams {
+    params_from_iter(params.into_iter().map(libsql::Value::from))
+}
+
+async fn execute(connection: &libsql::Connection, sql: Sql) -> Result<u64> {
+    connection
+        .execute(&sql.text, bind(sql.params))
+        .await
+        .map_err(libsql_error)
+}
+
+/// The connection handle plus the gate that keeps transactions isolated.
+///
+/// A local database or embedded replica is a single SQLite connection shared
+/// by every task. Without coordination, a statement from one task runs inside
+/// whatever transaction another task has open on that handle (and is lost if
+/// that transaction rolls back), and a second `BEGIN` fails outright. Plain
+/// statements therefore hold the gate shared and a transaction holds it
+/// exclusively. A remote connection opens a separate server-side stream for
+/// each transaction, so it needs no gate and keeps full concurrency.
+#[derive(Clone)]
+struct Handle {
     // Keep the owning Database alive. libSQL's embedded-replica background
     // synchronizer is tied to this value's lifetime, not the cloned
     // Connection handle.
-    database: Arc<libsql::Database>,
+    _database: Arc<libsql::Database>,
     connection: libsql::Connection,
-    schema: Mutex<SchemaExtension>,
+    gate: Option<Arc<AsyncRwLock<()>>>,
+}
+
+impl Handle {
+    async fn connect(config: LibSqlConfig) -> Result<Self> {
+        let gate = match config {
+            LibSqlConfig::Remote { .. } => None,
+            LibSqlConfig::Local { .. } | LibSqlConfig::RemoteReplica(_) => {
+                Some(Arc::new(AsyncRwLock::new(())))
+            }
+        };
+        let database = Arc::new(build_database(config).await?);
+        let connection = database.connect().map_err(libsql_error)?;
+        // A no-op for remote connections.
+        connection
+            .busy_timeout(BUSY_TIMEOUT)
+            .map_err(libsql_error)?;
+        Ok(Self {
+            _database: database,
+            connection,
+            gate,
+        })
+    }
+
+    /// Held while a statement outside a transaction runs.
+    async fn shared(&self) -> Option<RwLockReadGuard<'_, ()>> {
+        match &self.gate {
+            Some(gate) => Some(gate.read().await),
+            None => None,
+        }
+    }
+}
+
+pub struct LibSqlDbAdapter {
+    handle: Handle,
+    schema: RwLock<Arc<SchemaExtension>>,
 }
 
 impl LibSqlDbAdapter {
     pub async fn connect(config: LibSqlConfig) -> Result<Self> {
-        let database = Arc::new(build_database(config).await?);
-        let connection = database.connect().map_err(libsql_error)?;
         Ok(Self {
-            database,
-            connection,
-            schema: Mutex::new(core_schema()),
+            handle: Handle::connect(config).await?,
+            schema: RwLock::new(Arc::new(core_schema())),
         })
     }
 
@@ -109,33 +211,39 @@ impl LibSqlDbAdapter {
         Self::connect(LibSqlConfig::RemoteReplica(config)).await
     }
 
+    /// Secondary storage on the same connection as this adapter.
     pub fn secondary_storage(&self) -> LibSqlSecondaryStorage {
         LibSqlSecondaryStorage {
-            _database: Arc::clone(&self.database),
-            connection: self.connection.clone(),
+            handle: self.handle.clone(),
         }
     }
 
     pub fn register_schema(&self, schema: &SchemaExtension) -> Result<()> {
-        self.schema
-            .lock()
-            .map_err(|_| schema_lock_error())?
-            .merge(schema)
+        let mut current = self.schema.write().map_err(|_| schema_lock_error())?;
+        let mut merged = SchemaExtension::clone(&current);
+        merged.merge(schema)?;
+        *current = Arc::new(merged);
+        Ok(())
     }
 
     pub async fn apply_migrations(&self, plan: &MigrationPlan) -> Result<()> {
         plan.apply(self, SqlDialect::Sqlite).await
     }
 
-    fn connection(&self) -> libsql::Connection {
-        self.connection.clone()
+    /// A cheap snapshot of the registered schema.
+    fn schema(&self) -> Result<Arc<SchemaExtension>> {
+        Ok(Arc::clone(
+            &*self.schema.read().map_err(|_| schema_lock_error())?,
+        ))
     }
 }
 
 #[async_trait::async_trait]
 impl MigrationExecutor for LibSqlDbAdapter {
     async fn execute(&self, statement: &str) -> Result<()> {
-        self.connection()
+        let _shared = self.handle.shared().await;
+        self.handle
+            .connection
             .execute(statement, ())
             .await
             .map_err(libsql_error)?;
@@ -143,10 +251,15 @@ impl MigrationExecutor for LibSqlDbAdapter {
     }
 
     async fn column_exists(&self, table: &str, column: &str) -> Result<Option<bool>> {
+        let _shared = self.handle.shared().await;
         let mut rows = self
-            .connection()
+            .handle
+            .connection
             .query(
-                &format!("PRAGMA table_info({})", quote_identifier(table)?),
+                &format!(
+                    "PRAGMA table_info({})",
+                    sqlite_sql::quote_identifier(table)?
+                ),
                 (),
             )
             .await
@@ -172,57 +285,57 @@ impl DbAdapter for LibSqlDbAdapter {
     }
 
     async fn find_many(&self, table: &str, query: Query) -> Result<Vec<Value>> {
-        let (where_sql, mut values) = where_clause(&query)?;
-        let mut sql = format!("SELECT * FROM {}", quote_identifier(table)?);
-        sql.push_str(&where_sql);
-        sql.push_str(&order_clause(&query)?);
-        append_pagination(&mut sql, &query, &mut values);
-        let schema = self.schema.lock().map_err(|_| schema_lock_error())?.clone();
-        let connection = self.connection();
-        let mut rows = connection
-            .query(&sql, params_from_iter(values))
+        let sql = sqlite_sql::select(table, &query)?;
+        let schema = self.schema()?;
+        let _shared = self.handle.shared().await;
+        let mut rows = self
+            .handle
+            .connection
+            .query(&sql.text, bind(sql.params))
             .await
             .map_err(libsql_error)?;
+        // Resolve each column's name and declared type once, not per row.
+        let columns = (0..rows.column_count())
+            .map(|index| {
+                let name = rows.column_name(index).ok_or_else(|| {
+                    AuthError::Adapter("libSQL row is missing a column name".into())
+                })?;
+                Ok((name.to_owned(), field_type(&schema, table, name)))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let mut result = Vec::new();
         while let Some(row) = rows.next().await.map_err(libsql_error)? {
-            result.push(row_to_json(&row, table, &schema)?);
+            let mut object = Map::new();
+            for (index, (name, field_type)) in columns.iter().enumerate() {
+                let value = from_libsql(row.get_value(index as i32).map_err(libsql_error)?);
+                object.insert(name.clone(), sqlite_sql::param_to_json(value, *field_type)?);
+            }
+            result.push(Value::Object(object));
         }
         Ok(result)
     }
 
     async fn insert_record(&self, table: &str, record: Value) -> Result<Value> {
-        let object = record_object(&record)?;
-        let schema = self.schema.lock().map_err(|_| schema_lock_error())?.clone();
-        let (sql, values) = insert_statement(table, object, &schema)?;
-        self.connection()
-            .execute(&sql, params_from_iter(values))
-            .await
-            .map_err(libsql_error)?;
+        let sql = sqlite_sql::insert(table, record_object(&record)?, &*self.schema()?)?;
+        let _shared = self.handle.shared().await;
+        execute(&self.handle.connection, sql).await?;
         Ok(record)
     }
 
     async fn update_where(&self, table: &str, query: Query, changes: Value) -> Result<u64> {
-        let object = record_object(&changes)?;
-        if object.is_empty() {
+        let changes = record_object(&changes)?;
+        if changes.is_empty() {
             return Ok(0);
         }
-        let schema = self.schema.lock().map_err(|_| schema_lock_error())?.clone();
-        let (sql, values) = update_statement(table, query, object, &schema)?;
-        self.connection()
-            .execute(&sql, params_from_iter(values))
-            .await
-            .map_err(libsql_error)
+        let sql = sqlite_sql::update(table, &query, changes, &*self.schema()?)?;
+        let _shared = self.handle.shared().await;
+        execute(&self.handle.connection, sql).await
     }
 
     async fn delete_where(&self, table: &str, query: Query) -> Result<u64> {
-        let (where_sql, values) = where_clause(&query)?;
-        self.connection()
-            .execute(
-                &format!("DELETE FROM {}{where_sql}", quote_identifier(table)?),
-                params_from_iter(values),
-            )
-            .await
-            .map_err(libsql_error)
+        let sql = sqlite_sql::delete(table, &query)?;
+        let _shared = self.handle.shared().await;
+        execute(&self.handle.connection, sql).await
     }
 
     async fn list(&self, table: &str) -> Result<Vec<(String, Value)>> {
@@ -234,14 +347,37 @@ impl DbAdapter for LibSqlDbAdapter {
     }
 
     async fn transaction(&self, operations: Vec<DbOperation>) -> Result<()> {
-        let schema = self.schema.lock().map_err(|_| schema_lock_error())?.clone();
-        let connection = self.connection();
-        let transaction = connection
+        let schema = self.schema()?;
+        // Build every statement before taking the gate or a database lock.
+        let statements = operations
+            .into_iter()
+            .map(|operation| sqlite_sql::operation(operation, &schema))
+            .collect::<Result<Vec<_>>>()?;
+        let _exclusive = match &self.handle.gate {
+            Some(gate) => Some(gate.write().await),
+            None => None,
+        };
+        let transaction = self
+            .handle
+            .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
             .map_err(libsql_error)?;
-        for operation in operations {
-            apply_transaction_operation(&transaction, operation, &schema).await?;
+        for statement in statements {
+            let Some(sql) = statement.sql else { continue };
+            let changed = match execute(&transaction, sql).await {
+                Ok(changed) => changed,
+                Err(error) => {
+                    // Roll back before the gate is released, so the next
+                    // statement on this handle cannot join this transaction.
+                    let _ = transaction.rollback().await;
+                    return Err(error);
+                }
+            };
+            if changed == 0 && statement.require_change {
+                let _ = transaction.rollback().await;
+                return Err(AuthError::NotFound);
+            }
         }
         transaction.commit().await.map_err(libsql_error)
     }
@@ -249,55 +385,76 @@ impl DbAdapter for LibSqlDbAdapter {
 
 #[derive(Clone)]
 pub struct LibSqlSecondaryStorage {
-    // Retained solely to keep replica synchronization alive.
-    _database: Arc<libsql::Database>,
-    connection: libsql::Connection,
+    handle: Handle,
 }
 
 impl LibSqlSecondaryStorage {
     pub async fn connect(config: LibSqlConfig) -> Result<Self> {
-        let database = Arc::new(build_database(config).await?);
-        let connection = database.connect().map_err(libsql_error)?;
         Ok(Self {
-            _database: database,
-            connection,
+            handle: Handle::connect(config).await?,
         })
     }
 
     /// Creates the secondary-storage table. This is intentionally explicit so
     /// connecting to a production database never changes its schema.
     pub async fn migrate(&self) -> Result<()> {
-        self.connection
-            .execute(SECONDARY_STORAGE_DDL, ())
+        let _shared = self.handle.shared().await;
+        self.handle
+            .connection
+            .execute(KV_DDL, ())
             .await
             .map_err(libsql_error)?;
         Ok(())
     }
 
-    fn connection(&self) -> libsql::Connection {
-        self.connection.clone()
+    /// Deletes every expired entry and returns how many were removed. Expired
+    /// entries are otherwise only removed when their key is read again, so a
+    /// long-running service should call this periodically.
+    pub async fn purge_expired(&self) -> Result<u64> {
+        let _shared = self.handle.shared().await;
+        self.handle
+            .connection
+            .execute(KV_PURGE, libsql::params![now_seconds() as i64])
+            .await
+            .map_err(libsql_error)
     }
 }
 
 #[async_trait::async_trait]
 impl SecondaryStorage for LibSqlSecondaryStorage {
     async fn get(&self, key: &str) -> Result<Option<StorageValue>> {
-        let connection = self.connection();
-        read_kv(&connection, key).await
+        let _shared = self.handle.shared().await;
+        let connection = &self.handle.connection;
+        let mut rows = connection
+            .query(KV_GET, libsql::params![key])
+            .await
+            .map_err(libsql_error)?;
+        let Some(row) = rows.next().await.map_err(libsql_error)? else {
+            return Ok(None);
+        };
+        let raw: String = row.get(0).map_err(libsql_error)?;
+        let expires_at: Option<i64> = row.get(1).map_err(libsql_error)?;
+        drop(rows);
+        let now = now_seconds() as i64;
+        let value = sqlite_sql::kv_value(&raw, expires_at, now)?;
+        if value.is_none() {
+            connection
+                .execute(KV_DELETE_EXPIRED, libsql::params![key, now])
+                .await
+                .map_err(libsql_error)?;
+        }
+        Ok(value)
     }
 
     async fn set(&self, key: &str, value: StorageValue) -> Result<()> {
-        let expires_at = value
-            .expires_in
-            .map(|ttl| now_seconds() as i64 + ttl.as_secs() as i64);
-        self.connection()
+        let now = now_seconds() as i64;
+        let expires_at = value.expires_in.map(|ttl| sqlite_sql::expiry(now, ttl));
+        let _shared = self.handle.shared().await;
+        self.handle
+            .connection
             .execute(
-                "INSERT INTO _better_auth_kv(storage_key, value_json, expires_at) VALUES (?1, ?2, ?3) ON CONFLICT(storage_key) DO UPDATE SET value_json = excluded.value_json, expires_at = excluded.expires_at",
-                params_from_iter(vec![
-                    libsql::Value::Text(key.to_owned()),
-                    libsql::Value::Text(value.value.to_string()),
-                    expires_at.map(libsql::Value::Integer).unwrap_or(libsql::Value::Null),
-                ]),
+                KV_SET,
+                libsql::params![key, value.value.to_string(), expires_at],
             )
             .await
             .map_err(libsql_error)?;
@@ -305,472 +462,50 @@ impl SecondaryStorage for LibSqlSecondaryStorage {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        self.connection()
-            .execute(
-                "DELETE FROM _better_auth_kv WHERE storage_key = ?1",
-                params_from_iter(vec![libsql::Value::Text(key.to_owned())]),
-            )
+        let _shared = self.handle.shared().await;
+        self.handle
+            .connection
+            .execute(KV_DELETE, libsql::params![key])
             .await
             .map_err(libsql_error)?;
         Ok(())
     }
 
     async fn increment(&self, key: &str, amount: i64, expires_in: Duration) -> Result<i64> {
-        let connection = self.connection();
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .await
-            .map_err(libsql_error)?;
-        let existing = read_kv(&transaction, key).await?;
-        let current = existing
-            .as_ref()
-            .and_then(|value| value.value.as_i64())
-            .unwrap_or(0);
-        let next = current
-            .checked_add(amount)
-            .ok_or_else(|| AuthError::Adapter("counter overflow".into()))?;
-        let expires_at = existing
-            .and_then(|value| value.expires_in)
-            .map(|ttl| now_seconds() as i64 + ttl.as_secs() as i64)
-            .unwrap_or(now_seconds() as i64 + expires_in.as_secs() as i64);
-        transaction
-            .execute(
-                "INSERT INTO _better_auth_kv(storage_key, value_json, expires_at) VALUES (?1, ?2, ?3) ON CONFLICT(storage_key) DO UPDATE SET value_json = excluded.value_json, expires_at = excluded.expires_at",
-                params_from_iter(vec![
-                    libsql::Value::Text(key.to_owned()),
-                    libsql::Value::Text(Value::from(next).to_string()),
-                    libsql::Value::Integer(expires_at),
-                ]),
+        let now = now_seconds() as i64;
+        let _shared = self.handle.shared().await;
+        let mut rows = self
+            .handle
+            .connection
+            .query(
+                KV_INCREMENT,
+                libsql::params![key, amount, sqlite_sql::expiry(now, expires_in), now],
             )
             .await
             .map_err(libsql_error)?;
-        transaction.commit().await.map_err(libsql_error)?;
-        Ok(next)
+        let Some(row) = rows.next().await.map_err(libsql_error)? else {
+            return Err(AuthError::Adapter("counter overflow".into()));
+        };
+        let raw: String = row.get(0).map_err(libsql_error)?;
+        raw.parse()
+            .map_err(|_| AuthError::Adapter("counter overflow".into()))
     }
 
     async fn get_and_delete(&self, key: &str) -> Result<Option<StorageValue>> {
-        let connection = self.connection();
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        let _shared = self.handle.shared().await;
+        let mut rows = self
+            .handle
+            .connection
+            .query(KV_TAKE, libsql::params![key])
             .await
             .map_err(libsql_error)?;
-        let result = read_kv(&transaction, key).await?;
-        transaction
-            .execute(
-                "DELETE FROM _better_auth_kv WHERE storage_key = ?1",
-                params_from_iter(vec![libsql::Value::Text(key.to_owned())]),
-            )
-            .await
-            .map_err(libsql_error)?;
-        transaction.commit().await.map_err(libsql_error)?;
-        Ok(result)
+        let Some(row) = rows.next().await.map_err(libsql_error)? else {
+            return Ok(None);
+        };
+        let raw: String = row.get(0).map_err(libsql_error)?;
+        let expires_at: Option<i64> = row.get(1).map_err(libsql_error)?;
+        sqlite_sql::kv_value(&raw, expires_at, now_seconds() as i64)
     }
-}
-
-fn record_object(record: &Value) -> Result<&Map<String, Value>> {
-    record
-        .as_object()
-        .ok_or_else(|| AuthError::Adapter("database records must be JSON objects".into()))
-}
-
-fn quote_identifier(identifier: &str) -> Result<String> {
-    if identifier.is_empty()
-        || !identifier
-            .chars()
-            .all(|character| character == '_' || character.is_ascii_alphanumeric())
-    {
-        return Err(AuthError::Adapter(format!(
-            "invalid SQL identifier: {identifier}"
-        )));
-    }
-    Ok(format!("\"{identifier}\""))
-}
-
-fn where_clause(query: &Query) -> Result<(String, Vec<libsql::Value>)> {
-    let mut values = Vec::new();
-    let mut predicates = Vec::new();
-    for filter in &query.filters {
-        let field = quote_identifier(&filter.field)?;
-        match filter.op {
-            FilterOp::Eq
-            | FilterOp::Ne
-            | FilterOp::Lt
-            | FilterOp::Lte
-            | FilterOp::Gt
-            | FilterOp::Gte => {
-                let operator = match filter.op {
-                    FilterOp::Eq => "=",
-                    FilterOp::Ne => "<>",
-                    FilterOp::Lt => "<",
-                    FilterOp::Lte => "<=",
-                    FilterOp::Gt => ">",
-                    FilterOp::Gte => ">=",
-                    FilterOp::In => unreachable!(),
-                };
-                values.push(json_to_libsql(&filter.value, None)?);
-                predicates.push(format!("{field} {operator} ?{}", values.len()));
-            }
-            FilterOp::In => {
-                let Some(items) = filter.value.as_array() else {
-                    return Err(AuthError::Adapter(format!(
-                        "IN filter for {} must contain an array",
-                        filter.field
-                    )));
-                };
-                if items.is_empty() {
-                    predicates.push("1 = 0".into());
-                } else {
-                    let placeholders = items
-                        .iter()
-                        .map(|item| {
-                            values.push(json_to_libsql(item, None)?);
-                            Ok(format!("?{}", values.len()))
-                        })
-                        .collect::<Result<Vec<_>>>()?
-                        .join(", ");
-                    predicates.push(format!("{field} IN ({placeholders})"));
-                }
-            }
-        }
-    }
-    if predicates.is_empty() {
-        Ok((String::new(), values))
-    } else {
-        Ok((format!(" WHERE {}", predicates.join(" AND ")), values))
-    }
-}
-
-fn order_clause(query: &Query) -> Result<String> {
-    if query.order_by.is_empty() {
-        return Ok(" ORDER BY \"id\" ASC".into());
-    }
-    let orders = query
-        .order_by
-        .iter()
-        .map(|order| {
-            let direction = match order.direction {
-                OrderDirection::Asc => "ASC",
-                OrderDirection::Desc => "DESC",
-            };
-            Ok(format!("{} {direction}", quote_identifier(&order.field)?))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(format!(" ORDER BY {}", orders.join(", ")))
-}
-
-fn append_pagination(sql: &mut String, query: &Query, values: &mut Vec<libsql::Value>) {
-    if let Some(limit) = query.limit {
-        values.push(libsql::Value::Integer(limit as i64));
-        sql.push_str(&format!(" LIMIT ?{}", values.len()));
-    } else if query.offset.is_some() {
-        sql.push_str(" LIMIT -1");
-    }
-    if let Some(offset) = query.offset {
-        values.push(libsql::Value::Integer(offset as i64));
-        sql.push_str(&format!(" OFFSET ?{}", values.len()));
-    }
-}
-
-fn renumber_placeholders(sql: &str, offset: usize) -> String {
-    let mut output = String::with_capacity(sql.len());
-    let characters = sql.chars().collect::<Vec<_>>();
-    let mut position = 0;
-    while position < characters.len() {
-        if characters[position] == '?' {
-            position += 1;
-            let start = position;
-            while position < characters.len() && characters[position].is_ascii_digit() {
-                position += 1;
-            }
-            let index = characters[start..position]
-                .iter()
-                .collect::<String>()
-                .parse::<usize>()
-                .unwrap_or(1);
-            output.push_str(&format!("?{}", index + offset));
-        } else {
-            output.push(characters[position]);
-            position += 1;
-        }
-    }
-    output
-}
-
-fn json_to_libsql(value: &Value, field_type: Option<&FieldType>) -> Result<libsql::Value> {
-    if value.is_null() {
-        return Ok(libsql::Value::Null);
-    }
-    match field_type {
-        Some(FieldType::Boolean) => Ok(libsql::Value::Integer(
-            value
-                .as_bool()
-                .ok_or_else(|| AuthError::Adapter("expected a boolean value".into()))?
-                as i64,
-        )),
-        Some(FieldType::Bytes) => Ok(libsql::Value::Blob(
-            value
-                .as_array()
-                .ok_or_else(|| AuthError::Adapter("expected an array of bytes".into()))?
-                .iter()
-                .map(|item| {
-                    item.as_u64()
-                        .and_then(|byte| u8::try_from(byte).ok())
-                        .ok_or_else(|| AuthError::Adapter("invalid byte value".into()))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        )),
-        Some(FieldType::Json) | None if value.is_array() || value.is_object() => Ok(
-            libsql::Value::Text(serde_json::to_string(value).map_err(json_error)?),
-        ),
-        _ => match value {
-            Value::String(value) => Ok(libsql::Value::Text(value.clone())),
-            Value::Bool(value) => Ok(libsql::Value::Integer(*value as i64)),
-            Value::Number(value) => value
-                .as_i64()
-                .map(libsql::Value::Integer)
-                .or_else(|| value.as_f64().map(libsql::Value::Real))
-                .ok_or_else(|| AuthError::Adapter("unsupported JSON number".into())),
-            Value::Array(_) | Value::Object(_) => Ok(libsql::Value::Text(
-                serde_json::to_string(value).map_err(json_error)?,
-            )),
-            Value::Null => Ok(libsql::Value::Null),
-        },
-    }
-}
-
-fn row_to_json(row: &libsql::Row, table: &str, schema: &SchemaExtension) -> Result<Value> {
-    let mut object = Map::new();
-    for index in 0..row.column_count() {
-        let name = row
-            .column_name(index)
-            .ok_or_else(|| AuthError::Adapter("libSQL row is missing a column name".into()))?;
-        let field_type = schema
-            .tables
-            .get(table)
-            .and_then(|table| table.fields.get(name))
-            .map(|field| &field.field_type);
-        object.insert(
-            name.to_owned(),
-            sql_to_json(row.get_value(index).map_err(libsql_error)?, field_type)?,
-        );
-    }
-    Ok(Value::Object(object))
-}
-
-fn sql_to_json(value: libsql::Value, field_type: Option<&FieldType>) -> Result<Value> {
-    match value {
-        libsql::Value::Null => Ok(Value::Null),
-        libsql::Value::Integer(value) if matches!(field_type, Some(FieldType::Boolean)) => {
-            Ok(Value::Bool(value != 0))
-        }
-        libsql::Value::Integer(value) => Ok(Value::Number(value.into())),
-        libsql::Value::Real(value) => Ok(Number::from_f64(value)
-            .map(Value::Number)
-            .unwrap_or(Value::Null)),
-        libsql::Value::Text(value) => {
-            if matches!(field_type, Some(FieldType::Json)) {
-                serde_json::from_str(&value).map_err(json_error)
-            } else {
-                Ok(Value::String(value))
-            }
-        }
-        libsql::Value::Blob(value) => {
-            Ok(Value::Array(value.into_iter().map(Value::from).collect()))
-        }
-    }
-}
-
-fn insert_statement(
-    table: &str,
-    object: &Map<String, Value>,
-    schema: &SchemaExtension,
-) -> Result<(String, Vec<libsql::Value>)> {
-    let mut fields = object.keys().cloned().collect::<Vec<_>>();
-    fields.sort();
-    let quoted_fields = fields
-        .iter()
-        .map(|field| quote_identifier(field))
-        .collect::<Result<Vec<_>>>()?
-        .join(", ");
-    let placeholders = (1..=fields.len())
-        .map(|index| format!("?{index}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let values = fields
-        .iter()
-        .map(|field| {
-            json_to_libsql(
-                object
-                    .get(field)
-                    .ok_or_else(|| AuthError::Adapter("record field disappeared".into()))?,
-                schema
-                    .tables
-                    .get(table)
-                    .and_then(|table| table.fields.get(field))
-                    .map(|field| &field.field_type),
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok((
-        format!(
-            "INSERT INTO {} ({quoted_fields}) VALUES ({placeholders})",
-            quote_identifier(table)?
-        ),
-        values,
-    ))
-}
-
-fn update_statement(
-    table: &str,
-    query: Query,
-    changes: &Map<String, Value>,
-    schema: &SchemaExtension,
-) -> Result<(String, Vec<libsql::Value>)> {
-    let mut fields = changes.keys().cloned().collect::<Vec<_>>();
-    fields.sort();
-    let (where_sql, where_values) = where_clause(&query)?;
-    let assignments = fields
-        .iter()
-        .enumerate()
-        .map(|(index, field)| Ok(format!("{} = ?{}", quote_identifier(field)?, index + 1)))
-        .collect::<Result<Vec<_>>>()?
-        .join(", ");
-    let mut values = fields
-        .iter()
-        .map(|field| {
-            json_to_libsql(
-                changes
-                    .get(field)
-                    .ok_or_else(|| AuthError::Adapter("change field disappeared".into()))?,
-                schema
-                    .tables
-                    .get(table)
-                    .and_then(|table| table.fields.get(field))
-                    .map(|field| &field.field_type),
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    values.extend(where_values);
-    Ok((
-        format!(
-            "UPDATE {} SET {assignments}{}",
-            quote_identifier(table)?,
-            renumber_placeholders(&where_sql, fields.len())
-        ),
-        values,
-    ))
-}
-
-async fn apply_transaction_operation(
-    connection: &libsql::Connection,
-    operation: DbOperation,
-    schema: &SchemaExtension,
-) -> Result<()> {
-    match operation {
-        DbOperation::Insert { table, id, record } => {
-            let record = record_with_id(record, &id)?;
-            let (sql, values) = insert_statement(&table, record_object(&record)?, schema)?;
-            connection
-                .execute(&sql, params_from_iter(values))
-                .await
-                .map_err(libsql_error)?;
-        }
-        DbOperation::InsertRecord { table, record } => {
-            let (sql, values) = insert_statement(&table, record_object(&record)?, schema)?;
-            connection
-                .execute(&sql, params_from_iter(values))
-                .await
-                .map_err(libsql_error)?;
-        }
-        DbOperation::Update { table, id, record } => {
-            let (sql, values) = update_statement(
-                &table,
-                Query::new().eq("id", id),
-                record_object(&record)?,
-                schema,
-            )?;
-            if connection
-                .execute(&sql, params_from_iter(values))
-                .await
-                .map_err(libsql_error)?
-                == 0
-            {
-                return Err(AuthError::NotFound);
-            }
-        }
-        DbOperation::UpdateWhere {
-            table,
-            query,
-            changes,
-        } => {
-            let (sql, values) = update_statement(&table, query, record_object(&changes)?, schema)?;
-            connection
-                .execute(&sql, params_from_iter(values))
-                .await
-                .map_err(libsql_error)?;
-        }
-        DbOperation::Delete { table, id } => {
-            let (where_sql, values) = where_clause(&Query::new().eq("id", id))?;
-            connection
-                .execute(
-                    &format!("DELETE FROM {}{where_sql}", quote_identifier(&table)?),
-                    params_from_iter(values),
-                )
-                .await
-                .map_err(libsql_error)?;
-        }
-        DbOperation::DeleteWhere { table, query } => {
-            let (where_sql, values) = where_clause(&query)?;
-            connection
-                .execute(
-                    &format!("DELETE FROM {}{where_sql}", quote_identifier(&table)?),
-                    params_from_iter(values),
-                )
-                .await
-                .map_err(libsql_error)?;
-        }
-    }
-    Ok(())
-}
-
-fn record_with_id(record: Value, id: &str) -> Result<Value> {
-    let Value::Object(mut object) = record else {
-        return Err(AuthError::Adapter(
-            "database records must be JSON objects".into(),
-        ));
-    };
-    object.insert("id".into(), Value::String(id.to_owned()));
-    Ok(Value::Object(object))
-}
-
-async fn read_kv(connection: &libsql::Connection, key: &str) -> Result<Option<StorageValue>> {
-    let mut rows = connection
-        .query(
-            "SELECT value_json, expires_at FROM _better_auth_kv WHERE storage_key = ?1",
-            params_from_iter(vec![libsql::Value::Text(key.to_owned())]),
-        )
-        .await
-        .map_err(libsql_error)?;
-    let Some(row) = rows.next().await.map_err(libsql_error)? else {
-        return Ok(None);
-    };
-    let raw: String = row.get(0).map_err(libsql_error)?;
-    let expires_at: Option<i64> = row.get(1).map_err(libsql_error)?;
-    let now = now_seconds() as i64;
-    if expires_at.is_some_and(|expires_at| expires_at <= now) {
-        connection
-            .execute(
-                "DELETE FROM _better_auth_kv WHERE storage_key = ?1",
-                params_from_iter(vec![libsql::Value::Text(key.to_owned())]),
-            )
-            .await
-            .map_err(libsql_error)?;
-        return Ok(None);
-    }
-    Ok(Some(StorageValue {
-        value: serde_json::from_str(&raw).map_err(json_error)?,
-        expires_in: expires_at.map(|expires_at| Duration::from_secs((expires_at - now) as u64)),
-    }))
 }
 
 fn libsql_error(error: libsql::Error) -> AuthError {

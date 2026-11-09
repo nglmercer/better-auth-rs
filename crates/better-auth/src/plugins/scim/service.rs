@@ -17,6 +17,9 @@ use serde_json::json;
 use std::{collections::HashSet, sync::Arc};
 use uuid::Uuid;
 
+/// How many user ids one `IN (...)` lookup carries.
+const USER_ID_BATCH: usize = 500;
+
 #[derive(Clone)]
 pub struct ScimService {
     adapter: Arc<dyn DbAdapter>,
@@ -324,7 +327,10 @@ impl ScimService {
         }
         let groups = self
             .adapter
-            .find_many("scim_group", Query::new())
+            .find_many(
+                "scim_group",
+                Query::new().eq("organization_id", organization_id.to_owned()),
+            )
             .await?
             .into_iter()
             .filter_map(|value| serde_json::from_value::<ScimGroup>(value).ok())
@@ -467,16 +473,27 @@ impl ScimService {
             ));
         }
         let predicate = ScimFilter::parse(filter)?;
-        let members = self.member_ids(organization_id).await?;
-        let mut records = self
-            .adapter
-            .find_many("user", Query::new())
+        // Read only this organization's members, not the whole user table.
+        // The ids go in bounded batches to stay under bind-parameter limits.
+        let mut members = self
+            .member_ids(organization_id)
             .await?
             .into_iter()
-            .filter(|user| predicate.matches(user))
-            .map(|user| Ok((record_id(&user)?, user)))
-            .collect::<Result<Vec<_>>>()?;
-        records.retain(|(id, _)| members.contains(id));
+            .collect::<Vec<_>>();
+        members.sort();
+        let mut records = Vec::new();
+        for batch in members.chunks(USER_ID_BATCH) {
+            for user in self
+                .adapter
+                .find_many("user", Query::new().is_in("id", batch.to_vec()))
+                .await?
+            {
+                if predicate.matches(&user) {
+                    records.push((record_id(&user)?, user));
+                }
+            }
+        }
+        records.sort_by(|left, right| left.0.cmp(&right.0));
         if let Some(sort_by) = sort_by {
             let sort_by = normalize_scim_attribute(sort_by)?;
             records.sort_by(|left, right| {

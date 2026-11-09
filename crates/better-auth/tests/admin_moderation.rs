@@ -375,3 +375,33 @@ async fn a_ban_locks_a_live_session_even_if_its_sessions_were_not_deleted() {
     .unwrap();
     assert!(!has_session(&router, &cookie).await);
 }
+
+/// Applications resolve sessions through `SessionService` (the axum extractor
+/// does), not through the router. A ban must hold there too.
+#[tokio::test]
+async fn a_ban_locks_a_live_session_for_direct_session_resolution() {
+    let db = Arc::new(MemoryDb::default());
+    let router = router(db.clone());
+    let sessions = better_auth::session::SessionService::new(router.context().clone()).unwrap();
+    let (cookie, user_id) = sign_up(&router, "direct@example.com").await;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::COOKIE, cookie.parse().unwrap());
+    assert!(sessions.resolve(&headers, true).await.unwrap().is_some());
+    db.update_where(
+        "user",
+        Query::new().eq("id", user_id.clone()),
+        json!({"banned": true}),
+    )
+    .await
+    .unwrap();
+    assert!(sessions.resolve(&headers, true).await.unwrap().is_none());
+    // An expired ban no longer applies.
+    db.update_where(
+        "user",
+        Query::new().eq("id", user_id),
+        json!({"ban_expires": 1}),
+    )
+    .await
+    .unwrap();
+    assert!(sessions.resolve(&headers, true).await.unwrap().is_some());
+}

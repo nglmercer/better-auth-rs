@@ -1,8 +1,11 @@
+#[cfg(any(feature = "sqlite", feature = "libsql", feature = "sqlx"))]
 mod common;
 #[cfg(feature = "libsql")]
 mod libsql;
 #[cfg(feature = "sqlite")]
 mod sqlite;
+#[cfg(any(feature = "sqlite", feature = "libsql"))]
+mod sqlite_sql;
 #[cfg(feature = "sqlx")]
 mod sqlx;
 
@@ -16,7 +19,9 @@ pub use sqlx::{
     SqlxBackend, SqlxDbAdapter, SqlxSecondaryStorage,
 };
 
+// The shared helpers and imports serve whichever adapter features are enabled.
 #[cfg(test)]
+#[allow(dead_code, unused_imports)]
 mod tests {
     use super::*;
     use better_auth_core::adapter::{DbAdapter, DbOperation, OrderBy, Query, SecondaryStorage};
@@ -171,6 +176,153 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(storage.get(&expiring_key).await.unwrap().is_none());
+    }
+
+    /// Counter and expiry rules every SQLite-dialect store must share.
+    #[cfg(any(feature = "sqlite", feature = "libsql"))]
+    async fn kv_counter_rules(storage: &dyn SecondaryStorage) {
+        use better_auth_core::StorageValue;
+        let window = Duration::from_secs(60);
+
+        // An expired counter restarts instead of continuing the old count.
+        storage
+            .set("expired", StorageValue::with_ttl(41.into(), Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(storage.increment("expired", 1, window).await.unwrap(), 1);
+        assert_eq!(storage.increment("expired", 1, window).await.unwrap(), 2);
+
+        // A value without an expiry gains the window on its first increment.
+        storage
+            .set("permanent", StorageValue::permanent(5.into()))
+            .await
+            .unwrap();
+        assert_eq!(storage.increment("permanent", 2, window).await.unwrap(), 7);
+        let stored = storage.get("permanent").await.unwrap().unwrap();
+        assert_eq!(stored.value, Value::from(7));
+        assert!(stored.expires_in.is_some_and(|ttl| ttl <= window));
+
+        // Overflow is an error and leaves the stored value untouched.
+        storage
+            .set("full", StorageValue::permanent(i64::MAX.into()))
+            .await
+            .unwrap();
+        assert!(storage.increment("full", 1, window).await.is_err());
+        assert_eq!(
+            storage.get("full").await.unwrap().unwrap().value,
+            Value::from(i64::MAX)
+        );
+
+        // An expired entry cannot be taken.
+        storage
+            .set("stale", StorageValue::with_ttl("x".into(), Duration::ZERO))
+            .await
+            .unwrap();
+        assert!(storage.get_and_delete("stale").await.unwrap().is_none());
+        assert!(storage.get("stale").await.unwrap().is_none());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_secondary_storage_counter_rules_and_purge() {
+        let storage = SqliteSecondaryStorage::in_memory().unwrap();
+        storage.migrate().unwrap();
+        kv_counter_rules(&storage).await;
+        for key in ["gone-1", "gone-2"] {
+            storage
+                .set(
+                    key,
+                    better_auth_core::StorageValue::with_ttl(1.into(), Duration::ZERO),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(storage.purge_expired().unwrap(), 2);
+        assert_eq!(storage.purge_expired().unwrap(), 0);
+        assert!(storage.get("permanent").await.unwrap().is_some());
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn libsql_secondary_storage_counter_rules_and_purge() {
+        let storage = LibSqlSecondaryStorage::connect(LibSqlConfig::Local {
+            path: ":memory:".into(),
+        })
+        .await
+        .unwrap();
+        storage.migrate().await.unwrap();
+        kv_counter_rules(&storage).await;
+        for key in ["gone-1", "gone-2"] {
+            storage
+                .set(
+                    key,
+                    better_auth_core::StorageValue::with_ttl(1.into(), Duration::ZERO),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(storage.purge_expired().await.unwrap(), 2);
+        assert_eq!(storage.purge_expired().await.unwrap(), 0);
+        assert!(storage.get("permanent").await.unwrap().is_some());
+    }
+
+    /// The adapter and the secondary storage may each hold their own
+    /// connection to one database file and write to it at the same time.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_adapter_and_storage_share_a_file_under_concurrent_writes() {
+        let path =
+            std::env::temp_dir().join(format!("better-auth-shared-{}.db", uuid::Uuid::new_v4()));
+        let adapter = Arc::new(SqliteDbAdapter::open(&path).unwrap());
+        adapter.enable_wal().unwrap();
+        adapter
+            .apply_migrations(&MigrationPlan::from_schema(
+                &better_auth_core::schema::core_schema(),
+            ))
+            .await
+            .unwrap();
+        let storage = Arc::new(SqliteSecondaryStorage::open(&path).unwrap());
+        storage.enable_wal().unwrap();
+        storage.migrate().unwrap();
+        let mut tasks = Vec::new();
+        for index in 0..32 {
+            let adapter = Arc::clone(&adapter);
+            let storage = Arc::clone(&storage);
+            tasks.push(tokio::spawn(async move {
+                adapter
+                    .insert_record(
+                        "user",
+                        serde_json::json!({
+                            "id": format!("shared-{index}"),
+                            "email": format!("shared-{index}@example.com"),
+                            "name": "Shared",
+                            "email_verified": true,
+                            "additional_fields": {"index": index}
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                storage
+                    .increment("hits", 1, Duration::from_secs(60))
+                    .await
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let users = adapter.find_many("user", Query::new()).await.unwrap();
+        assert_eq!(users.len(), 32);
+        assert_eq!(users[0]["email_verified"], true);
+        assert!(users[0]["additional_fields"]["index"].is_number());
+        assert_eq!(
+            storage.get("hits").await.unwrap().unwrap().value,
+            Value::from(32)
+        );
+        drop((adapter, storage));
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[cfg(feature = "sqlite")]
@@ -440,6 +592,82 @@ mod tests {
         storage.migrate().await.unwrap();
         secondary_storage_conformance(Arc::new(storage)).await;
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A local libSQL handle is one SQLite connection. Statements from other
+    /// tasks must not land inside an open transaction, and two transactions
+    /// must not try to nest on the same handle.
+    #[cfg(feature = "libsql")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn libsql_local_transactions_are_isolated_from_concurrent_tasks() {
+        let adapter = Arc::new(LibSqlDbAdapter::local(":memory:").await.unwrap());
+        adapter
+            .apply_migrations(&MigrationPlan::from_schema(
+                &better_auth_core::schema::core_schema(),
+            ))
+            .await
+            .unwrap();
+        let storage = adapter.secondary_storage();
+        storage.migrate().await.unwrap();
+        let storage: Arc<dyn SecondaryStorage> = Arc::new(storage);
+        let user = |id: String| {
+            serde_json::json!({
+                "id": id,
+                "email": format!("{id}@example.com"),
+                "name": id,
+                "email_verified": false,
+                "additional_fields": {}
+            })
+        };
+        let mut tasks = Vec::new();
+        for index in 0..64 {
+            let adapter = Arc::clone(&adapter);
+            let storage = Arc::clone(&storage);
+            tasks.push(tokio::spawn(async move {
+                // A transaction that always rolls back, racing the writes below.
+                let rolled_back = adapter
+                    .transaction(vec![
+                        DbOperation::InsertRecord {
+                            table: "user".into(),
+                            record: user(format!("doomed-{index}")),
+                        },
+                        DbOperation::Update {
+                            table: "user".into(),
+                            id: "missing".into(),
+                            record: serde_json::json!({"name": "x"}),
+                        },
+                    ])
+                    .await;
+                assert!(matches!(
+                    rolled_back,
+                    Err(better_auth_core::error::AuthError::NotFound)
+                ));
+                adapter
+                    .insert_record("user", user(format!("kept-{index}")))
+                    .await
+                    .unwrap();
+                adapter
+                    .transaction(vec![DbOperation::InsertRecord {
+                        table: "user".into(),
+                        record: user(format!("committed-{index}")),
+                    }])
+                    .await
+                    .unwrap();
+                storage
+                    .increment("shared", 1, Duration::from_secs(60))
+                    .await
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let rows = adapter.find_many("user", Query::new()).await.unwrap();
+        assert_eq!(rows.len(), 128, "every acknowledged write must persist");
+        assert_eq!(
+            storage.get("shared").await.unwrap().unwrap().value,
+            Value::from(64)
+        );
     }
 
     #[cfg(feature = "libsql")]

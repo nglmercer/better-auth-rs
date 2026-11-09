@@ -220,10 +220,7 @@ fn verification_key(purpose: &str, token: &str) -> String {
 }
 
 fn hash_token(token: &str) -> String {
-    Sha256::digest(token.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    data_encoding::HEXLOWER.encode(&Sha256::digest(token.as_bytes()))
 }
 
 fn now_seconds() -> u64 {

@@ -62,7 +62,7 @@ impl Plugin for PasskeyPlugin {
             "passkey",
             TableSchema::default()
                 .field("id", required(FieldType::String).unique())
-                .field("user_id", required(FieldType::String))
+                .field("user_id", required(FieldType::String).indexed())
                 .field("name", optional(FieldType::String))
                 .field("credential_id", required(FieldType::String).unique())
                 // The whole webauthn-rs credential, including the public key and

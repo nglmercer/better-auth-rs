@@ -136,6 +136,13 @@ fn ban_is_active(user: &Value, now: u64) -> bool {
             .is_none_or(|expires| expires > now)
 }
 
+/// Whether an already-loaded `user` row carries an active ban. Lets session
+/// resolution enforce bans on the row it has to read anyway.
+pub(crate) fn user_record_is_banned(context: &AuthContext, user: &Value) -> bool {
+    crate::email_password::has_plugin(context, ADMIN_PLUGIN_NAME)
+        && ban_is_active(user, now_seconds())
+}
+
 /// Whether `user_id` may not sign in or use a session right now. Without the
 /// admin plugin no bans exist, so this costs no query.
 pub(crate) async fn account_is_banned(context: &AuthContext, user_id: &str) -> Result<bool> {

@@ -53,14 +53,14 @@ impl Plugin for ScimPlugin {
                 TableSchema::default()
                     .field("id", required(FieldType::String).unique())
                     .field("display_name", required(FieldType::String))
-                    .field("organization_id", required(FieldType::String)),
+                    .field("organization_id", required(FieldType::String).indexed()),
             )
             .table(
                 "scim_group_member",
                 TableSchema::default()
                     .field("id", required(FieldType::String).unique())
-                    .field("group_id", required(FieldType::String))
-                    .field("user_id", required(FieldType::String)),
+                    .field("group_id", required(FieldType::String).indexed())
+                    .field("user_id", required(FieldType::String).indexed()),
             )
     }
 }
