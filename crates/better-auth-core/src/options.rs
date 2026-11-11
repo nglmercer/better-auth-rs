@@ -142,6 +142,21 @@ impl Default for PasswordHashOptions {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
+impl PasswordHashOptions {
+    /// Scrypt parameters with a negligible work factor (log2(N) = 4, 16 KiB), for
+    /// test suites that sign users up and in many times. A hash made with these
+    /// values is trivial to brute-force; never use them outside tests. Existing
+    /// hashes keep verifying with their own stored parameters.
+    pub fn fast_for_tests() -> Self {
+        Self {
+            scrypt_log_n: 4,
+            scrypt_r: 8,
+            scrypt_p: 1,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct AuthOptions {
     pub base_url: Option<BaseUrl>,

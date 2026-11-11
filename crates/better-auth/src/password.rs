@@ -213,6 +213,27 @@ mod tests {
         assert!(verify_password("password", &hash).unwrap());
     }
 
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn fast_test_parameters_verify_and_are_cheaper_than_the_default() {
+        let fast = PasswordHashOptions::fast_for_tests();
+        assert!(fast.scrypt_log_n < PasswordHashOptions::default().scrypt_log_n);
+        let hash = hash_password_with_options("password", &fast).unwrap();
+        assert!(hash.contains("ln=4"));
+        assert!(verify_password("password", &hash).unwrap());
+        assert!(!verify_password("other", &hash).unwrap());
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[tokio::test]
+    async fn fast_test_hashes_are_upgraded_by_a_default_cost_provider() {
+        let fast = ScryptPhcPasswordProvider::new(PasswordHashOptions::fast_for_tests());
+        let current = ScryptPhcPasswordProvider::new(PasswordHashOptions::default());
+        let encoded = fast.hash("password").await.unwrap();
+        let result = current.verify("password", &encoded).await.unwrap();
+        assert!(result.valid && result.needs_rehash);
+    }
+
     #[tokio::test]
     async fn provider_marks_successful_hashes_for_rehash() {
         let old = ScryptPhcPasswordProvider::new(PasswordHashOptions {

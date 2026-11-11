@@ -24,6 +24,11 @@ data (password hashes, signed envelopes, database schema) are marked **Compatibi
 - **Provider tokens are no longer retained by default.** Google sign-in stores nothing from the provider unless `OAuthService::with_provider_token_retention()` is enabled. When it is enabled, only the access token and its expiry are sealed. Refresh and ID tokens are dropped, and nothing reads the stored token back.
 
 ### Added
+- `PasswordHashOptions::fast_for_tests()`, available only with the `test-utils` feature (now also
+  exposed by `better-auth-core`). It returns scrypt parameters with a negligible work factor so
+  test suites that sign users up and in many times do not pay for 32 MiB hashes. Set it through
+  `AuthOptions::password_hash`. Never enable the feature in production. Hashes made with it still
+  verify, and a default-cost provider reports them as needing a rehash.
 - `examples/sqlite-turso.rs`: the email/password flow, session resolution and rate limiting on
   SQLite, a local libSQL file, or a remote Turso database.
 - `SqliteDbAdapter::enable_wal` and `SqliteSecondaryStorage::enable_wal` switch a file database to

@@ -15,7 +15,7 @@ libsql = ["dep:libsql", "dep:secrecy"]
 saml = ["dep:saml-rs"]
 siwe = ["dep:k256", "dep:sha3"]
 # Test-only fixtures, such as HTTP OAuth providers on localhost. Never enable in production.
-test-utils = []
+test-utils = ["better-auth-core/test-utils"]
 
 [dependencies]
 aes-gcm.workspace = true
