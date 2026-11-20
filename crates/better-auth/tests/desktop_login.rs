@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Native (desktop) login, end to end and in its negative cases.
 //!
 //! The happy path runs the whole flow: a loopback callback receiver, a browser-style

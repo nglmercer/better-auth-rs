@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Takeover by pre-registration. An attacker signs up with a victim's address and a password, and
 //! the account is not yet verified. When the victim proves the mailbox with a code, the attacker's
 //! password and sessions must stop working.

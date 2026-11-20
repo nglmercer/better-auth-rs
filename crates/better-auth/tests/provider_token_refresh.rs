@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Refresh and revocation of provider tokens against a local token/revocation fixture.
 //! The library keeps no refresh token itself; these tests call it with one the caller holds.
 

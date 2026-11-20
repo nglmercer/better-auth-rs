@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Administrator moderation over HTTP: bans, unbans, session listing and
 //! revocation, and removal. A ban must end access immediately and keep it ended.
 

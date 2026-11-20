@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Abuse cases that must fail: session fixation, and client-address spoofing when no proxy is
 //! trusted. Each test states the attacker's move and checks that the server refuses it.
 

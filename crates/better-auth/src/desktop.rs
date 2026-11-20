@@ -12,23 +12,28 @@
 //! A code that fails verification is still consumed. A legitimate client must then start
 //! over, which keeps an intercepted code from being retried.
 
+#[cfg(feature = "full")]
 use crate::{
     context::AuthContext,
     email_password::{AuthResult, User},
     session::SessionService,
 };
+#[cfg(feature = "full")]
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use better_auth_core::{
-    adapter::{Query, SecondaryStorage, StorageValue},
-    error::{AuthError, Result},
-};
+#[cfg(feature = "full")]
+use better_auth_core::adapter::{Query, SecondaryStorage, StorageValue};
+use better_auth_core::error::{AuthError, Result};
+#[cfg(feature = "full")]
 use http::HeaderMap;
+#[cfg(feature = "full")]
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "full")]
 use sha2::{Digest, Sha256};
+use std::{collections::HashMap, time::Duration};
+#[cfg(feature = "full")]
 use std::{
-    collections::HashMap,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
 use tokio::{
@@ -37,10 +42,12 @@ use tokio::{
     sync::oneshot,
 };
 use url::Url;
+#[cfg(feature = "full")]
 use uuid::Uuid;
 
 /// Longest lifetime a handoff code may be given.
 pub const HANDOFF_MAX_TTL: Duration = Duration::from_secs(120);
+#[cfg(feature = "full")]
 const HANDOFF_PREFIX: &str = "desktop:handoff:";
 const MAX_HEAD_BYTES: usize = 8 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -88,6 +95,7 @@ pub fn loopback_callback_url(redirect_uri: &str, code: &str, state: &str) -> Res
     Ok(url.to_string())
 }
 
+#[cfg(feature = "full")]
 fn valid_verifier(verifier: &str) -> bool {
     // RFC 7636: 43 to 128 unreserved characters.
     (43..=128).contains(&verifier.len())
@@ -96,6 +104,7 @@ fn valid_verifier(verifier: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"-._~".contains(&byte))
 }
 
+#[cfg(feature = "full")]
 fn valid_challenge(challenge: &str) -> bool {
     // An S256 challenge is the 32-byte SHA-256 digest, base64url-encoded without padding.
     challenge.len() == 43
@@ -104,6 +113,7 @@ fn valid_challenge(challenge: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+#[cfg(feature = "full")]
 fn s256(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
@@ -298,6 +308,7 @@ pub struct RedeemRequest {
     pub code_verifier: String,
 }
 
+#[cfg(feature = "full")]
 #[derive(Serialize, Deserialize)]
 struct HandoffRecord {
     user_id: String,
@@ -307,6 +318,7 @@ struct HandoffRecord {
     expires_at: u64,
 }
 
+#[cfg(feature = "full")]
 fn handoff_key(code: &str) -> String {
     let digest = Sha256::digest(code.as_bytes());
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -314,12 +326,14 @@ fn handoff_key(code: &str) -> String {
 }
 
 /// Issues and redeems single-use handoff codes. Requires secondary storage.
+#[cfg(feature = "full")]
 #[derive(Clone)]
 pub struct DesktopHandoffService {
     context: AuthContext,
     storage: Arc<dyn SecondaryStorage>,
 }
 
+#[cfg(feature = "full")]
 impl DesktopHandoffService {
     pub fn new(context: AuthContext) -> Result<Self> {
         let storage = context.secondary_storage.clone().ok_or_else(|| {
@@ -420,6 +434,7 @@ impl DesktopHandoffService {
     }
 }
 
+#[cfg(feature = "full")]
 fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -455,6 +470,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "full")]
     #[test]
     fn pkce_shapes_are_checked_before_use() {
         let verifier = "a".repeat(43);
@@ -471,6 +487,7 @@ mod tests {
         assert_eq!(url, "http://127.0.0.1:5000/cb?code=code-1&state=state-1");
     }
 
+    #[cfg(feature = "full")]
     #[test]
     fn stored_handoff_keys_do_not_contain_the_code() {
         let key = handoff_key("secret-code");

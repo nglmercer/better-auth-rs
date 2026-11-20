@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! SCIM Users over HTTP. Each organization's bearer token sees and changes only its own
 //! members, a shared user cannot be changed from one organization, and no SCIM request
 //! can set a role.

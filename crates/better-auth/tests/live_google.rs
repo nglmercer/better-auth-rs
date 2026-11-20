@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Live checks against Google's public OpenID metadata and signing keys.
 //!
 //! These need no credentials and send nothing private: they read Google's public discovery

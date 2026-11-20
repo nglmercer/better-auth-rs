@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! The central access table: every documented route has a stated requirement, anonymous
 //! callers are refused everywhere a session is required, and non-administrators are refused
 //! on every admin route except the permission check.

@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! OIDC signing-key lifecycle for the Google-style provider path, against a local
 //! JWKS and token fixture. No live provider is contacted.
 //!

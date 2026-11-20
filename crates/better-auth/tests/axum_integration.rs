@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! An independent-style Axum application that mounts Better Auth, registers Google,
 //! and protects its own routes. The application is served on a local port and called
 //! over HTTP, so the extractors, CSRF policy and routing are exercised as a client

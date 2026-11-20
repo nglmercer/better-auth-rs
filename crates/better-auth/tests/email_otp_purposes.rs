@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Emailed codes by purpose: sign-in, email verification and password reset.
 //! Each code works once, for the purpose it was issued for, and only a limited
 //! number of wrong guesses are allowed.

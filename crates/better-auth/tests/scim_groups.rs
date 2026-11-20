@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! SCIM Groups over HTTP. A group belongs to one organization. Its members are that
 //! organization's members, and another organization's token cannot see or change it.
 

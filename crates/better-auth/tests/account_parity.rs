@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Account routes that match upstream paths: password re-verification, username
 //! availability, two-factor URI and backup codes, unlinking, and `/ok`.
 

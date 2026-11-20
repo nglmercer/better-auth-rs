@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! End-to-end passkey ceremonies through the public HTTP surface, using a
 //! software authenticator: a P-256 key that produces "none" attestations and
 //! ES256 assertions, the same bytes a platform authenticator would send.

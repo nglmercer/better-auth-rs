@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Organization teams over HTTP: creating and renaming teams, adding and removing
 //! members, scoping by organization, and cleanup when someone leaves.
 

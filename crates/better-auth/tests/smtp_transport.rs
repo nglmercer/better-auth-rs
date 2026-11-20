@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! The SMTP transport against the in-process mock server, so delivery is tested
 //! end to end without a real mail server.
 

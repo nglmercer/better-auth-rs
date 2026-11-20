@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Session lifecycle against live PostgreSQL and MySQL servers. Each runs only when its
 //! URL variable is set (`BETTER_AUTH_TEST_POSTGRES_URL`, `BETTER_AUTH_TEST_MYSQL_URL`), and
 //! uses fresh random emails so the database can be reused between runs.

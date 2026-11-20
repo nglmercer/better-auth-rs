@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Full OAuth flows against fixture providers on localhost.
 //!
 //! The fixture runs a token endpoint and two userinfo endpoints, one reporting a

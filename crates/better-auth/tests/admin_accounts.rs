@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Administrator account operations over HTTP: creating, reading and updating users,
 //! setting passwords, and permission checks that match what the role can do.
 

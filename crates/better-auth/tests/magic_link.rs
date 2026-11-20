@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Magic-link sign-in: the GET confirmation page changes nothing, the POST signs in
 //! and redirects only to a path on this site, and foreign origins are refused.
 

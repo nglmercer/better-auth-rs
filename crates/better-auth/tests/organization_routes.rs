@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Organization management over HTTP: reading and updating an organization, slugs,
 //! invitations (list, cancel, reject, accept), leaving, and deleting.
 

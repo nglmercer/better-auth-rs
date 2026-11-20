@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Property checks on parameter parsing. A deterministic generator (a fixed seed, so a failure
 //! reproduces exactly) builds hostile strings: control characters, quotes, percent escapes,
 //! separators, multibyte text, and long values. Every public route must answer them with a client

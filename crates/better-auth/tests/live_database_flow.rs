@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Account and second-factor flows against live PostgreSQL and MySQL servers.
 //!
 //! Each test runs only when its URL variable is set:

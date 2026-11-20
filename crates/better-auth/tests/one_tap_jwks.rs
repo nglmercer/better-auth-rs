@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Google One Tap with signing keys from a JWKS endpoint, against a local fixture.
 //! Covers the same key lifecycle as the OAuth path: rotation after startup, unknown
 //! keys, a broken endpoint at startup, plus One Tap's own replay and email rules.

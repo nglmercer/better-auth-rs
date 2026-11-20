@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Server-side request forgery: OAuth provider endpoints must point at public HTTPS hosts.
 //! A misconfigured or hostile endpoint must never make the server call its own network.
 

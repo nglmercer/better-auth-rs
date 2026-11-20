@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! OAuth sign-in against a live PostgreSQL server. Runs only when
 //! `BETTER_AUTH_TEST_POSTGRES_URL` is set. The provider is a fixture; no network is used.
 

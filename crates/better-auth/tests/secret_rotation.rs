@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Rotating the secret does not lock anyone out of a second factor. A factor enrolled under an
 //! old secret keeps working, and it is re-sealed under the current secret the first time it is used.
 

@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Backward-compatibility fixtures.
 //!
 //! Each fixture was produced by an earlier build and is checked in. A change

@@ -7,50 +7,74 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["axum", "sqlite"]
-axum = ["dep:axum"]
-sqlite = ["dep:rusqlite"]
-sqlx = ["dep:sqlx"]
-libsql = ["dep:libsql", "dep:secrecy"]
-saml = ["dep:saml-rs"]
-siwe = ["dep:k256", "dep:sha3"]
+default = ["full", "axum", "sqlite"]
+# Server runtime: identity, sessions, passkeys, JWT/OIDC, HTTP clients, password
+# hashing and cookie encryption. Pulls in everything that is not needed to talk
+# to Better Auth from a client, so it is off for `desktop`.
+full = [
+    "dep:aes-gcm",
+    "dep:async-trait",
+    "dep:data-encoding",
+    "dep:getrandom",
+    "dep:hmac",
+    "dep:http",
+    "dep:jsonwebtoken",
+    "dep:password-hash",
+    "dep:reqwest",
+    "dep:rsa",
+    "dep:scrypt",
+    "dep:sha1",
+    "dep:tokio-rustls",
+    "dep:tracing",
+    "dep:webauthn-rs",
+    "dep:webpki-roots",
+]
+# Client-side helpers for desktop and mobile apps: loopback OAuth callback
+# receiver and redirect validation. Requires no server-only dependency.
+desktop = []
+axum = ["full", "dep:axum"]
+sqlite = ["full", "dep:rusqlite"]
+sqlx = ["full", "dep:sqlx"]
+libsql = ["full", "dep:libsql", "dep:secrecy"]
+saml = ["full", "dep:saml-rs"]
+siwe = ["full", "dep:k256", "dep:sha3"]
 # Test-only fixtures, such as HTTP OAuth providers on localhost. Never enable in production.
-test-utils = ["better-auth-core/test-utils"]
+test-utils = ["full", "better-auth-core/test-utils"]
 
 [dependencies]
-aes-gcm.workspace = true
+aes-gcm = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
-async-trait.workspace = true
+async-trait = { workspace = true, optional = true }
 base64.workspace = true
 better-auth-core = { path = "../better-auth-core", version = "0.1.0" }
-data-encoding.workspace = true
-getrandom.workspace = true
-reqwest.workspace = true
+data-encoding = { workspace = true, optional = true }
+getrandom = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 saml-rs = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["net", "io-util", "macros", "sync"] }
-tokio-rustls.workspace = true
-webpki-roots.workspace = true
-hmac.workspace = true
-http.workspace = true
-jsonwebtoken.workspace = true
-rsa.workspace = true
+tokio-rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+jsonwebtoken = { workspace = true, optional = true }
+rsa = { workspace = true, optional = true }
 k256 = { workspace = true, optional = true }
 sha3 = { workspace = true, optional = true }
 libsql = { workspace = true, optional = true }
-password-hash.workspace = true
+password-hash = { workspace = true, optional = true }
 secrecy = { workspace = true, optional = true }
-sha1.workspace = true
-scrypt.workspace = true
+sha1 = { workspace = true, optional = true }
+scrypt = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
+tracing = { workspace = true, optional = true }
 url.workspace = true
-webauthn-rs.workspace = true
+webauthn-rs = { workspace = true, optional = true }
 uuid.workspace = true
 
 [dev-dependencies]
@@ -74,3 +98,11 @@ required-features = ["axum"]
 [[example]]
 name = "sqlite-turso"
 required-features = ["sqlite"]
+
+[[example]]
+name = "desktop-login"
+required-features = ["full"]
+
+[[example]]
+name = "load_test"
+required-features = ["full"]

@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! The origin and Fetch Metadata policy for state-changing requests, case by case.
 
 use better_auth::{

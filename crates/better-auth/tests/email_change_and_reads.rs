@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Email change by code, the non-consuming code check, the error page, and the
 //! organization read routes.
 

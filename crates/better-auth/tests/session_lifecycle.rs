@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Session revocation, expiry and renewal, including stale cookie-cache credentials and
 //! several application instances that share one database.
 //!

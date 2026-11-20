@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Organization permission checks, checked against what each role can really do,
 //! and social sign-in started by POST, which returns the provider URL as JSON.
 

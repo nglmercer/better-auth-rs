@@ -1,3 +1,4 @@
+#![cfg(feature = "full")]
 //! Two router instances on one PostgreSQL database, with every connection killed mid-run.
 //!
 //! Runs only when `BETTER_AUTH_TEST_POSTGRES_URL` is set. The test checks three things:
