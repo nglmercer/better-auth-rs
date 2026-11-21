@@ -8,7 +8,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use better_auth_core::error::{AuthError, Result};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use rsa::{pkcs8::DecodePrivateKey, traits::PublicKeyParts, RsaPrivateKey};
+use rsa::{pkcs8::DecodePrivateKey, traits::PublicKeyParts, PrivateKey};
 use serde_json::{json, Map, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -53,7 +53,7 @@ impl JwtSigner {
         audience: impl Into<String>,
         private_pem: &str,
     ) -> Result<Self> {
-        let key = RsaPrivateKey::from_pkcs8_pem(private_pem)
+        let key = PrivateKey::from_pkcs8_pem(private_pem)
             .map_err(|error| AuthError::Crypto(format!("invalid RSA private key: {error}")))?;
         if key.size() < 256 {
             return Err(AuthError::InvalidConfiguration(
@@ -66,8 +66,8 @@ impl JwtSigner {
         Ok(Self {
             current: PublishedKey {
                 kid: kid.into(),
-                modulus: URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),
-                exponent: URL_SAFE_NO_PAD.encode(public.e().to_bytes_be()),
+                modulus: URL_SAFE_NO_PAD.encode(public.n().as_ref().to_be_bytes()),
+                exponent: URL_SAFE_NO_PAD.encode(public.e().to_be_bytes()),
             },
             previous: Vec::new(),
             issuer: issuer.into(),

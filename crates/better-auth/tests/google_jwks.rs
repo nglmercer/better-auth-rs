@@ -23,7 +23,7 @@ use better_auth::{
     JwksRefreshPolicy,
 };
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
-use rsa::{pkcs8::DecodePrivateKey, traits::PublicKeyParts, RsaPrivateKey};
+use rsa::{pkcs8::DecodePrivateKey, traits::PublicKeyParts, PrivateKey};
 use serde_json::{json, Value};
 use std::{
     sync::{
@@ -45,15 +45,15 @@ const KEY_B: &[u8] = include_bytes!("fixtures/jwks/key_b.pem");
 const KEY_C: &[u8] = include_bytes!("fixtures/jwks/key_c.pem");
 
 fn public_jwk(kid: &str, pem: &[u8]) -> Value {
-    let private = RsaPrivateKey::from_pkcs8_pem(std::str::from_utf8(pem).unwrap()).unwrap();
+    let private = PrivateKey::from_pkcs8_pem(std::str::from_utf8(pem).unwrap()).unwrap();
     let public = private.to_public_key();
     json!({
         "kty": "RSA",
         "kid": kid,
         "alg": "RS256",
         "use": "sig",
-        "n": URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),
-        "e": URL_SAFE_NO_PAD.encode(public.e().to_bytes_be()),
+        "n": URL_SAFE_NO_PAD.encode(public.n().as_ref().to_be_bytes()),
+        "e": URL_SAFE_NO_PAD.encode(public.e().to_be_bytes()),
     })
 }
 

@@ -6736,7 +6736,7 @@ mod tests {
         .unwrap();
         let router = AuthRouter::new(context).unwrap();
         let key = SigningKey::from_slice(&[9u8; 32]).unwrap();
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         let address = format!(
             "0x{}",
             Keccak256::digest(&point.as_bytes()[1..])[12..]
@@ -6747,8 +6747,7 @@ mod tests {
         let sign = |text: &str| {
             let prefixed = format!("\x19Ethereum Signed Message:\n{}{}", text.len(), text);
             let (signature, recovery) = key
-                .sign_prehash_recoverable(&Keccak256::digest(prefixed.as_bytes()))
-                .unwrap();
+                .sign_prehash_recoverable(&Keccak256::digest(prefixed.as_bytes()));
             let mut bytes = signature.to_bytes().to_vec();
             bytes.push(recovery.to_byte() + 27);
             format!(

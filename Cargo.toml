@@ -16,18 +16,18 @@ axum = "0.8"
 async-trait = "0.1"
 base64 = "0.23.1"
 data-encoding = "2"
-reqwest = { version = "0.12", default-features = false, features = ["cookies", "json", "rustls-tls"] }
-rusqlite = "0.32"
+reqwest = { version = "0.13", default-features = false, features = ["cookies", "json", "form", "rustls"] }
+rusqlite = "0.43"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "any", "postgres", "mysql"] }
 saml-rs = "0.3"
 tokio = { version = "1", features = ["rt", "time"] }
 hmac = "0.13"
 http = "1"
 jsonwebtoken = { version = "12", features = ["rust_crypto"] }
-k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic", "std"] }
+k256 = { version = "0.14", default-features = false, features = ["ecdsa", "arithmetic", "std"] }
 sha3 = "0.12"
-rsa = { version = "0.9", features = ["pem"] }
-libsql = "0.9"
+rsa = { version = "0.10", features = ["encoding"] }
+libsql = "0.10"
 password-hash = { version = "0.6.1", features = ["phc", "getrandom"] }
 secrecy = "0.10"
 sha1 = "0.11"

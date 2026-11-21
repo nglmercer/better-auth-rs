@@ -84,7 +84,7 @@ pub fn recover_address(message: &str, signature_hex: &str) -> Result<String> {
     let digest = Keccak256::digest(prefixed.as_bytes());
     let key =
         VerifyingKey::recover_from_prehash(&digest, &signature, recovery).map_err(|_| invalid())?;
-    let point = key.to_encoded_point(false);
+    let point = key.to_sec1_point(false);
     let address_digest = Keccak256::digest(&point.as_bytes()[1..]);
     Ok(format!("0x{}", hex_encode(&address_digest[12..])))
 }
@@ -212,7 +212,7 @@ mod tests {
     }
 
     fn address_of(key: &SigningKey) -> String {
-        let point = key.verifying_key().to_encoded_point(false);
+        let point = key.verifying_key().to_sec1_point(false);
         let digest = Keccak256::digest(&point.as_bytes()[1..]);
         format!("0x{}", hex_encode(&digest[12..]))
     }
@@ -228,7 +228,7 @@ mod tests {
     fn sign(key: &SigningKey, text: &str) -> String {
         let prefixed = format!("\x19Ethereum Signed Message:\n{}{}", text.len(), text);
         let digest = Keccak256::digest(prefixed.as_bytes());
-        let (signature, recovery) = key.sign_prehash_recoverable(&digest).unwrap();
+        let (signature, recovery) = key.sign_prehash_recoverable(&digest);
         let mut bytes = signature.to_bytes().to_vec();
         bytes.push(recovery.to_byte() + 27);
         format!("0x{}", hex_encode(&bytes))

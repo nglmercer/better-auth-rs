@@ -179,7 +179,6 @@ impl DbAdapter for SqliteDbAdapter {
         // Resolve each column's name and declared type once, not per row.
         let columns = statement
             .column_names()
-            .into_iter()
             .map(|name| (name.to_owned(), field_type(&schema, table, name)))
             .collect::<Vec<_>>();
         let mut rows = statement
