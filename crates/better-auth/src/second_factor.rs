@@ -318,7 +318,7 @@ impl SecondFactorService {
         let version = self.keys.current_version().to_owned();
         let key = secret_key(&self.keys, &version)?;
         let mut nonce = [0u8; 12];
-        getrandom::getrandom(&mut nonce)
+        getrandom::fill(&mut nonce)
             .map_err(|error| AuthError::Crypto(format!("random source failed: {error}")))?;
         let cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|_| AuthError::Crypto("invalid encryption key".into()))?;
@@ -451,7 +451,7 @@ fn random_token() -> String {
 
 fn random_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
-    getrandom::getrandom(&mut bytes).expect("operating system random source is unavailable");
+    getrandom::fill(&mut bytes).expect("operating system random source is unavailable");
     bytes
 }
 

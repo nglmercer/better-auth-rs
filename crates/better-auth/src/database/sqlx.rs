@@ -73,7 +73,9 @@ pub type MySqlDbAdapter = SqlxDbAdapter;
 #[async_trait::async_trait]
 impl MigrationExecutor for SqlxDbAdapter {
     async fn execute(&self, statement: &str) -> Result<()> {
-        self.pool.execute(statement).await.map_err(sqlx_error)?;
+        self.pool
+            .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(statement.to_owned())))
+            .await.map_err(sqlx_error)?;
         Ok(())
     }
 
@@ -87,7 +89,7 @@ impl MigrationExecutor for SqlxDbAdapter {
             }
         };
         let statement = sqlx_bind_sql(self.backend, statement);
-        let row = sqlx::query(&statement)
+        let row = sqlx::query(statement)
             .bind(table)
             .bind(column)
             .fetch_optional(&self.pool)
@@ -106,7 +108,7 @@ impl MigrationExecutor for SqlxDbAdapter {
             }
         };
         let statement = sqlx_bind_sql(self.backend, statement);
-        let row = sqlx::query(&statement)
+        let row = sqlx::query(statement)
             .bind(table)
             .bind(index)
             .fetch_optional(&self.pool)
@@ -135,7 +137,7 @@ impl DbAdapter for SqlxDbAdapter {
         sql.push_str(&order_clause(&query, self.backend)?);
         append_pagination(&mut sql, &query, &mut values);
         let sql = sqlx_bind_sql(self.backend, &sql);
-        let rows = bind_values(sqlx::query(&sql), values)
+        let rows = bind_values(sqlx::query(sql), values)
             .fetch_all(&self.pool)
             .await
             .map_err(sqlx_error)?;
@@ -148,7 +150,7 @@ impl DbAdapter for SqlxDbAdapter {
     async fn insert_record(&self, table: &str, record: Value) -> Result<Value> {
         let object = record_object(&record)?;
         let (sql, values) = insert_statement(table, object, self.backend)?;
-        bind_values(sqlx::query(&sqlx_bind_sql(self.backend, &sql)), values)
+        bind_values(sqlx::query(sqlx_bind_sql(self.backend, &sql)), values)
             .execute(&self.pool)
             .await
             .map_err(sqlx_error)?;
@@ -184,7 +186,7 @@ impl DbAdapter for SqlxDbAdapter {
             quote_identifier(table, self.backend)?
         );
         let result = bind_values(
-            sqlx::query(&sqlx_bind_sql(self.backend, &sql)),
+            sqlx::query(sqlx_bind_sql(self.backend, &sql)),
             change_values,
         )
         .execute(&self.pool)
@@ -199,7 +201,7 @@ impl DbAdapter for SqlxDbAdapter {
             "DELETE FROM {}{where_sql}",
             quote_identifier(table, self.backend)?
         );
-        let result = bind_values(sqlx::query(&sqlx_bind_sql(self.backend, &sql)), values)
+        let result = bind_values(sqlx::query(sqlx_bind_sql(self.backend, &sql)), values)
             .execute(&self.pool)
             .await
             .map_err(sqlx_error)?;
@@ -218,7 +220,7 @@ impl DbAdapter for SqlxDbAdapter {
         let mut transaction = self.pool.begin().await.map_err(sqlx_error)?;
         for operation in operations {
             let (sql, values, require_change) = operation_statement(operation, self.backend)?;
-            let result = bind_values(sqlx::query(&sqlx_bind_sql(self.backend, &sql)), values)
+            let result = bind_values(sqlx::query(sqlx_bind_sql(self.backend, &sql)), values)
                 .execute(&mut *transaction)
                 .await
                 .map_err(sqlx_error)?;
@@ -287,7 +289,7 @@ impl SecondaryStorage for SqlxSecondaryStorage {
             .map(|ttl| now_seconds() as i64 + ttl.as_secs() as i64);
         let mut transaction = self.pool.begin().await.map_err(sqlx_error)?;
         bind_values(
-            sqlx::query(&sqlx_bind_sql(
+            sqlx::query(sqlx_bind_sql(
                 self.backend,
                 "DELETE FROM _better_auth_kv WHERE storage_key = ?",
             )),
@@ -297,7 +299,7 @@ impl SecondaryStorage for SqlxSecondaryStorage {
         .await
         .map_err(sqlx_error)?;
         bind_values(
-            sqlx::query(&sqlx_bind_sql(
+            sqlx::query(sqlx_bind_sql(
                 self.backend,
                 "INSERT INTO _better_auth_kv(storage_key, value_json, expires_at) VALUES (?, ?, ?)",
             )),
@@ -315,7 +317,7 @@ impl SecondaryStorage for SqlxSecondaryStorage {
 
     async fn delete(&self, key: &str) -> Result<()> {
         bind_values(
-            sqlx::query(&sqlx_bind_sql(
+            sqlx::query(sqlx_bind_sql(
                 self.backend,
                 "DELETE FROM _better_auth_kv WHERE storage_key = ?",
             )),
@@ -348,7 +350,7 @@ impl SecondaryStorage for SqlxSecondaryStorage {
         let mut transaction = self.pool.begin().await.map_err(sqlx_error)?;
         let result = read_sqlx_kv(&mut transaction, self.backend, key, true).await?;
         bind_values(
-            sqlx::query(&sqlx_bind_sql(
+            sqlx::query(sqlx_bind_sql(
                 self.backend,
                 "DELETE FROM _better_auth_kv WHERE storage_key = ?",
             )),
@@ -389,7 +391,7 @@ impl SqlxSecondaryStorage {
         // concurrent first increments wait on one row. A plain read-then-insert
         // lets both transactions insert and one fails on the primary key.
         bind_values(
-            sqlx::query(&sqlx_bind_sql(
+            sqlx::query(sqlx_bind_sql(
                 self.backend,
                 kv_insert_if_absent_sql(self.backend),
             )),
@@ -402,7 +404,7 @@ impl SqlxSecondaryStorage {
         .execute(&mut *transaction)
         .await?;
         let row = bind_values(
-            sqlx::query(&sqlx_bind_sql(
+            sqlx::query(sqlx_bind_sql(
                 self.backend,
                 "SELECT value_json, expires_at FROM _better_auth_kv WHERE storage_key = ? FOR UPDATE",
             )),
@@ -432,7 +434,7 @@ impl SqlxSecondaryStorage {
             Err(error) => return Ok(Err(error)),
         };
         bind_values(
-            sqlx::query(&sqlx_bind_sql(
+            sqlx::query(sqlx_bind_sql(
                 self.backend,
                 "UPDATE _better_auth_kv SET value_json = ?, expires_at = ? WHERE storage_key = ?",
             )),
@@ -493,7 +495,7 @@ async fn read_sqlx_kv(
         "SELECT value_json, expires_at FROM _better_auth_kv WHERE storage_key = ?"
     };
     let row = bind_values(
-        sqlx::query(&sqlx_bind_sql(backend, query)),
+        sqlx::query(sqlx_bind_sql(backend, query)),
         vec![Value::String(key.to_owned())],
     )
     .fetch_optional(&mut **transaction)
@@ -761,10 +763,10 @@ fn append_pagination(sql: &mut String, query: &CoreQuery, values: &mut Vec<Value
 }
 
 #[cfg(feature = "sqlx")]
-fn bind_values<'q>(
-    mut query: sqlx::query::Query<'q, sqlx::Any, AnyArguments<'q>>,
+fn bind_values(
+    mut query: sqlx::query::Query<sqlx::Any, AnyArguments>,
     values: Vec<Value>,
-) -> sqlx::query::Query<'q, sqlx::Any, AnyArguments<'q>> {
+) -> sqlx::query::Query<sqlx::Any, AnyArguments> {
     for value in values {
         query =
             match value {
@@ -911,9 +913,9 @@ fn validate_sqlx_url(url: &str, backend: SqlxBackend) -> Result<()> {
 }
 
 #[cfg(feature = "sqlx")]
-fn sqlx_bind_sql(backend: SqlxBackend, sql: &str) -> String {
+fn sqlx_bind_sql(backend: SqlxBackend, sql: &str) -> sqlx::AssertSqlSafe<String> {
     if backend == SqlxBackend::MySql {
-        return sql.to_owned();
+        return sqlx::AssertSqlSafe(sql.to_owned());
     }
     let mut output = String::with_capacity(sql.len() + 8);
     let mut parameter = 0;
@@ -926,7 +928,7 @@ fn sqlx_bind_sql(backend: SqlxBackend, sql: &str) -> String {
             output.push(character);
         }
     }
-    output
+    sqlx::AssertSqlSafe(output)
 }
 
 #[cfg(feature = "sqlx")]

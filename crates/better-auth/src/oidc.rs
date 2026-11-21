@@ -122,7 +122,7 @@ impl OidcIdTokenValidator {
     pub fn add_test_hs_key(mut self, key_id: impl Into<String>, secret: &[u8]) -> Self {
         self.keys.insert(
             key_id.into(),
-            (DecodingKey::from_secret(secret), Algorithm::HS256),
+            (DecodingKey::from_secret(secret).unwrap(), Algorithm::HS256),
         );
         self
     }
@@ -224,7 +224,7 @@ mod tests {
             "iat": now_seconds() as usize,
             "nonce": "nonce-1"
         });
-        let token = encode(&header, &claims, &EncodingKey::from_secret(secret)).unwrap();
+        let token = encode(&header, &claims, &EncodingKey::from_secret(secret).unwrap()).unwrap();
         assert_eq!(
             validator.validate(&token, Some("nonce-1")).unwrap().sub,
             "subject-1"
@@ -251,7 +251,7 @@ mod tests {
             if let Some(azp) = azp {
                 claims["azp"] = json!(azp);
             }
-            encode(&header, &claims, &EncodingKey::from_secret(secret)).unwrap()
+            encode(&header, &claims, &EncodingKey::from_secret(secret).unwrap()).unwrap()
         };
         assert!(validator.validate(&base(None), Some("nonce-1")).is_err());
         assert!(validator
@@ -293,7 +293,7 @@ mod tests {
                 "exp": (now_seconds() + 60) as usize,
                 "iat": now_seconds() as usize,
             });
-            encode(&header, &claims, &EncodingKey::from_secret(secret)).unwrap()
+            encode(&header, &claims, &EncodingKey::from_secret(secret).unwrap()).unwrap()
         };
         assert!(validator
             .validate(&token("accounts.google.com"), None)

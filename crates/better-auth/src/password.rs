@@ -3,11 +3,13 @@ use better_auth_core::{
     error::{AuthError, Result},
     options::PasswordHashOptions,
 };
-use password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use password_hash::{
+    phc::{PasswordHash, SaltString},
+    CustomizedPasswordHasher, PasswordVerifier,
+};
 use scrypt::{Params, Scrypt};
 use std::sync::Arc;
 
-const SCRYPT_OUTPUT_LENGTH: usize = 32;
 
 /// The result of a password check. A successful legacy check can request an
 /// automatic write-back using the primary provider's format.
@@ -53,7 +55,7 @@ impl PasswordProvider for ScryptPhcPasswordProvider {
         tokio::task::spawn_blocking(move || {
             let parsed = PasswordHash::new(&encoded)
                 .map_err(|error| AuthError::Crypto(format!("invalid password hash: {error}")))?;
-            let valid = Scrypt.verify_password(password.as_bytes(), &parsed).is_ok();
+            let valid = Scrypt::new().verify_password(password.as_bytes(), &parsed).is_ok();
             let needs_rehash = parsed.algorithm.as_str() != "scrypt"
                 || parsed.params.get_decimal("ln") != Some(options.scrypt_log_n as u32)
                 || parsed.params.get_decimal("r") != Some(options.scrypt_r)
@@ -142,14 +144,14 @@ pub fn hash_password_with_options(password: &str, options: &PasswordHashOptions)
     if password.is_empty() {
         return Err(AuthError::InvalidRequest("password cannot be empty".into()));
     }
-    let salt = SaltString::generate(&mut password_hash::rand_core::OsRng);
-    Scrypt
+    let salt = SaltString::generate();
+    Scrypt::new()
         .hash_password_customized(
             password.as_bytes(),
+            AsRef::<str>::as_ref(&salt).as_bytes(),
             None,
             None,
             scrypt_params(options)?,
-            &salt,
         )
         .map(|hash| hash.to_string())
         .map_err(|error| AuthError::Crypto(format!("password hashing failed: {error}")))
@@ -158,7 +160,7 @@ pub fn hash_password_with_options(password: &str, options: &PasswordHashOptions)
 pub fn verify_password(password: &str, encoded_hash: &str) -> Result<bool> {
     let parsed = PasswordHash::new(encoded_hash)
         .map_err(|error| AuthError::Crypto(format!("invalid password hash: {error}")))?;
-    Ok(Scrypt.verify_password(password.as_bytes(), &parsed).is_ok())
+    Ok(Scrypt::new().verify_password(password.as_bytes(), &parsed).is_ok())
 }
 
 /// Run the CPU- and memory-heavy hash on Tokio's blocking thread pool instead
@@ -186,7 +188,6 @@ fn scrypt_params(options: &PasswordHashOptions) -> Result<Params> {
         options.scrypt_log_n,
         options.scrypt_r,
         options.scrypt_p,
-        SCRYPT_OUTPUT_LENGTH,
     )
     .map_err(|error| AuthError::InvalidConfiguration(format!("invalid scrypt parameters: {error}")))
 }

@@ -7,7 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-default = ["full", "axum", "sqlite"]
+default = ["full"]
 # Server runtime: identity, sessions, passkeys, JWT/OIDC, HTTP clients, password
 # hashing and cookie encryption. Pulls in everything that is not needed to talk
 # to Better Auth from a client, so it is off for `desktop`.

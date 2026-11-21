@@ -72,7 +72,7 @@ pub struct TotpSecret {
 pub fn generate_totp_secret(account_name: &str, issuer: &str) -> TotpSecret {
     // 160 bits from the operating system RNG, as RFC 4226 recommends.
     let mut bytes = [0u8; 20];
-    getrandom::getrandom(&mut bytes).expect("operating system random source is unavailable");
+    getrandom::fill(&mut bytes).expect("operating system random source is unavailable");
     let secret = BASE32_NOPAD.encode(&bytes);
     let otpauth_url = build_otpauth_url(account_name, issuer, &secret);
     TotpSecret {

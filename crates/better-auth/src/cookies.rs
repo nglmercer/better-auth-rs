@@ -332,7 +332,7 @@ impl CookieCacheCodec {
         // A fresh random 96-bit nonce per envelope. UUID bytes are not used
         // because their version bits are fixed.
         let mut nonce_bytes = [0u8; 12];
-        getrandom::getrandom(&mut nonce_bytes)
+        getrandom::fill(&mut nonce_bytes)
             .map_err(|error| AuthError::Crypto(format!("random source failed: {error}")))?;
         let nonce = Nonce::try_from(nonce_bytes.as_slice()).expect("12-byte nonce");
         let key_material = self

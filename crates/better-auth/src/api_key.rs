@@ -292,7 +292,7 @@ fn validate_scopes(scopes: &[String]) -> Result<()> {
 
 fn random_token(bytes: usize) -> String {
     let mut buffer = vec![0u8; bytes];
-    getrandom::getrandom(&mut buffer).expect("operating system random source is unavailable");
+    getrandom::fill(&mut buffer).expect("operating system random source is unavailable");
     data_encoding::BASE32_NOPAD
         .encode(&buffer)
         .to_ascii_lowercase()

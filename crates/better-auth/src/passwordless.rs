@@ -427,7 +427,7 @@ fn random_code() -> String {
     const LIMIT: u32 = u32::MAX - (u32::MAX % 1_000_000);
     loop {
         let mut bytes = [0u8; 4];
-        getrandom::getrandom(&mut bytes).expect("operating system random source is unavailable");
+        getrandom::fill(&mut bytes).expect("operating system random source is unavailable");
         let value = u32::from_be_bytes(bytes);
         if value < LIMIT {
             return format!("{:06}", value % 1_000_000);

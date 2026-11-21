@@ -4019,7 +4019,7 @@ struct MemberRoleInput {
 /// 256 bits from the OS RNG, base64url encoded.
 fn random_invitation_token() -> String {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("operating system random source is unavailable");
+    getrandom::fill(&mut bytes).expect("operating system random source is unavailable");
     data_encoding::BASE64URL_NOPAD.encode(&bytes)
 }
 const PHONE_PLUGIN: &str = "phone-number";
@@ -6553,7 +6553,7 @@ mod tests {
                 "email_verified": verified,
                 "name": "One Tap",
             }),
-            &EncodingKey::from_secret(b"one-tap-test-secret"),
+            &EncodingKey::from_secret(b"one-tap-test-secret").unwrap(),
         )
         .unwrap()
     }

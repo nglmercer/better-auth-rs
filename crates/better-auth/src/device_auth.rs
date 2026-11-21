@@ -233,7 +233,7 @@ fn random_user_code() -> String {
     let mut code = String::with_capacity(8);
     while code.len() < 8 {
         let mut byte = [0u8; 1];
-        getrandom::getrandom(&mut byte).expect("operating system random source is unavailable");
+        getrandom::fill(&mut byte).expect("operating system random source is unavailable");
         // Rejection sampling keeps the 30-symbol alphabet uniform (256 = 8 * 30 + 16).
         if usize::from(byte[0]) < USER_CODE_ALPHABET.len() * 8 {
             code.push(char::from(
@@ -246,7 +246,7 @@ fn random_user_code() -> String {
 
 fn random_string(bytes: usize) -> String {
     let mut buffer = vec![0u8; bytes];
-    getrandom::getrandom(&mut buffer).expect("operating system random source is unavailable");
+    getrandom::fill(&mut buffer).expect("operating system random source is unavailable");
     data_encoding::BASE32_NOPAD
         .encode(&buffer)
         .to_ascii_lowercase()
