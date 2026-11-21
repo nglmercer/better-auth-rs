@@ -152,7 +152,7 @@ impl Authenticator {
         })
         .to_string();
 
-        let point = self.key.verifying_key().to_encoded_point(false);
+        let point = self.key.verifying_key().to_sec1_point(false);
         let mut cose = BTreeMap::new();
         cose.insert(
             serde_cbor_2::Value::Integer(1),

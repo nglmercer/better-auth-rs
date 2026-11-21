@@ -155,7 +155,7 @@ impl SecretKeySet {
             .ok_or_else(|| AuthError::Crypto("current secret version is missing".into()))?;
         let payload = URL_SAFE_NO_PAD.encode(value.as_bytes());
         let message = format!("{}.{}", self.current_version, payload);
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
+        let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key)
             .map_err(|_| AuthError::Crypto("invalid HMAC key".into()))?;
         mac.update(message.as_bytes());
         Ok(format!(
@@ -174,7 +174,7 @@ impl SecretKeySet {
         }
         let key = self.keys.get(version).ok_or(AuthError::Unauthorized)?;
         let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(key).map_err(|_| AuthError::Unauthorized)?;
+            <HmacSha256 as hmac::KeyInit>::new_from_slice(key).map_err(|_| AuthError::Unauthorized)?;
         mac.update(format!("{version}.{payload}").as_bytes());
         let expected = URL_SAFE_NO_PAD
             .decode(signature)
@@ -270,7 +270,7 @@ impl CookieCacheCodec {
             .keys
             .key_for_version(self.keys.current_version())
             .ok_or_else(|| AuthError::Crypto("current secret version is missing".into()))?;
-        let mut mac = <HmacSha256 as Mac>::new_from_slice(key)
+        let mut mac = <HmacSha256 as hmac::KeyInit>::new_from_slice(key)
             .map_err(|_| AuthError::Crypto("invalid HMAC key".into()))?;
         mac.update(message.as_bytes());
         Ok(format!(
@@ -305,7 +305,7 @@ impl CookieCacheCodec {
             .key_for_version(version)
             .ok_or(AuthError::Unauthorized)?;
         let mut mac =
-            <HmacSha256 as Mac>::new_from_slice(key).map_err(|_| AuthError::Unauthorized)?;
+            <HmacSha256 as hmac::KeyInit>::new_from_slice(key).map_err(|_| AuthError::Unauthorized)?;
         mac.update(format!("{header_segment}.{payload}").as_bytes());
         let signature = URL_SAFE_NO_PAD
             .decode(signature)
@@ -334,7 +334,7 @@ impl CookieCacheCodec {
         let mut nonce_bytes = [0u8; 12];
         getrandom::getrandom(&mut nonce_bytes)
             .map_err(|error| AuthError::Crypto(format!("random source failed: {error}")))?;
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce = Nonce::try_from(nonce_bytes.as_slice()).expect("12-byte nonce");
         let key_material = self
             .keys
             .key_for_version(self.keys.current_version())
@@ -344,7 +344,7 @@ impl CookieCacheCodec {
             .map_err(|_| AuthError::Crypto("invalid encryption key".into()))?;
         let encrypted = cipher
             .encrypt(
-                nonce,
+                &nonce,
                 aes_gcm::aead::Payload {
                     msg: payload,
                     aad: protected.as_bytes(),
@@ -407,7 +407,7 @@ impl CookieCacheCodec {
         );
         let plaintext = cipher
             .decrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::try_from(nonce.as_slice()).expect("12-byte nonce"),
                 aes_gcm::aead::Payload {
                     msg: &encrypted,
                     aad: protected.as_bytes(),

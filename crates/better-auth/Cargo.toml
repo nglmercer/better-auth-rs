@@ -80,7 +80,7 @@ uuid.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 # Software authenticator for passkey tests: P-256 signing and CBOR encoding.
-p256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.14", features = ["ecdsa"] }
 serde_cbor_2 = "0.13"
 
 [[example]]

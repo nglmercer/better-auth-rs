@@ -323,7 +323,7 @@ impl SecondFactorService {
         let cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|_| AuthError::Crypto("invalid encryption key".into()))?;
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce), secret.as_bytes())
+            .encrypt(&Nonce::try_from(&nonce[..]).expect("12-byte nonce"), secret.as_bytes())
             .map_err(|_| AuthError::Crypto("secret encryption failed".into()))?;
         let mut envelope = nonce.to_vec();
         envelope.extend_from_slice(&ciphertext);
@@ -355,7 +355,7 @@ impl SecondFactorService {
         let cipher = Aes256Gcm::new_from_slice(&key)
             .map_err(|_| AuthError::Crypto("invalid encryption key".into()))?;
         let plaintext = cipher
-            .decrypt(Nonce::from_slice(nonce), ciphertext)
+            .decrypt(&Nonce::try_from(nonce).expect("12-byte nonce"), ciphertext)
             .map_err(|_| AuthError::Crypto("two-factor secret failed authentication".into()))?;
         String::from_utf8(plaintext)
             .map_err(|_| AuthError::Crypto("two-factor secret is not text".into()))

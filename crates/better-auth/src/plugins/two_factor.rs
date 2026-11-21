@@ -108,7 +108,7 @@ pub fn totp_code(
         .decode(secret.as_bytes())
         .map_err(|_| AuthError::InvalidRequest("invalid TOTP secret".into()))?;
     let counter = unix_seconds / step_seconds;
-    let mut mac = <HmacSha1 as Mac>::new_from_slice(&key)
+    let mut mac = <HmacSha1 as hmac::KeyInit>::new_from_slice(&key)
         .map_err(|_| AuthError::Crypto("invalid TOTP key".into()))?;
     mac.update(&counter.to_be_bytes());
     let digest = mac.finalize().into_bytes();
