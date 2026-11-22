@@ -2,6 +2,7 @@ use better_auth_core::{
     adapter::{DbAdapter, Query, SecondaryStorage, StorageValue},
     error::{AuthError, Result},
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
@@ -278,11 +279,7 @@ impl WebAuthnService {
         let response: PublicKeyCredential = serde_json::from_value(response).map_err(json_error)?;
         let result = self
             .webauthn
-            .finish_discoverable_authentication(
-                &response,
-                state,
-                &[DiscoverableKey::from(&*credential)],
-            )
+            .finish_discoverable_authentication_v2(&response, state, &*credential)
             .map_err(verification_error)?;
         let updated = credential
             .update_credential(&result)
@@ -328,7 +325,7 @@ impl WebAuthnService {
 /// encoding is used for stored IDs and for the `rawId` of a response, so the
 /// two can be compared directly.
 pub fn credential_key(credential_id: &CredentialID) -> Result<String> {
-    encoded_key(credential_id)
+    Ok(URL_SAFE_NO_PAD.encode(credential_id))
 }
 
 /// The credential ID a sign-in response names, before any verification. The
@@ -336,16 +333,7 @@ pub fn credential_key(credential_id: &CredentialID) -> Result<String> {
 pub fn credential_key_from_response(response: &Value) -> Result<String> {
     let response: PublicKeyCredential =
         serde_json::from_value(response.clone()).map_err(json_error)?;
-    encoded_key(&response.raw_id)
-}
-
-fn encoded_key<T: Serialize>(value: &T) -> Result<String> {
-    match serde_json::to_value(value).map_err(json_error)? {
-        Value::String(text) => Ok(text),
-        _ => Err(AuthError::Adapter(
-            "credential ID did not encode as text".into(),
-        )),
-    }
+    Ok(URL_SAFE_NO_PAD.encode(&response.raw_id))
 }
 
 /// A stored passkey with the columns that identify it. The credential holds the
